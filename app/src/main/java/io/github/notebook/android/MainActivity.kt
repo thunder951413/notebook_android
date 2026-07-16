@@ -63,6 +63,7 @@ import android.text.method.LinkMovementMethod
 import android.util.TypedValue
 import android.widget.TextView
 import io.noties.markwon.Markwon
+import io.noties.markwon.SoftBreakAddsNewLinePlugin
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
 import io.github.notebook.android.update.AppUpdateViewModel
@@ -292,7 +293,13 @@ private fun markdownChunks(markdown:String,maxChars:Int=8*1024):List<MarkdownChu
     }
 }
 
-@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val markwon=remember(context){Markwon.builder(context).usePlugin(StrikethroughPlugin.create()).usePlugin(TablePlugin.create(context)).build()};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;setTextSize(TypedValue.COMPLEX_UNIT_SP,17f);setLineSpacing(0f,1.18f);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true)}},update={view->view.setTextColor(color);if(view.tag!==markdown){markwon.setMarkdown(view,markdown);view.tag=markdown};onViewReady(view)},modifier=modifier)}
+internal fun createMarkdownRenderer(context:android.content.Context):Markwon=Markwon.builder(context)
+    .usePlugin(SoftBreakAddsNewLinePlugin.create())
+    .usePlugin(StrikethroughPlugin.create())
+    .usePlugin(TablePlugin.create(context))
+    .build()
+
+@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val markwon=remember(context){createMarkdownRenderer(context)};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;setTextSize(TypedValue.COMPLEX_UNIT_SP,17f);setLineSpacing(0f,1.18f);isSingleLine=false;setHorizontallyScrolling(false);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true)}},update={view->view.setTextColor(color);if(view.tag!==markdown){markwon.setMarkdown(view,markdown);view.tag=markdown};onViewReady(view)},modifier=modifier)}
 
 @Composable private fun AttachmentView(asset:AssetEntity){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Card(Modifier.fillMaxWidth().padding(vertical=4.dp).clickable{open()}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().heightIn(max=180.dp))}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)"${asset.size/1024} KB" else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
 
