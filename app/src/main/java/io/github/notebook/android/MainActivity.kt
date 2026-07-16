@@ -16,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -28,9 +29,11 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.graphics.toArgb
 import io.github.notebook.android.data.NoteEntity
+import io.github.notebook.android.data.NoteSummary
 import io.github.notebook.android.data.TodoStepEntity
 import io.github.notebook.android.data.FolderEntity
 import io.github.notebook.android.data.TagEntity
@@ -50,8 +53,10 @@ import io.github.notebook.android.ui.NotebookTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.*
+import kotlin.math.roundToInt
 import android.text.method.LinkMovementMethod
 import android.util.TypedValue
 import android.widget.TextView
@@ -88,7 +93,7 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
     var destination by remember{mutableStateOf(Destination.All)}
     var folderId by remember{mutableStateOf<String?>(null)}
     var tagId by remember{mutableStateOf<String?>(null)};var manage by remember{mutableStateOf<String?>(null)}
-    var query by remember{mutableStateOf("")}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by remember{mutableStateOf(false)}
+    var query by remember{mutableStateOf("")};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by remember{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
     var showSettings by remember{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
     var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)}
     var encryptedUnlocked by remember{mutableStateOf(false)};var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)}
@@ -96,7 +101,9 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
     val isTablet=LocalConfiguration.current.screenWidthDp>=840
     val drawerScroll=androidx.compose.foundation.rememberScrollState()
     UpdatePrompt()
-    LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->all.firstOrNull{it.id==id}?.let{target->destination=if(target.itemType=="todo")Destination.Today else Destination.All;folderId=null;tagId=null;startInEditMode=false;editing=target;onNotificationConsumed()}}}
+    fun openNote(id:String,startEditing:Boolean=false){if(loadingNoteId!=null)return;loadingNoteId=id;scope.launch{runCatching{repo.loadNote(id)}.onSuccess{note->if(note!=null){startInEditMode=startEditing;editing=note}else status="笔记不存在或已被删除"}.onFailure{status="无法加载笔记：${it.localizedMessage}"};loadingNoteId=null}}
+    LaunchedEffect(query){if(query.isBlank())matchingNoteIds=null else{delay(180);matchingNoteIds=runCatching{repo.searchNoteIds(query.trim())}.getOrElse{status="搜索失败：${it.localizedMessage}";emptySet()}}}
+    LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->all.firstOrNull{it.id==id}?.let{target->destination=if(target.itemType=="todo")Destination.Today else Destination.All;folderId=null;tagId=null;openNote(id);onNotificationConsumed()}}}
     fun runSync(){if(syncing)return;scope.launch{syncing=true;changedKey=null;status="正在同步…";runCatching{repo.sync()}.onSuccess{status="同步完成"}.onFailure{error->if(error is HostKeyChangedException){changedKey=error;status="服务器主机密钥发生变化，需要你确认"}else status=error.localizedMessage?:error.message?:"同步失败"};syncing=false}}
     changedKey?.let{change->AlertDialog(onDismissRequest={changedKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("服务器身份已变化")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("确认这是你的服务器后，可以信任新的主机指纹并继续同步。");Text("原指纹\n${change.expected}",style=MaterialTheme.typography.bodySmall);Text("新指纹\n${change.actual}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(change.actual);changedKey=null;runSync()}){Text("信任并继续")}},dismissButton={TextButton({changedKey=null}){Text("取消")}})}
 
@@ -122,7 +129,7 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
             destination==Destination.Conflicts -> !encrypted&&n.conflict
             else -> n.deletedAt!=null&&(!encrypted||encryptedUnlocked)
         }
-        section&&(query.isBlank()||n.title.contains(query,true)||n.body.contains(query,true))
+        section&&(query.isBlank()||matchingNoteIds?.contains(n.id)==true)
     }
     val drawerItems:@Composable ColumnScope.()->Unit={
             Text("Notebook",Modifier.padding(20.dp,24.dp,16.dp,12.dp),style=MaterialTheme.typography.headlineSmall,fontWeight=FontWeight.SemiBold)
@@ -152,9 +159,10 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
             Column(Modifier.padding(pad).fillMaxSize().background(MaterialTheme.colorScheme.background)){
                 OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(12.dp),singleLine=true,shape=MaterialTheme.shapes.large,placeholder={Text("搜索全部笔记")},leadingIcon={Icon(Icons.Default.Search,null)})
                 status?.let{Text(it,Modifier.padding(horizontal=16.dp),color=MaterialTheme.colorScheme.primary)}
+                loadingNoteId?.let{LinearProgressIndicator(Modifier.fillMaxWidth())}
                 saveError?.let{Text(it,Modifier.padding(horizontal=16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
                 Row(Modifier.fillMaxSize()){
-                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else LazyColumn{items(visible,key={it.id}){n->NoteRow(n){startInEditMode=false;editing=n}}}}
+                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else VirtualNoteList(visible,loadingNoteId){openNote(it)}}
                     if(isTablet){VerticalDivider();Box(Modifier.weight(1.65f).fillMaxHeight().background(MaterialTheme.colorScheme.background)){editing?.let{note->EditorPane(note,repo,initiallyEditing=startInEditMode,onDone={editing=null})}?:Box(Modifier.fillMaxSize().padding(40.dp)){Text("选择一篇笔记开始阅读",color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
                 }
             }
@@ -166,7 +174,21 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
 
 @Composable private fun DrawerRow(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,selected:Boolean,count:Int?=null,onClick:()->Unit){NavigationDrawerItem(label={Row{Text(label);Spacer(Modifier.weight(1f));count?.let{Text(it.toString(),style=MaterialTheme.typography.labelMedium)}}},icon={Icon(icon,null)},selected=selected,onClick=onClick,modifier=Modifier.padding(horizontal=8.dp,vertical=1.dp))}
 
-@Composable private fun NoteRow(note:NoteEntity,onClick:()->Unit){ListItem(headlineContent={Row{Text(note.title.ifBlank{"无标题"},fontWeight=FontWeight.Medium);Spacer(Modifier.weight(1f));if(note.reminderAt!=null)Icon(Icons.Default.Notifications,null,Modifier.size(15.dp),tint=MaterialTheme.colorScheme.primary)}},supportingContent={Column{Text(note.body.take(120),maxLines=2);Spacer(Modifier.height(5.dp));Text("${DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt))}  ·  ${note.folderName}",style=MaterialTheme.typography.labelSmall)}},leadingContent={if(note.itemType=="todo")Icon(Icons.Default.CheckCircle,null,tint=if(note.completedAt==null)MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary)},modifier=Modifier.clickable(onClick=onClick).padding(horizontal=4.dp));HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant)}
+@Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,onOpen:(String)->Unit){
+    val state=rememberLazyListState()
+    BoxWithConstraints(Modifier.fillMaxSize()){
+        LazyColumn(Modifier.fillMaxSize(),state=state){items(notes,key={it.id}){n->NoteRow(n,loadingNoteId==n.id){onOpen(n.id)}}}
+        val visibleCount=state.layoutInfo.visibleItemsInfo.size
+        if(notes.size>visibleCount&&visibleCount>0){
+            val thumbFraction=(visibleCount.toFloat()/notes.size).coerceIn(.08f,1f)
+            val progress=(state.firstVisibleItemIndex.toFloat()/(notes.size-visibleCount).coerceAtLeast(1)).coerceIn(0f,1f)
+            val thumbHeight=maxHeight*thumbFraction
+            Box(Modifier.align(androidx.compose.ui.Alignment.TopEnd).padding(end=2.dp).width(4.dp).height(thumbHeight).offset{IntOffset(0,((maxHeight-thumbHeight).toPx()*progress).roundToInt())}.background(MaterialTheme.colorScheme.primary.copy(alpha=.45f),MaterialTheme.shapes.small))
+        }
+    }
+}
+
+@Composable private fun NoteRow(note:NoteSummary,loading:Boolean,onClick:()->Unit){ListItem(headlineContent={Row{Text(note.title.ifBlank{"无标题"},fontWeight=FontWeight.Medium);Spacer(Modifier.weight(1f));if(loading)CircularProgressIndicator(Modifier.size(15.dp),strokeWidth=2.dp)else if(note.reminderAt!=null)Icon(Icons.Default.Notifications,null,Modifier.size(15.dp),tint=MaterialTheme.colorScheme.primary)}},supportingContent={Column{Text(note.preview,maxLines=2);Spacer(Modifier.height(5.dp));Text("${DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt))}  ·  ${note.folderName}",style=MaterialTheme.typography.labelSmall)}},leadingContent={if(note.itemType=="todo")Icon(Icons.Default.CheckCircle,null,tint=if(note.completedAt==null)MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary)},modifier=Modifier.clickable(enabled=!loading,onClick=onClick).padding(horizontal=4.dp));HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant)}
 
 @Composable private fun Editor(original:NoteEntity,repo:SyncRepository,initiallyEditing:Boolean,onBack:()->Unit){Scaffold(containerColor=MaterialTheme.colorScheme.background){p->Box(Modifier.padding(p)){EditorPane(original,repo,showBack=true,initiallyEditing=initiallyEditing,onDone={onBack()})}}}
 

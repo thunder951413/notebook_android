@@ -40,7 +40,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     val saveError=_saveError.asStateFlow()
     fun clearSaveError(){_saveError.value=null}
     private val prefs=encryptedPrefs(context)
-    val notes=dao.observeNotes()
+    val notes=dao.observeNoteSummaries()
     val folders=dao.observeFolders()
     val tags=dao.observeTags()
     fun settings()=SshSettings(prefs.getString("host","")!!,prefs.getInt("port",22),prefs.getString("user","")!!,prefs.getString("password","")!!,prefs.getString("path","~/NotebookSync")!!,prefs.getString("fingerprint","")!!)
@@ -48,6 +48,10 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     fun trustHostKey(fingerprint:String){saveSettings(settings().copy(fingerprint=fingerprint))}
     fun isEncrypted(note:NoteEntity)=encryptedNoteIds().contains(note.id)||encryptedFolderId(note)!=null
     fun encryptedFolderId(note:NoteEntity)=encryptedMappings()[note.id]?:note.folderId?.takeIf{encryptedNoteIds().contains(note.id)}
+    fun isEncrypted(note:NoteSummary)=encryptedNoteIds().contains(note.id)||encryptedFolderId(note)!=null
+    fun encryptedFolderId(note:NoteSummary)=encryptedMappings()[note.id]?:note.folderId?.takeIf{encryptedNoteIds().contains(note.id)}
+    suspend fun loadNote(id:String)=dao.getForEditing(id)
+    suspend fun searchNoteIds(query:String)=withContext(Dispatchers.IO){dao.searchNoteIds(query).toSet()}
     fun markEncrypted(noteId:String,folderId:String){val ids=encryptedNoteIds().toMutableSet().apply{add(noteId)};val mappings=encryptedMappings().toMutableMap().apply{put(noteId,folderId)};prefs.edit().putString("encryptedNoteIds",gson.toJson(ids)).putString("encryptedMappings",gson.toJson(mappings)).apply()}
     private fun encryptedNoteIds():Set<String> = runCatching{gson.fromJson(prefs.getString("encryptedNoteIds","[]"),Array<String>::class.java).toSet()}.getOrDefault(emptySet())
     private fun encryptedMappings():Map<String,String> = runCatching{gson.fromJson(prefs.getString("encryptedMappings","{}"),JsonObject::class.java).entrySet().associate{it.key to it.value.asString}}.getOrDefault(emptyMap())
@@ -60,32 +64,32 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     fun recoverDraftsAsync(){appScope.launch{runCatching{recoverDrafts()}.onFailure{_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
 
     private suspend fun persistDraft(draft:NoteEntity):NoteEntity=saveMutex.withLock{
-        val current=dao.get(draft.id)
+        val current=dao.getForEditing(draft.id)
         if(current!=null&&sameEditableContent(current,draft)){dao.deleteDraft(draft.id);return@withLock current}
         val base=current?:draft;val saved=base.copy(title=draft.title,body=draft.body,folderId=draft.folderId,folderName=draft.folderName,reminderAt=draft.reminderAt,recurrence=draft.recurrence,tagIds=draft.tagIds,deletedAt=draft.deletedAt,itemType=draft.itemType,dueAt=draft.dueAt,completedAt=draft.completedAt,important=draft.important,updatedAt=System.currentTimeMillis(),version=(current?.version?:draft.version)+1,dirty=true)
-        dao.put(saved);dao.deleteDraft(draft.id);if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);saved
+        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());dao.deleteDraft(draft.id);if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);saved
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important
-    suspend fun restore(id:String){dao.get(id)?.let{save(it.copy(deletedAt=null))}}
+    suspend fun restore(id:String){dao.getForEditing(id)?.let{save(it.copy(deletedAt=null))}}
     suspend fun deletePermanently(id:String){dao.deleteNotePermanently(id)}
-    suspend fun keepLocal(id:String){dao.get(id)?.let{local->val remoteVersion=local.conflictSnapshotJson?.let{runCatching{JsonParser.parseString(it).asJsonObject["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}
-    suspend fun acceptRemote(id:String){val local=dao.get(id)?:return;val snapshot=local.conflictSnapshotJson?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;val env=JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)};val remote=fromEnvelope(env);dao.put(remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion))}
+    suspend fun keepLocal(id:String){dao.getForEditing(id)?.let{local->val remoteVersion=dao.conflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=dao.snapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}
+    suspend fun acceptRemote(id:String){val local=dao.getForEditing(id)?:return;val snapshot=dao.conflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;val env=JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)};val remote=fromEnvelope(env);dao.put(remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion))}
     suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString())=dao.putFolder(FolderEntity(id,name,dao.allFolders().size,type))
     suspend fun deleteFolder(id:String){dao.deleteFolder(id);dao.putTombstone(TombstoneEntity("folder|$id",id,"folder",System.currentTimeMillis(),deviceId()))}
     suspend fun saveTag(name:String,color:String="gray",id:String=UUID.randomUUID().toString())=dao.putTag(TagEntity(id,name,color))
     suspend fun deleteTag(id:String){dao.deleteTag(id);dao.putTombstone(TombstoneEntity("tag|$id",id,"tag",System.currentTimeMillis(),deviceId()))}
     fun steps(noteId:String)=dao.observeSteps(noteId)
     fun assets(noteId:String)=dao.observeAssets(noteId)
-    suspend fun saveStep(step:TodoStepEntity){dao.putStep(step);dao.get(step.noteId)?.let{save(it)}}
-    suspend fun deleteStep(id:String){val noteId=dao.getStep(id)?.noteId;dao.deleteStep(id);noteId?.let{dao.get(it)?.let{n->save(n)}}}
+    suspend fun saveStep(step:TodoStepEntity){dao.putStep(step);dao.getForEditing(step.noteId)?.let{save(it)}}
+    suspend fun deleteStep(id:String){val noteId=dao.getStep(id)?.noteId;dao.deleteStep(id);noteId?.let{dao.getForEditing(it)?.let{n->save(n)}}}
     suspend fun attach(noteId:String,uri:android.net.Uri):AssetEntity=withContext(Dispatchers.IO){
         val resolver=appContext.contentResolver;val id=UUID.randomUUID().toString();val mime=resolver.getType(uri)?:"application/octet-stream"
         var name="attachment";resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use{if(it.moveToFirst())name=it.getString(0)?:name}
         name=name.replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_");val relative="$noteId/$id-$name";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();resolver.openInputStream(uri).use{input->requireNotNull(input){"无法读取附件"}.copyTo(target.outputStream())}
-        val kind=when{mime.startsWith("image/")->"image";mime.startsWith("audio/")->"audio";else->"file"};AssetEntity(id,noteId,kind,name,mime,relative,target.absolutePath,sha(target.readBytes()),target.length(),true).also{dao.putAssets(listOf(it));dao.get(noteId)?.let{n->save(n)}}
+        val kind=when{mime.startsWith("image/")->"image";mime.startsWith("audio/")->"audio";else->"file"};AssetEntity(id,noteId,kind,name,mime,relative,target.absolutePath,sha(target.readBytes()),target.length(),true).also{dao.putAssets(listOf(it));dao.getForEditing(noteId)?.let{n->save(n)}}
     }
     fun recordingFile(noteId:String)=java.io.File(appContext.filesDir,"recordings/$noteId/${System.currentTimeMillis()}.m4a")
-    suspend fun addRecordedAudio(noteId:String,file:java.io.File):AssetEntity=withContext(Dispatchers.IO){require(file.isFile&&file.length()>0){"录音文件为空"};val id=UUID.randomUUID().toString();val relative="$noteId/$id-${file.name}";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();file.copyTo(target,true);file.delete();AssetEntity(id,noteId,"audio",target.name,"audio/mp4",relative,target.absolutePath,sha(target.readBytes()),target.length(),true).also{dao.putAssets(listOf(it));dao.get(noteId)?.let{n->save(n)}}}
+    suspend fun addRecordedAudio(noteId:String,file:java.io.File):AssetEntity=withContext(Dispatchers.IO){require(file.isFile&&file.length()>0){"录音文件为空"};val id=UUID.randomUUID().toString();val relative="$noteId/$id-${file.name}";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();file.copyTo(target,true);file.delete();AssetEntity(id,noteId,"audio",target.name,"audio/mp4",relative,target.absolutePath,sha(target.readBytes()),target.length(),true).also{dao.putAssets(listOf(it));dao.getForEditing(noteId)?.let{n->save(n)}}}
 
     suspend fun sync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
         flushAll()
@@ -118,18 +122,18 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         val idx=readJson(c,"${s.path}/notes/index.json")?:return
         idx["deletedEntries"]?.asJsonArray?.forEach { entry ->
             val deletion=entry.asJsonObject; val id=deletion.str("noteID"); val deletedAt=deletion.dateMs("deletedAt")
-            val local=dao.get(id)
+            val local=dao.getForEditing(id)
             if(local!=null && (!local.dirty || deletedAt>=local.updatedAt)) dao.put(local.copy(deletedAt=deletedAt,dirty=false))
         }
         idx["entries"]?.asJsonArray?.forEach { e ->
-            val id=e.asJsonObject.str("noteID");val remoteVersion=e.asJsonObject["version"].asLong;val local=dao.get(id)
+            val id=e.asJsonObject.str("noteID");val remoteVersion=e.asJsonObject["version"].asLong;val local=dao.getForEditing(id)
             if(local==null||(!local.dirty&&remoteVersion>local.version)) readJson(c,"${s.path}/notes/$id.json")?.let{env->dao.put(fromEnvelope(env));dao.putAssets(assetsFromEnvelope(env));stepsFromEnvelope(env).forEach{dao.putStep(it)}}
             else if(local.dirty&&remoteVersion>local.lastSyncedVersion) readJson(c,"${s.path}/notes/$id.json")?.let{remote->dao.put(local.copy(conflict=true,conflictSnapshotJson=gson.toJson(remote["currentSnapshot"])))}
         }
     }
     private suspend fun pullAssets(c:ChannelSftp,s:SshSettings){
         val manifest=readJson(c,"${s.path}/notes/assets_manifest.json")?:return
-        val known=dao.allNotes().flatMap{dao.assets(it.id)}.associateBy{it.relativePath}
+        val known=dao.allNoteIds().flatMap{dao.assets(it)}.associateBy{it.relativePath}
         manifest["entries"]?.asJsonArray?.forEach{raw->val e=raw.asJsonObject;val relative=safeRelative(e.str("relativePath"));val expected=e.str("contentHash");val asset=known[relative]?:return@forEach;val target=java.io.File(appContext.filesDir,"attachments/$relative");if(!target.exists()||sha(target.readBytes())!=expected){target.parentFile?.mkdirs();val tmp=java.io.File(target.parentFile,"${target.name}.download");c.get("${s.path}/attachments/$relative",tmp.outputStream());require(sha(tmp.readBytes())==expected){"附件校验失败：$relative"};if(!tmp.renameTo(target)){tmp.copyTo(target,true);tmp.delete()};dao.putAssets(listOf(asset.copy(localPath=target.absolutePath,contentHash=expected,size=target.length(),dirty=false)))}}
     }
     private suspend fun pushAssets(c:ChannelSftp,s:SshSettings){
@@ -159,7 +163,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         val remote=readJson(c,"${s.path}/notes/index.json")
         val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
         val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{deleted[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
-        val confirmed=mutableListOf<Pair<String,Long>>();dao.dirtyNotes().filter{!it.conflict}.forEach{n->
+        val confirmed=mutableListOf<Pair<String,Long>>();dao.dirtyNoteIds().mapNotNull{dao.getForEditing(it)?.copy(snapshotJson=dao.snapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=n.id to n.version}
             else {val env=toEnvelope(n);atomicWrite(c,"${s.path}/notes/${n.id}.json",gson.toJson(env));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",sha(gson.toJson(env["currentSnapshot"])));addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);confirmed+=n.id to n.version}
         }
@@ -203,6 +207,7 @@ private fun JsonObject.optStr(k:String)=get(k)?.takeUnless{it.isJsonNull}?.asStr
 private fun JsonObject.int(k:String)=get(k)?.asInt?:0
 private fun JsonObject.dateMs(k:String)=SwiftDateCodec.decode(get(k)?.asDouble?:0.0)
 private fun JsonObject.optDateMs(k:String)=get(k)?.takeUnless{it.isJsonNull}?.asDouble?.let(SwiftDateCodec::decode)
+private fun NoteEntity.editableUpdate()=NoteEditableUpdate(id,title,body,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion)
 
 private class FingerprintHostKeyRepository(private val expectedHost:String,private val expectedFingerprint:String):HostKeyRepository{
     var presentedFingerprint:String?=null;private set

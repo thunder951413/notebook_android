@@ -31,6 +31,52 @@ data class NoteEntity(
     val lastSyncedVersion: Long = 0
 )
 
+/** Lightweight row used by navigation, filtering and the virtualized note list. */
+data class NoteSummary(
+    val id:String,
+    val title:String,
+    val preview:String,
+    val createdAt:Long,
+    val updatedAt:Long,
+    val folderId:String?,
+    val folderName:String,
+    val reminderAt:Long?,
+    val recurrence:String,
+    val version:Long,
+    val tagIds:String,
+    val deletedAt:Long?,
+    val itemType:String,
+    val dueAt:Long?,
+    val completedAt:Long?,
+    val important:Boolean,
+    val dirty:Boolean,
+    val conflict:Boolean,
+    val lastSyncedVersion:Long
+)
+
+/** Partial Room update: deliberately leaves large sync snapshots untouched. */
+data class NoteEditableUpdate(
+    val id:String,
+    val title:String,
+    val body:String,
+    val createdAt:Long,
+    val updatedAt:Long,
+    val folderId:String?,
+    val folderName:String,
+    val reminderAt:Long?,
+    val recurrence:String,
+    val version:Long,
+    val tagIds:String,
+    val deletedAt:Long?,
+    val itemType:String,
+    val dueAt:Long?,
+    val completedAt:Long?,
+    val important:Boolean,
+    val dirty:Boolean,
+    val conflict:Boolean,
+    val lastSyncedVersion:Long
+)
+
 @Entity(tableName = "folders") data class FolderEntity(@PrimaryKey val id:String, val name:String, val sortOrder:Int=0, val type:String="noteFolder", val updatedAt:Long=System.currentTimeMillis())
 @Entity(tableName = "tags") data class TagEntity(@PrimaryKey val id:String, val name:String, val color:String="gray", val updatedAt:Long=System.currentTimeMillis())
 @Entity(tableName="todo_steps",foreignKeys=[ForeignKey(entity=NoteEntity::class,parentColumns=["id"],childColumns=["noteId"],onDelete=ForeignKey.CASCADE)],indices=[Index("noteId")])
@@ -42,12 +88,20 @@ data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:Stri
 
 @Dao interface NotebookDao {
     @Query("SELECT * FROM notes ORDER BY updatedAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
+    @Query("SELECT id,title,substr(body,1,240) AS preview,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion FROM notes ORDER BY updatedAt DESC") fun observeNoteSummaries():Flow<List<NoteSummary>>
     @Query("SELECT * FROM notes WHERE id=:id") suspend fun get(id:String): NoteEntity?
+    @Query("SELECT id,title,body,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE id=:id") suspend fun getForEditing(id:String):NoteEntity?
+    @Query("SELECT snapshotJson FROM notes WHERE id=:id") suspend fun snapshot(id:String):String?
+    @Query("SELECT conflictSnapshotJson FROM notes WHERE id=:id") suspend fun conflictSnapshot(id:String):String?
+    @Query("SELECT id FROM notes") suspend fun allNoteIds():List<String>
+    @Query("SELECT id FROM notes WHERE dirty=1") suspend fun dirtyNoteIds():List<String>
+    @Query("SELECT id FROM notes WHERE title LIKE '%' || :query || '%' OR body LIKE '%' || :query || '%'") suspend fun searchNoteIds(query:String):List<String>
     @Query("SELECT * FROM notes") suspend fun allNotes(): List<NoteEntity>
     @Query("SELECT * FROM notes WHERE dirty=1") suspend fun dirtyNotes(): List<NoteEntity>
-    @Query("SELECT * FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
+    @Query("SELECT id,title,'' AS body,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
     @Upsert suspend fun put(note:NoteEntity)
     @Upsert suspend fun putNotes(notes:List<NoteEntity>)
+    @Update(entity=NoteEntity::class) suspend fun updateEditable(note:NoteEditableUpdate)
     @Query("UPDATE notes SET dirty=0 WHERE id=:id") suspend fun markClean(id:String)
     @Query("UPDATE notes SET dirty=0,lastSyncedVersion=:version,conflict=0,conflictSnapshotJson=NULL WHERE id=:id AND version=:version") suspend fun markSynced(id:String,version:Long)
     @Query("DELETE FROM notes WHERE id=:id") suspend fun deleteNotePermanently(id:String)
