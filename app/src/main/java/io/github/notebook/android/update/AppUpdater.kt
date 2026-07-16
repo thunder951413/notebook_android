@@ -27,7 +27,8 @@ data class DownloadProgress(val downloadedBytes:Long,val totalBytes:Long){val fr
 
 object AppUpdater {
     suspend fun latestRelease():GithubRelease?=withContext(Dispatchers.IO){
-        val root=JsonParser.parseString(getText("https://api.github.com/repos/${BuildConfig.GITHUB_REPOSITORY}/releases?per_page=30")).asJsonArray.map{it.asJsonObject}.firstOrNull{it["draft"]?.asBoolean!=true&&it["prerelease"]?.asBoolean!=true&&it["tag_name"]?.asString.orEmpty().startsWith("android-v")}?:return@withContext null
+        val releases=JsonParser.parseString(getText("https://api.github.com/repos/${BuildConfig.GITHUB_REPOSITORY}/releases?per_page=100")).asJsonArray.map{it.asJsonObject}.filter{it["draft"]?.asBoolean!=true&&it["prerelease"]?.asBoolean!=true&&it["tag_name"]?.asString.orEmpty().startsWith("android-v")}
+        val root=releases.maxWithOrNull(Comparator{a,b->compareVersions(releaseVersion(a["tag_name"]?.asString.orEmpty()),releaseVersion(b["tag_name"]?.asString.orEmpty()))})?:return@withContext null
         val tag=root["tag_name"]?.asString.orEmpty();val version=tag.removePrefix("android-v").removePrefix("v")
         val assets=mutableListOf<com.google.gson.JsonObject>();root["assets"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{assets+=it.asJsonObject}
         val apk=assets.firstOrNull{it["name"].asString=="notebook-android.apk"}?:assets.firstOrNull{it["name"].asString.endsWith(".apk")}
@@ -125,6 +126,9 @@ object AppUpdater {
         throw lastFailure?:IllegalStateException("下载失败")
     }
 }
+
+internal fun releaseVersion(tag:String)=tag.removePrefix("android-v").removePrefix("v")
+internal fun newestVersion(versions:List<String>)=versions.maxWithOrNull(Comparator(AppUpdater::compareVersions))
 
 internal data class ParsedContentRange(val start:Long,val end:Long,val total:Long)
 internal fun parseContentRange(value:String?):ParsedContentRange?{val match=Regex("bytes (\\d+)-(\\d+)/(\\d+)",RegexOption.IGNORE_CASE).matchEntire(value.orEmpty())?:return null;val (start,end,total)=match.destructured;return ParsedContentRange(start.toLong(),end.toLong(),total.toLong()).takeIf{it.start<=it.end&&it.end<it.total}}
