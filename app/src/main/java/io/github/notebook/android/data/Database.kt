@@ -87,6 +87,17 @@ data class TodoStepEntity(@PrimaryKey val id:String,val noteId:String,val text:S
 data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:String,val filename:String,val mimeType:String,val relativePath:String,val localPath:String?=null,val contentHash:String="",val size:Long=0,val dirty:Boolean=false)
 @Entity(tableName="tombstones") data class TombstoneEntity(@PrimaryKey val itemKey:String,val itemId:String,val itemType:String,val deletedAt:Long,val deviceId:String)
 @Entity(tableName="drafts") data class DraftEntity(@PrimaryKey val noteId:String,val payloadJson:String,val updatedAt:Long=System.currentTimeMillis())
+@Entity(
+    tableName="reading_positions",
+    foreignKeys=[ForeignKey(entity=NoteEntity::class,parentColumns=["id"],childColumns=["noteId"],onDelete=ForeignKey.CASCADE)]
+)
+data class ReadingPositionEntity(
+    @PrimaryKey val noteId:String,
+    val anchorUtf16Offset:Int,
+    val viewportOffsetFraction:Double,
+    val updatedAt:Long,
+    val deviceId:String
+)
 
 @Dao interface NotebookDao {
     @Query("SELECT * FROM notes ORDER BY updatedAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
@@ -141,9 +152,14 @@ data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:Stri
     @Query("SELECT length(payloadJson) FROM drafts WHERE noteId=:noteId") suspend fun draftPayloadLength(noteId:String):Int?
     @Query("SELECT substr(payloadJson,:start,:length) FROM drafts WHERE noteId=:noteId") suspend fun draftPayloadChunk(noteId:String,start:Int,length:Int):String?
     @Query("DELETE FROM drafts WHERE noteId=:noteId") suspend fun deleteDraft(noteId:String)
+    @Query("SELECT * FROM reading_positions WHERE noteId=:noteId") suspend fun readingPosition(noteId:String):ReadingPositionEntity?
+    @Query("SELECT * FROM reading_positions") suspend fun allReadingPositions():List<ReadingPositionEntity>
+    @Upsert suspend fun putReadingPosition(position:ReadingPositionEntity)
+    @Query("DELETE FROM reading_positions WHERE noteId=:noteId") suspend fun deleteReadingPosition(noteId:String)
+    @Query("SELECT id FROM notes WHERE deletedAt IS NULL") suspend fun nonDeletedNoteIds():List<String>
 }
 
-@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class], version=4, exportSchema=false)
+@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class], version=5, exportSchema=false)
 abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
     companion object {
         private val MIGRATION_1_2=object:androidx.room.migration.Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
@@ -161,6 +177,9 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
             db.execSQL("ALTER TABLE notes ADD COLUMN previewText TEXT NOT NULL DEFAULT ''")
             db.execSQL("UPDATE notes SET previewText=trim(replace(replace(substr(body,1,300),char(13),' '),char(10),' ')) WHERE previewText='' AND body!=''")
         }}
-        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4).build()
+        private val MIGRATION_4_5=object:androidx.room.migration.Migration(4,5){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
+            db.execSQL("CREATE TABLE IF NOT EXISTS reading_positions (noteId TEXT NOT NULL, anchorUtf16Offset INTEGER NOT NULL, viewportOffsetFraction REAL NOT NULL, updatedAt INTEGER NOT NULL, deviceId TEXT NOT NULL, PRIMARY KEY(noteId), FOREIGN KEY(noteId) REFERENCES notes(id) ON UPDATE NO ACTION ON DELETE CASCADE)")
+        }}
+        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5).build()
     }
 }

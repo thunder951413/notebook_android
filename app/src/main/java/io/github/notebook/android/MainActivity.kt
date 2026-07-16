@@ -42,6 +42,7 @@ import io.github.notebook.android.audio.AudioRecorder
 import androidx.core.content.FileProvider
 import coil.compose.AsyncImage
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import io.github.notebook.android.reminder.Reminders
@@ -54,8 +55,7 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.collectLatest
 import java.text.DateFormat
 import java.util.*
 import kotlin.math.roundToInt
@@ -65,9 +65,9 @@ import android.widget.TextView
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
-import io.github.notebook.android.update.AppUpdater
+import io.github.notebook.android.update.AppUpdateViewModel
 import io.github.notebook.android.update.DownloadProgress
-import io.github.notebook.android.update.GithubRelease
+import io.github.notebook.android.update.UpdatePhase
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository:SyncRepository
@@ -103,8 +103,9 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
     val encryptedUnlocker=rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()){result->if(result.resultCode==android.app.Activity.RESULT_OK){encryptedUnlocked=true;pendingEncryptedFolder?.let{folderId=it;tagId=null;destination=Destination.All};pendingEncryptedFolder=null;scope.launch{drawer.close()}}}
     val isTablet=LocalConfiguration.current.screenWidthDp>=840
     val drawerScroll=androidx.compose.foundation.rememberScrollState()
-    val appUpdate=rememberAppUpdateState()
+    val appUpdate:AppUpdateViewModel=viewModel()
     UpdatePrompt(appUpdate)
+    val textImporter=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{val target=folders.firstOrNull{it.id==folderId};runCatching{repo.importText(source,target)}.onSuccess{note->startInEditMode=false;editing=note;status="已导入 ${note.title}"}.onFailure{status="导入失败：${it.localizedMessage}"}}}}
     fun openNote(id:String,startEditing:Boolean=false){if(loadingNoteId!=null)return;loadingNoteId=id;scope.launch{runCatching{repo.loadNote(id)}.onSuccess{note->if(note!=null){startInEditMode=startEditing;editing=note}else status="笔记不存在或已被删除"}.onFailure{status="无法加载笔记：${it.localizedMessage}"};loadingNoteId=null}}
     LaunchedEffect(query){if(query.isBlank())matchingNoteIds=null else{delay(180);matchingNoteIds=runCatching{repo.searchNoteIds(query.trim())}.getOrElse{status="搜索失败：${it.localizedMessage}";emptySet()}}}
     LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->all.firstOrNull{it.id==id}?.let{target->destination=if(target.itemType=="todo")Destination.Today else Destination.All;folderId=null;tagId=null;openNote(id);onNotificationConsumed()}}}
@@ -159,7 +160,7 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
             Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
-        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination!=Destination.Trash&&destination!=Destination.Completed)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val todo=destination in setOf(Destination.Today,Destination.Important,Destination.Todos)||folder?.type=="todoList";val id=UUID.randomUUID().toString();if(folder?.type=="encryptedFolder")repo.markEncrypted(id,folder.id);startInEditMode=true;editing=NoteEntity(id,itemType=if(todo)"todo" else "note",important=destination==Destination.Important,folderId=folderId,folderName=folder?.name?:"未分类",tagIds=tagId?:"")},Modifier.testTag("new-item")){Icon(Icons.Default.Add,"新建")}}){pad->
+        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={IconButton({textImporter.launch(arrayOf("text/plain","text/markdown","application/octet-stream"))}){Icon(Icons.Default.UploadFile,"导入 txt/md")};UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination!=Destination.Trash&&destination!=Destination.Completed)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val todo=destination in setOf(Destination.Today,Destination.Important,Destination.Todos)||folder?.type=="todoList";val id=UUID.randomUUID().toString();if(folder?.type=="encryptedFolder")repo.markEncrypted(id,folder.id);startInEditMode=true;editing=NoteEntity(id,itemType=if(todo)"todo" else "note",important=destination==Destination.Important,folderId=folderId,folderName=folder?.name?:"未分类",tagIds=tagId?:"")},Modifier.testTag("new-item")){Icon(Icons.Default.Add,"新建")}}){pad->
             Column(Modifier.padding(pad).fillMaxSize().background(MaterialTheme.colorScheme.background)){
                 OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(12.dp),singleLine=true,shape=MaterialTheme.shapes.large,placeholder={Text("搜索全部笔记")},leadingIcon={Icon(Icons.Default.Search,null)})
                 status?.let{Text(it,Modifier.padding(horizontal=16.dp),color=MaterialTheme.colorScheme.primary)}
@@ -237,16 +238,11 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
         Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};Text(if(editMode)"编辑笔记" else "阅读笔记",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));IconButton({if(editMode)repo.flushDraft(n);editMode=!editMode},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
-            LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("markdown-view")){
-                item(key="note-title"){Text(n.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.padding(vertical=12.dp))}
-                if(n.folderName.isNotBlank()||n.tagIds.isNotBlank())item(key="note-folder"){Text(n.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}
-                item(key="note-markdown"){MarkdownView(n.body.ifBlank{"*暂无正文*"},Modifier.fillMaxWidth().padding(vertical=12.dp))}
-                if(n.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider()};items(steps,key={"read-step-${it.id}"}){step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
-                items(attachments,key={"read-asset-${it.id}"}){AttachmentView(it)}
-            }
+            ReadingPane(n,repo,steps,attachments,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
         OutlinedTextField(n.title,{updateNote(n.copy(title=it))},Modifier.fillMaxWidth().testTag("title-field"),textStyle=MaterialTheme.typography.headlineSmall,label={Text("标题")})
-        FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){Box{AssistChip(onClick={folderMenu=true},label={Text(n.folderName)},leadingIcon={Icon(Icons.Default.Folder,null)});DropdownMenu(folderMenu,{folderMenu=false}){DropdownMenuItem({Text("未分类")},{updateNote(n.copy(folderId=null,folderName="未分类"));folderMenu=false});folders.filter{it.type==if(n.itemType=="todo")"todoList" else "noteFolder"}.forEach{f->DropdownMenuItem({Text(f.name)},{updateNote(n.copy(folderId=f.id,folderName=f.name));folderMenu=false})}}};tags.forEach{tag->val selected=n.tagIds.split(',').contains(tag.id);FilterChip(selected,{val ids=n.tagIds.split(',').filter{it.isNotBlank()}.toMutableSet();if(selected)ids.remove(tag.id)else ids.add(tag.id);updateNote(n.copy(tagIds=ids.joinToString(",")))},{Text(tag.name)})}}
+        val encrypted=repo.isEncrypted(n)
+        FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){Box{AssistChip(onClick={folderMenu=true},label={Text(n.folderName)},leadingIcon={Icon(if(encrypted)Icons.Default.Lock else Icons.Default.Folder,null)});DropdownMenu(folderMenu,{folderMenu=false}){if(!encrypted)DropdownMenuItem({Text("未分类")},{updateNote(n.copy(folderId=null,folderName="未分类"));folderMenu=false});folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"}.forEach{f->DropdownMenuItem({Text(f.name)},{if(encrypted)repo.moveEncrypted(n.id,f.id);updateNote(n.copy(folderId=f.id,folderName=f.name,tagIds=if(encrypted)"" else n.tagIds));folderMenu=false})}}};if(!encrypted)tags.forEach{tag->val selected=n.tagIds.split(',').contains(tag.id);FilterChip(selected,{val ids=n.tagIds.split(',').filter{it.isNotBlank()}.toMutableSet();if(selected)ids.remove(tag.id)else ids.add(tag.id);updateNote(n.copy(tagIds=ids.joinToString(",")))},{Text(tag.name)})}}
         Spacer(Modifier.height(8.dp))
         fun wrap(before:String,after:String=before){val start=bodyValue.selection.min;val end=bodyValue.selection.max;val next=bodyValue.text.substring(0,start)+before+bodyValue.text.substring(start,end)+after+bodyValue.text.substring(end);bodyValue=TextFieldValue(next,TextRange(end+before.length+after.length));updateNote(n.copy(body=next))}
         Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){IconButton({wrap("**")}){Text("B",fontWeight=FontWeight.Bold)};IconButton({wrap("_")}){Text("I")};IconButton({wrap("# ","")}){Text("H")};IconButton({wrap("- ","")}){Icon(Icons.Default.FormatListBulleted,"列表")};IconButton({wrap("- [ ] ","")}){Icon(Icons.Default.CheckBox,"清单")}}
@@ -261,7 +257,42 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
 
 private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important)
 
-@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val markwon=remember(context){Markwon.builder(context).usePlugin(StrikethroughPlugin.create()).usePlugin(TablePlugin.create(context)).build()};AndroidView(factory={TextView(it).apply{setTextSize(TypedValue.COMPLEX_UNIT_SP,17f);setLineSpacing(0f,1.18f);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true)}},update={view->view.setTextColor(color);markwon.setMarkdown(view,markdown)},modifier=modifier)}
+private data class MarkdownChunk(val startUtf16:Int,val text:String)
+private fun markdownChunks(markdown:String,maxChars:Int=8*1024):List<MarkdownChunk>{
+    if(markdown.isEmpty())return listOf(MarkdownChunk(0,"*暂无正文*"));val result=mutableListOf<MarkdownChunk>();var start=0
+    while(start<markdown.length){val limit=minOf(start+maxChars,markdown.length);var end=if(limit==markdown.length)limit else markdown.lastIndexOf('\n',limit-1).takeIf{it>=start}?.plus(1)?:limit;if(end<=start)end=limit;result+=MarkdownChunk(start,markdown.substring(start,end));start=end}
+    return result
+}
+
+@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,modifier:Modifier=Modifier){
+    val chunks=remember(note.id,note.body){markdownChunks(note.body)};val state=rememberLazyListState();val views=remember(note.id){mutableMapOf<Int,TextView>()};val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)2 else 1
+    var restored by remember(note.id){mutableStateOf(false)};val latestRestored by rememberUpdatedState(restored)
+    fun capturedPosition():Pair<Int,Double>{
+        val first=state.firstVisibleItemIndex;val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);if(first<bodyStart)return 0 to 0.0
+        val chunkIndex=first-bodyStart;if(chunkIndex !in chunks.indices)return note.body.length to 0.0;val chunk=chunks[chunkIndex];val view=views[chunkIndex];val layout=view?.layout
+        if(layout==null||view.text.isEmpty())return chunk.startUtf16 to 0.0
+        val localY=state.firstVisibleItemScrollOffset.coerceIn(0,maxOf(0,layout.height-1));val line=layout.getLineForVertical(localY);val renderedOffset=layout.getLineStart(line);val sourceOffset=(renderedOffset.toDouble()/view.text.length.coerceAtLeast(1)*chunk.text.length).roundToInt().coerceIn(0,chunk.text.length);val fraction=((layout.getLineTop(line)-localY).toDouble()/viewport).coerceIn(-1.0,1.0)
+        return (chunk.startUtf16+sourceOffset).coerceIn(0,note.body.length) to fraction
+    }
+    LaunchedEffect(note.id,note.body){
+        val position=repo.readingPosition(note.id);if(position!=null&&note.body.isNotEmpty()){
+            val anchor=position.anchorUtf16Offset.coerceIn(0,note.body.length);val chunkIndex=chunks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+chunkIndex;state.scrollToItem(itemIndex)
+            for(attempt in 0 until 30){val view=views[chunkIndex];val layout=view?.layout;if(layout!=null&&view.text.isNotEmpty()){val chunk=chunks[chunkIndex];val sourceLocal=(anchor-chunk.startUtf16).coerceIn(0,chunk.text.length);val rendered=(sourceLocal.toDouble()/chunk.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1));val line=layout.getLineForOffset(rendered);val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);val desired=(layout.getLineTop(line)-position.viewportOffsetFraction*viewport).roundToInt().coerceAtLeast(0);state.scrollToItem(itemIndex,desired);break};delay(16)}
+        }
+        restored=true
+    }
+    LaunchedEffect(note.id,restored,chunks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
+    DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
+    LazyColumn(modifier,state=state){
+        item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.padding(vertical=12.dp))}
+        if(hasMetadata)item(key="note-folder"){Text(note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}
+        items(chunks.size,key={"note-markdown-${chunks[it].startUtf16}"}){index->val chunk=chunks[index];MarkdownView(chunk.text,Modifier.fillMaxWidth().padding(vertical=if(index==0)12.dp else 0.dp),onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})}
+        if(note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider()};items(steps,key={"read-step-${it.id}"}){step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
+        items(attachments,key={"read-asset-${it.id}"}){AttachmentView(it)}
+    }
+}
+
+@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val markwon=remember(context){Markwon.builder(context).usePlugin(StrikethroughPlugin.create()).usePlugin(TablePlugin.create(context)).build()};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;setTextSize(TypedValue.COMPLEX_UNIT_SP,17f);setLineSpacing(0f,1.18f);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true)}},update={view->view.setTextColor(color);if(view.tag!==markdown){markwon.setMarkdown(view,markdown);view.tag=markdown};onViewReady(view)},modifier=modifier)}
 
 @Composable private fun AttachmentView(asset:AssetEntity){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Card(Modifier.fillMaxWidth().padding(vertical=4.dp).clickable{open()}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().heightIn(max=180.dp))}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)"${asset.size/1024} KB" else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
 
@@ -293,26 +324,7 @@ private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.f
 
 @Composable private fun ReminderPermissionCard(){val context=LocalContext.current;val owner=LocalLifecycleOwner.current;var refresh by remember{mutableIntStateOf(0)};val notificationLauncher=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){refresh++};DisposableEffect(owner){val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)refresh++};owner.lifecycle.addObserver(observer);onDispose{owner.lifecycle.removeObserver(observer)}};val notifications=refresh.let{android.os.Build.VERSION.SDK_INT<33||context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==android.content.pm.PackageManager.PERMISSION_GRANTED};val alarm=context.getSystemService(android.content.Context.ALARM_SERVICE) as android.app.AlarmManager;val exact=android.os.Build.VERSION.SDK_INT<31||alarm.canScheduleExactAlarms();Card(Modifier.fillMaxWidth()){Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(8.dp)){Text("提醒权限",fontWeight=FontWeight.SemiBold);Text("通知：${if(notifications)"已允许" else "未允许"}    精确提醒：${if(exact)"已允许" else "将使用非精确提醒"}",style=MaterialTheme.typography.bodySmall);FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){if(!notifications)OutlinedButton({notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)}){Text("允许通知")};if(!exact&&android.os.Build.VERSION.SDK_INT>=31)OutlinedButton({val intent=Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,android.net.Uri.parse("package:${context.packageName}"));runCatching{context.startActivity(intent)}}){Text("允许精确提醒")}}}}}
 
-private enum class UpdatePhase{Checking,Available,Downloading,Ready,Failed}
-@Stable private class AppUpdateState{
-    var release by mutableStateOf<GithubRelease?>(null)
-    var phase by mutableStateOf(UpdatePhase.Checking)
-    var progress by mutableStateOf(DownloadProgress(0,-1))
-    var downloaded by mutableStateOf<java.io.File?>(null)
-    var message by mutableStateOf<String?>(null)
-    var showDialog by mutableStateOf(false)
-}
-
-@Composable private fun rememberAppUpdateState():AppUpdateState{
-    val context=LocalContext.current;val state=remember{AppUpdateState()}
-    LaunchedEffect(Unit){runCatching{AppUpdater.latestRelease()}.onSuccess{release->
-        state.release=release
-        if(release!=null){state.downloaded=AppUpdater.cachedDownload(context,release);state.phase=if(state.downloaded!=null)UpdatePhase.Ready else UpdatePhase.Available;state.message=if(state.downloaded!=null)"安装包已下载并校验，可以继续安装" else null;state.showDialog=true}
-    }.onFailure{state.phase=UpdatePhase.Failed}}
-    return state
-}
-
-@Composable private fun UpdateAction(state:AppUpdateState){
+@Composable private fun UpdateAction(state:AppUpdateViewModel){
     if(state.release==null)return
     IconButton({state.showDialog=true}){
         if(state.phase==UpdatePhase.Downloading){val fraction=state.progress.fraction;if(fraction!=null)CircularProgressIndicator(progress={fraction},modifier=Modifier.size(22.dp),strokeWidth=2.5.dp)else CircularProgressIndicator(Modifier.size(22.dp),strokeWidth=2.5.dp)}
@@ -320,18 +332,15 @@ private enum class UpdatePhase{Checking,Available,Downloading,Ready,Failed}
     }
 }
 
-@Composable private fun UpdatePrompt(state:AppUpdateState){
-    val context=LocalContext.current;val scope=rememberCoroutineScope();val release=state.release?:return
-    fun install(){val apk=state.downloaded?:return;if(AppUpdater.install(context,apk)){state.message="正在打开系统安装程序…"}else state.message="请允许安装未知应用，返回后点击顶部升级图标继续安装"}
-    fun download(){if(state.phase==UpdatePhase.Downloading)return;scope.launch{state.phase=UpdatePhase.Downloading;state.message="正在下载更新，可关闭窗口后从顶部升级图标查看";runCatching{AppUpdater.download(context,release){progress->withContext(Dispatchers.Main.immediate){state.progress=progress}}}.onSuccess{state.downloaded=it;state.phase=UpdatePhase.Ready;state.message="下载和校验完成，正在打开系统安装程序";install()}.onFailure{state.phase=UpdatePhase.Failed;state.message="下载中断：${it.localizedMessage}。再次点击可从已下载位置继续"}}}
+@Composable private fun UpdatePrompt(state:AppUpdateViewModel){
+    val release=state.release?:return
     if(!state.showDialog)return
-    val action:()->Unit=if(state.downloaded==null){{download()}}else{{install()}}
     AlertDialog(onDismissRequest={state.showDialog=false},icon={Icon(if(state.phase==UpdatePhase.Ready)Icons.Default.InstallMobile else Icons.Default.SystemUpdate,null)},title={Text("发现新版本 ${release.version}")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){
         Text("当前版本：${BuildConfig.VERSION_NAME}")
         release.notes.take(600).takeIf{it.isNotBlank()}?.let{Text(it,style=MaterialTheme.typography.bodySmall)}
         if(state.phase==UpdatePhase.Downloading){val fraction=state.progress.fraction;if(fraction!=null)LinearProgressIndicator(progress={fraction},modifier=Modifier.fillMaxWidth())else LinearProgressIndicator(Modifier.fillMaxWidth());Text(downloadLabel(state.progress),style=MaterialTheme.typography.bodySmall)}
         state.message?.let{Text(it,color=if(state.phase==UpdatePhase.Failed)MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)}
-    }},confirmButton={Button(onClick=action,enabled=state.phase!=UpdatePhase.Downloading){Text(if(state.downloaded==null)if(state.phase==UpdatePhase.Failed)"继续下载" else "下载并升级" else "继续安装")}},dismissButton={TextButton({state.showDialog=false}){Text(if(state.phase==UpdatePhase.Downloading)"后台下载" else "稍后")}})
+    }},confirmButton={Button(onClick=state::downloadOrInstall,enabled=state.phase!=UpdatePhase.Downloading){Text(if(state.downloaded==null)if(state.phase==UpdatePhase.Failed)"继续下载" else "下载并升级" else "继续安装")}},dismissButton={TextButton({state.showDialog=false}){Text(if(state.phase==UpdatePhase.Downloading)"后台下载" else "稍后")}})
 }
 
 private fun downloadLabel(progress:DownloadProgress):String{

@@ -8,6 +8,8 @@ import androidx.core.content.FileProvider
 import com.google.gson.JsonParser
 import io.github.notebook.android.BuildConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -54,13 +56,14 @@ object AppUpdater {
     internal fun compareVersions(a:String,b:String):Int{val x=a.substringBefore('-').split('.').map{it.toIntOrNull()?:0};val y=b.substringBefore('-').split('.').map{it.toIntOrNull()?:0};for(i in 0 until maxOf(x.size,y.size)){val c=(x.getOrElse(i){0}).compareTo(y.getOrElse(i){0});if(c!=0)return c};return 0}
     private fun targetFile(context:Context,release:GithubRelease)=File(context.cacheDir,"updates/notebook-${release.version}.apk")
     private fun markerFile(target:File)=File(target.parentFile,"${target.name}.sha256")
-    private fun connection(url:String)=(URL(url).openConnection() as HttpURLConnection).apply{connectTimeout=15_000;readTimeout=30_000;instanceFollowRedirects=true;setRequestProperty("Accept","application/octet-stream, application/vnd.github+json");setRequestProperty("User-Agent","Notebook-Android/${BuildConfig.VERSION_NAME}")}
+    private fun connection(url:String)=(URL(url).openConnection() as HttpURLConnection).apply{connectTimeout=30_000;readTimeout=120_000;instanceFollowRedirects=true;setRequestProperty("Accept","application/octet-stream, application/vnd.github+json");setRequestProperty("User-Agent","Notebook-Android/${BuildConfig.VERSION_NAME}")}
     private fun getText(url:String):String=connection(url).run{try{require(responseCode in 200..299){"GitHub 请求失败：HTTP $responseCode"};inputStream.bufferedReader().use{it.readText()}}finally{disconnect()}}
     private fun sha256(file:File):String{val digest=MessageDigest.getInstance("SHA-256");file.inputStream().buffered().use{input->val buffer=ByteArray(DEFAULT_BUFFER_SIZE);while(true){val count=input.read(buffer);if(count<0)break;digest.update(buffer,0,count)}};return digest.digest().joinToString(""){"%02x".format(it)}}
 
     private suspend fun downloadTo(url:String,file:File,onProgress:suspend (DownloadProgress)->Unit){
         var existing=file.takeIf{it.isFile}?.length()?:0L
         suspend fun transfer(allowRetry:Boolean){connection(url).run{
+            existing=file.takeIf{it.isFile}?.length()?:0L
             if(existing>0)setRequestProperty("Range","bytes=$existing-")
             try{
                 val code=responseCode
@@ -82,6 +85,8 @@ object AppUpdater {
                 onProgress(DownloadProgress(downloaded,total.takeIf{it>0}?:downloaded))
             }finally{disconnect()}
         }}
-        transfer(true)
+        var lastFailure:Throwable?=null
+        repeat(3){attempt->try{transfer(true);return}catch(error:Throwable){if(error is CancellationException)throw error;lastFailure=error;if(attempt<2)delay((attempt+1)*1_500L)}}
+        throw lastFailure?:IllegalStateException("下载失败")
     }
 }

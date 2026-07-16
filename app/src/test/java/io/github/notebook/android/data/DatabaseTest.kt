@@ -69,9 +69,9 @@ class DatabaseTest {
     }
 
     @Test fun `note deletion cascades steps and assets`()=runBlocking {
-        dao.put(NoteEntity("n"));dao.putStep(TodoStepEntity("s","n","步骤"));dao.putAssets(listOf(AssetEntity("a","n","file","a.txt","text/plain","n/a.txt")))
+        dao.put(NoteEntity("n"));dao.putStep(TodoStepEntity("s","n","步骤"));dao.putAssets(listOf(AssetEntity("a","n","file","a.txt","text/plain","n/a.txt")));dao.putReadingPosition(ReadingPositionEntity("n",42,.1,99,"phone"))
         dao.deleteNotePermanently("n")
-        assertTrue(dao.steps("n").isEmpty());assertTrue(dao.assets("n").isEmpty())
+        assertTrue(dao.steps("n").isEmpty());assertTrue(dao.assets("n").isEmpty());assertNull(dao.readingPosition("n"))
     }
 
     @Test fun `updating note never deletes its steps or assets`()=runBlocking {
@@ -98,5 +98,12 @@ class DatabaseTest {
         dao.putDraft(DraftEntity("new-note","{\"title\":\"草稿\"}",42))
         assertNull(dao.get("new-note"));assertEquals("new-note",dao.allDrafts().single().noteId)
         dao.deleteDraft("new-note");assertTrue(dao.allDrafts().isEmpty())
+    }
+
+    @Test fun `reading position is independent from note version and dirty state`()=runBlocking {
+        dao.put(NoteEntity("n",version=7,dirty=false))
+        dao.putReadingPosition(ReadingPositionEntity("n",321,.25,1234,"android"))
+        val note=dao.get("n")!!;val position=dao.readingPosition("n")!!
+        assertEquals(7,note.version);assertFalse(note.dirty);assertEquals(321,position.anchorUtf16Offset);assertEquals(.25,position.viewportOffsetFraction,0.0)
     }
 }

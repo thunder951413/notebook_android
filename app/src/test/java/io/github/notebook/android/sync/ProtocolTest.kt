@@ -1,6 +1,7 @@
 package io.github.notebook.android.sync
 
 import com.google.gson.JsonObject
+import io.github.notebook.android.data.ReadingPositionEntity
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -48,6 +49,24 @@ class ProtocolTest {
         assertTrue(spans.any{it.asJsonObject["italic"]?.asBoolean==true})
         assertTrue(spans.any{it.asJsonObject["link"]?.asString=="https://example.com"})
         assertEquals(source,BlockDocumentCodec.decodeMarkdown(blocks))
+    }
+
+    @Test fun `large markdown is compacted without changing content`() {
+        val source=(0 until 1_200).joinToString("\n"){"第 $it 行"}
+        val first=BlockDocumentCodec.encodeMarkdown(source,"note")
+        val second=BlockDocumentCodec.encodeMarkdown(source,"note")
+        assertTrue(first.size()<10)
+        assertEquals(source,BlockDocumentCodec.decodeMarkdown(first))
+        assertEquals(first.map{it.asJsonObject["id"].asString},second.map{it.asJsonObject["id"].asString})
+    }
+
+    @Test fun `reading position uses mac ISO dates and deterministic last writer wins`() {
+        val older=ReadingPositionEntity("note",10,0.0,1_700_000_000_000,"phone-a")
+        val tieWinner=older.copy(anchorUtf16Offset=30,deviceId="phone-z")
+        val encoded=ReadingPositionProtocol.encode(older)
+        assertTrue(encoded["updatedAt"].asString.endsWith("Z"))
+        assertEquals(older,ReadingPositionProtocol.decode(encoded))
+        assertEquals(tieWinner,ReadingPositionProtocol.merge(listOf(older),listOf(tieWinner)).single())
     }
 
     private fun entry(id:String,version:Long)=JsonObject().apply{addProperty("noteID",id);addProperty("version",version);addProperty("contentHash","");addProperty("historyCount",0)}
