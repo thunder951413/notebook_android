@@ -9,7 +9,12 @@ import com.google.gson.JsonParser
 import io.github.notebook.android.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -56,11 +61,41 @@ object AppUpdater {
     internal fun compareVersions(a:String,b:String):Int{val x=a.substringBefore('-').split('.').map{it.toIntOrNull()?:0};val y=b.substringBefore('-').split('.').map{it.toIntOrNull()?:0};for(i in 0 until maxOf(x.size,y.size)){val c=(x.getOrElse(i){0}).compareTo(y.getOrElse(i){0});if(c!=0)return c};return 0}
     private fun targetFile(context:Context,release:GithubRelease)=File(context.cacheDir,"updates/notebook-${release.version}.apk")
     private fun markerFile(target:File)=File(target.parentFile,"${target.name}.sha256")
-    private fun connection(url:String)=(URL(url).openConnection() as HttpURLConnection).apply{connectTimeout=30_000;readTimeout=120_000;instanceFollowRedirects=true;setRequestProperty("Accept","application/octet-stream, application/vnd.github+json");setRequestProperty("User-Agent","Notebook-Android/${BuildConfig.VERSION_NAME}")}
+    private fun connection(url:String)=(URL(url).openConnection() as HttpURLConnection).apply{connectTimeout=30_000;readTimeout=120_000;instanceFollowRedirects=true;setRequestProperty("Accept","application/octet-stream, application/vnd.github+json");setRequestProperty("Accept-Encoding","identity");setRequestProperty("User-Agent","Notebook-Android/${BuildConfig.VERSION_NAME}")}
     private fun getText(url:String):String=connection(url).run{try{require(responseCode in 200..299){"GitHub 请求失败：HTTP $responseCode"};inputStream.bufferedReader().use{it.readText()}}finally{disconnect()}}
     private fun sha256(file:File):String{val digest=MessageDigest.getInstance("SHA-256");file.inputStream().buffered().use{input->val buffer=ByteArray(DEFAULT_BUFFER_SIZE);while(true){val count=input.read(buffer);if(count<0)break;digest.update(buffer,0,count)}};return digest.digest().joinToString(""){"%02x".format(it)}}
 
     private suspend fun downloadTo(url:String,file:File,onProgress:suspend (DownloadProgress)->Unit){
+        val total=runCatching{probeRangeTotal(url)}.getOrNull()
+        if(total!=null&&total>=1024L*1024L){downloadInRanges(url,file,total,onProgress);return}
+        downloadSingleTo(url,file,onProgress)
+    }
+
+    private fun probeRangeTotal(url:String):Long?=connection(url).run{setRequestProperty("Range","bytes=0-0");try{if(responseCode!=HttpURLConnection.HTTP_PARTIAL)return@run null;val parsed=parseContentRange(getHeaderField("Content-Range"))?:return@run null;inputStream.use{it.read()};parsed.total}finally{disconnect()}}
+
+    private suspend fun downloadInRanges(url:String,file:File,total:Long,onProgress:suspend (DownloadProgress)->Unit)=coroutineScope{
+        if(file.isFile&&file.length()==total){onProgress(DownloadProgress(total,total));return@coroutineScope}
+        val ranges=byteRanges(total);val segments=ranges.indices.map{File(file.parentFile,"${file.name}.segment-$it")};segments.zip(ranges).forEach{(segment,range)->if(segment.length()>range.last-range.first+1)segment.delete()};val progressLock=Mutex();var lastPercent=-1
+        suspend fun report(){progressLock.withLock{val downloaded=segments.sumOf{it.length()}.coerceAtMost(total);val percent=(downloaded*100/total).toInt();if(percent!=lastPercent){lastPercent=percent;onProgress(DownloadProgress(downloaded,total))}}}
+        report()
+        ranges.mapIndexed{index,range->async(Dispatchers.IO){downloadRange(url,segments[index],range,total){report()}}}.awaitAll()
+        FileOutputStream(file,false).buffered().use{output->segments.forEach{segment->segment.inputStream().buffered().use{it.copyTo(output)}}}
+        require(file.length()==total){"分段下载合并长度不一致"};segments.forEach{it.delete()};onProgress(DownloadProgress(total,total))
+    }
+
+    private suspend fun downloadRange(url:String,file:File,range:LongRange,total:Long,onProgress:suspend ()->Unit){
+        val expected=range.last-range.first+1;if(file.length()>expected)file.delete()
+        var lastFailure:Throwable?=null
+        repeat(3){attempt->try{
+            val existing=file.takeIf{it.isFile}?.length()?:0L;if(existing==expected){onProgress();return}
+            val start=range.first+existing
+            connection(url).run{setRequestProperty("Range","bytes=$start-${range.last}");try{require(responseCode==HttpURLConnection.HTTP_PARTIAL){"服务器未返回分段内容：HTTP $responseCode"};val received=parseContentRange(getHeaderField("Content-Range"));require(received!=null&&received.start==start&&received.end==range.last&&received.total==total){"服务器返回了无效的 Content-Range"};inputStream.use{input->FileOutputStream(file,true).buffered().use{output->val buffer=ByteArray(64*1024);while(true){val count=input.read(buffer);if(count<0)break;output.write(buffer,0,count);onProgress()}}}}finally{disconnect()}}
+            require(file.length()==expected){"分段下载长度不一致"};return
+        }catch(error:Throwable){if(error is CancellationException)throw error;lastFailure=error;if(attempt<2)delay((attempt+1)*1_500L)}}
+        throw lastFailure?:IllegalStateException("分段下载失败")
+    }
+
+    private suspend fun downloadSingleTo(url:String,file:File,onProgress:suspend (DownloadProgress)->Unit){
         var existing=file.takeIf{it.isFile}?.length()?:0L
         suspend fun transfer(allowRetry:Boolean){connection(url).run{
             existing=file.takeIf{it.isFile}?.length()?:0L
@@ -90,3 +125,7 @@ object AppUpdater {
         throw lastFailure?:IllegalStateException("下载失败")
     }
 }
+
+internal data class ParsedContentRange(val start:Long,val end:Long,val total:Long)
+internal fun parseContentRange(value:String?):ParsedContentRange?{val match=Regex("bytes (\\d+)-(\\d+)/(\\d+)",RegexOption.IGNORE_CASE).matchEntire(value.orEmpty())?:return null;val (start,end,total)=match.destructured;return ParsedContentRange(start.toLong(),end.toLong(),total.toLong()).takeIf{it.start<=it.end&&it.end<it.total}}
+internal fun byteRanges(total:Long,count:Int=4):List<LongRange>{require(total>0&&count>0);val actual=minOf(total,count.toLong()).toInt();val base=total/actual;val extra=total%actual;var start=0L;return List(actual){index->val length=base+if(index<extra)1 else 0;val range=start..(start+length-1);start=range.last+1;range}}

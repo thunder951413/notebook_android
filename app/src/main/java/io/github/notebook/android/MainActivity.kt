@@ -105,6 +105,8 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
     val isTablet=LocalConfiguration.current.screenWidthDp>=840
     val drawerScroll=androidx.compose.foundation.rememberScrollState()
     val appUpdate:AppUpdateViewModel=viewModel()
+    val updateLifecycleOwner=LocalLifecycleOwner.current
+    DisposableEffect(updateLifecycleOwner,appUpdate){val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)appUpdate.checkForUpdate()};updateLifecycleOwner.lifecycle.addObserver(observer);if(updateLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))appUpdate.checkForUpdate();onDispose{updateLifecycleOwner.lifecycle.removeObserver(observer)}}
     UpdatePrompt(appUpdate)
     val textImporter=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{val target=folders.firstOrNull{it.id==folderId};runCatching{repo.importText(source,target)}.onSuccess{note->startInEditMode=false;editing=note;status="已导入 ${note.title}"}.onFailure{status="导入失败：${it.localizedMessage}"}}}}
     fun openNote(id:String,startEditing:Boolean=false){if(loadingNoteId!=null)return;loadingNoteId=id;scope.launch{runCatching{repo.loadNote(id)}.onSuccess{note->if(note!=null){startInEditMode=startEditing;editing=note}else status="笔记不存在或已被删除"}.onFailure{status="无法加载笔记：${it.localizedMessage}"};loadingNoteId=null}}
