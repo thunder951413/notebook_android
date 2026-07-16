@@ -62,6 +62,26 @@ class MainActivityTest {
         rule.onNodeWithText("设置与同步").assertIsDisplayed()
     }
 
+    @Test fun folderBelowSelectedFolderRemainsClickable(){
+        val suffix=System.nanoTime().toString()
+        val selectedId="selected-folder-$suffix";val targetId="target-folder-$suffix"
+        val selectedName="已选目录-$suffix";val targetName="下方目录-$suffix";val targetNote="下方目录笔记-$suffix"
+        val app=rule.activity.application as NotebookApp
+        runBlocking{
+            app.database.dao().putFolder(FolderEntity(selectedId,selectedName,10_000,"noteFolder"))
+            app.database.dao().putFolder(FolderEntity(targetId,targetName,10_001,"noteFolder"))
+            app.database.dao().put(NoteEntity("target-note-$suffix",title=targetNote,folderId=targetId,folderName=targetName))
+        }
+        rule.activityRule.scenario.recreate()
+        rule.onNodeWithContentDescription("导航").performClick()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText(selectedName))
+        rule.onNodeWithText(selectedName).performClick()
+        rule.onNodeWithContentDescription("导航").performClick()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText(targetName))
+        rule.onNodeWithText(targetName).assertIsDisplayed().performClick()
+        rule.onNodeWithText(targetNote).assertIsDisplayed()
+    }
+
     @Test fun existingNoteOpensInMarkdownAndCanSwitchToEdit(){
         val app=rule.activity.application as NotebookApp;val title="Markdown 阅读-${System.nanoTime()}"
         runBlocking{app.database.dao().put(NoteEntity("markdown-mode-test",title=title,body="# 一级标题\n\n**粗体内容**"))}

@@ -173,8 +173,8 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
             }
         }
     }
-    if(isTablet)PermanentNavigationDrawer(drawerContent={PermanentDrawerSheet(Modifier.width(280.dp).verticalScroll(drawerScroll).testTag("drawer-scroll"),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant,content=drawerItems)},content=mainContent)
-    else ModalNavigationDrawer(drawerState=drawer,drawerContent={ModalDrawerSheet(Modifier.width(300.dp).verticalScroll(drawerScroll).testTag("drawer-scroll"),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant,content=drawerItems)},content=mainContent)
+    if(isTablet)PermanentNavigationDrawer(drawerContent={PermanentDrawerSheet(Modifier.width(280.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
+    else ModalNavigationDrawer(drawerState=drawer,drawerContent={ModalDrawerSheet(Modifier.width(300.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
 }
 
 @Composable private fun DrawerRow(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,selected:Boolean,count:Int?=null,onClick:()->Unit){NavigationDrawerItem(label={Row{Text(label);Spacer(Modifier.weight(1f));count?.let{Text(it.toString(),style=MaterialTheme.typography.labelMedium)}}},icon={Icon(icon,null)},selected=selected,onClick=onClick,modifier=Modifier.padding(horizontal=8.dp,vertical=1.dp))}
