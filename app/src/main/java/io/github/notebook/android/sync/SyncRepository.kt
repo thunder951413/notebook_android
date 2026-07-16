@@ -33,12 +33,13 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private val gson=GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create()
     private val appScope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
     private val saveMutex=Mutex()
+    private val syncMutex=Mutex()
     private val pendingDrafts=ConcurrentHashMap<String,NoteEntity>()
     private val draftJobs=ConcurrentHashMap<String,Job>()
     private val _saveError=MutableStateFlow<String?>(null)
     val saveError=_saveError.asStateFlow()
     fun clearSaveError(){_saveError.value=null}
-    private val prefs=EncryptedSharedPreferences.create(context,"ssh",MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
+    private val prefs=encryptedPrefs(context)
     val notes=dao.observeNotes()
     val folders=dao.observeFolders()
     val tags=dao.observeTags()
@@ -56,7 +57,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     fun flushAllAsync(){pendingDrafts.values.toList().forEach(::flushDraft)}
     suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);pendingDrafts.remove(draft.id,draft)}}
     suspend fun recoverDrafts(){dao.allDrafts().sortedBy{it.updatedAt}.forEach{draft->runCatching{gson.fromJson(draft.payloadJson,NoteEntity::class.java)}.getOrNull()?.let{persistDraft(it)}}}
-    fun recoverDraftsAsync(){appScope.launch{recoverDrafts()}}
+    fun recoverDraftsAsync(){appScope.launch{runCatching{recoverDrafts()}.onFailure{_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
 
     private suspend fun persistDraft(draft:NoteEntity):NoteEntity=saveMutex.withLock{
         val current=dao.get(draft.id)
@@ -86,7 +87,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     fun recordingFile(noteId:String)=java.io.File(appContext.filesDir,"recordings/$noteId/${System.currentTimeMillis()}.m4a")
     suspend fun addRecordedAudio(noteId:String,file:java.io.File):AssetEntity=withContext(Dispatchers.IO){require(file.isFile&&file.length()>0){"录音文件为空"};val id=UUID.randomUUID().toString();val relative="$noteId/$id-${file.name}";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();file.copyTo(target,true);file.delete();AssetEntity(id,noteId,"audio",target.name,"audio/mp4",relative,target.absolutePath,sha(target.readBytes()),target.length(),true).also{dao.putAssets(listOf(it));dao.get(noteId)?.let{n->save(n)}}}
 
-    suspend fun sync():Unit=withContext(Dispatchers.IO){
+    suspend fun sync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
         flushAll()
         val s=settings(); require(s.host.isNotBlank()&&s.username.isNotBlank()){ "请先配置 SSH 服务器" }
         val verifier=s.fingerprint.takeIf{it.isNotBlank()}?.let{FingerprintHostKeyRepository(s.host,it)}
@@ -96,7 +97,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         if(s.fingerprint.isBlank())saveSettings(s.copy(fingerprint=sshSha256Fingerprint(java.util.Base64.getDecoder().decode(session.hostKey.key))))
         val ch=(session.openChannel("sftp") as ChannelSftp).apply{connect(15_000)}
         try { mkdirs(ch,s.path); mkdirs(ch,"${s.path}/notes");mkdirs(ch,"${s.path}/attachments");pullLibrary(ch,s);pullNotes(ch,s);pullAssets(ch,s);pushLibrary(ch,s);pushNotes(ch,s);pushAssets(ch,s);Reminders.reconcile(appContext,dao.reminders()) } finally { ch.disconnect();session.disconnect() }
-    }
+    }}
 
     private suspend fun pullLibrary(c:ChannelSftp,s:SshSettings){
         val root=readJson(c,"${s.path}/library.json")?:return
@@ -191,6 +192,11 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private fun sha(s:String)=MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString(""){"%02x".format(it)}
     private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}
     private fun safeRelative(path:String):String{val normalized=path.replace('\\','/').trimStart('/');require(normalized.isNotBlank()&&!normalized.split('/').any{it==".."||it.isBlank()}){"非法附件路径"};return normalized}
+    private fun encryptedPrefs(context:Context)=runCatching{createEncryptedPrefs(context)}.getOrElse{
+        context.deleteSharedPreferences("ssh")
+        createEncryptedPrefs(context)
+    }
+    private fun createEncryptedPrefs(context:Context)=EncryptedSharedPreferences.create(context,"ssh",MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
 }
 private fun JsonObject.str(k:String,d:String="")=get(k)?.takeUnless{it.isJsonNull}?.asString?:d
 private fun JsonObject.optStr(k:String)=get(k)?.takeUnless{it.isJsonNull}?.asString
