@@ -9,6 +9,7 @@ data class NoteEntity(
     @PrimaryKey val id: String,
     val title: String = "",
     val body: String = "",
+    val previewText: String = "",
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis(),
     val folderId: String? = null,
@@ -59,6 +60,7 @@ data class NoteEditableUpdate(
     val id:String,
     val title:String,
     val body:String,
+    val previewText:String,
     val createdAt:Long,
     val updatedAt:Long,
     val folderId:String?,
@@ -88,17 +90,21 @@ data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:Stri
 
 @Dao interface NotebookDao {
     @Query("SELECT * FROM notes ORDER BY updatedAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
-    @Query("SELECT id,title,substr(body,1,240) AS preview,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion FROM notes ORDER BY updatedAt DESC") fun observeNoteSummaries():Flow<List<NoteSummary>>
+    @Query("SELECT id,title,previewText AS preview,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion FROM notes ORDER BY updatedAt DESC") fun observeNoteSummaries():Flow<List<NoteSummary>>
     @Query("SELECT * FROM notes WHERE id=:id") suspend fun get(id:String): NoteEntity?
-    @Query("SELECT id,title,body,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE id=:id") suspend fun getForEditing(id:String):NoteEntity?
-    @Query("SELECT snapshotJson FROM notes WHERE id=:id") suspend fun snapshot(id:String):String?
-    @Query("SELECT conflictSnapshotJson FROM notes WHERE id=:id") suspend fun conflictSnapshot(id:String):String?
+    @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE id=:id") suspend fun getNoteHeader(id:String):NoteEntity?
+    @Query("SELECT length(body) FROM notes WHERE id=:id") suspend fun bodyLength(id:String):Int?
+    @Query("SELECT substr(body,:start,:length) FROM notes WHERE id=:id") suspend fun bodyChunk(id:String,start:Int,length:Int):String?
+    @Query("SELECT length(snapshotJson) FROM notes WHERE id=:id") suspend fun snapshotLength(id:String):Int?
+    @Query("SELECT substr(snapshotJson,:start,:length) FROM notes WHERE id=:id") suspend fun snapshotChunk(id:String,start:Int,length:Int):String?
+    @Query("SELECT length(conflictSnapshotJson) FROM notes WHERE id=:id") suspend fun conflictSnapshotLength(id:String):Int?
+    @Query("SELECT substr(conflictSnapshotJson,:start,:length) FROM notes WHERE id=:id") suspend fun conflictSnapshotChunk(id:String,start:Int,length:Int):String?
     @Query("SELECT id FROM notes") suspend fun allNoteIds():List<String>
     @Query("SELECT id FROM notes WHERE dirty=1") suspend fun dirtyNoteIds():List<String>
     @Query("SELECT id FROM notes WHERE title LIKE '%' || :query || '%' OR body LIKE '%' || :query || '%'") suspend fun searchNoteIds(query:String):List<String>
     @Query("SELECT * FROM notes") suspend fun allNotes(): List<NoteEntity>
     @Query("SELECT * FROM notes WHERE dirty=1") suspend fun dirtyNotes(): List<NoteEntity>
-    @Query("SELECT id,title,'' AS body,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
+    @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
     @Upsert suspend fun put(note:NoteEntity)
     @Upsert suspend fun putNotes(notes:List<NoteEntity>)
     @Update(entity=NoteEntity::class) suspend fun updateEditable(note:NoteEditableUpdate)
@@ -130,10 +136,14 @@ data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:Stri
     @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putTombstone(item:TombstoneEntity)
     @Upsert suspend fun putDraft(draft:DraftEntity)
     @Query("SELECT * FROM drafts") suspend fun allDrafts():List<DraftEntity>
+    @Query("SELECT noteId FROM drafts ORDER BY updatedAt") suspend fun draftNoteIds():List<String>
+    @Query("SELECT updatedAt FROM drafts WHERE noteId=:noteId") suspend fun draftUpdatedAt(noteId:String):Long?
+    @Query("SELECT length(payloadJson) FROM drafts WHERE noteId=:noteId") suspend fun draftPayloadLength(noteId:String):Int?
+    @Query("SELECT substr(payloadJson,:start,:length) FROM drafts WHERE noteId=:noteId") suspend fun draftPayloadChunk(noteId:String,start:Int,length:Int):String?
     @Query("DELETE FROM drafts WHERE noteId=:noteId") suspend fun deleteDraft(noteId:String)
 }
 
-@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class], version=3, exportSchema=false)
+@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class], version=4, exportSchema=false)
 abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
     companion object {
         private val MIGRATION_1_2=object:androidx.room.migration.Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
@@ -147,6 +157,10 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
             db.execSQL("CREATE TABLE IF NOT EXISTS tombstones (itemKey TEXT NOT NULL, itemId TEXT NOT NULL, itemType TEXT NOT NULL, deletedAt INTEGER NOT NULL, deviceId TEXT NOT NULL, PRIMARY KEY(itemKey))")
         }}
         private val MIGRATION_2_3=object:androidx.room.migration.Migration(2,3){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("CREATE TABLE IF NOT EXISTS drafts (noteId TEXT NOT NULL, payloadJson TEXT NOT NULL, updatedAt INTEGER NOT NULL, PRIMARY KEY(noteId))")}}
-        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3).build()
+        private val MIGRATION_3_4=object:androidx.room.migration.Migration(3,4){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
+            db.execSQL("ALTER TABLE notes ADD COLUMN previewText TEXT NOT NULL DEFAULT ''")
+            db.execSQL("UPDATE notes SET previewText=trim(replace(replace(substr(body,1,300),char(13),' '),char(10),' ')) WHERE previewText='' AND body!=''")
+        }}
+        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4).build()
     }
 }

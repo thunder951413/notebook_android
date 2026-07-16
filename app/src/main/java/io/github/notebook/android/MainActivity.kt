@@ -233,12 +233,12 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
         Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};Text(if(editMode)"编辑笔记" else "阅读笔记",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));IconButton({if(editMode)repo.flushDraft(n);editMode=!editMode},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
-            Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(androidx.compose.foundation.rememberScrollState()).testTag("markdown-view")){
-                Text(n.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.padding(vertical=12.dp))
-                if(n.folderName.isNotBlank()||n.tagIds.isNotBlank())Text(n.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                MarkdownView(n.body.ifBlank{"*暂无正文*"},Modifier.fillMaxWidth().padding(vertical=12.dp))
-                if(n.itemType=="todo"&&steps.isNotEmpty()){HorizontalDivider();steps.forEach{step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
-                attachments.forEach{AttachmentView(it)}
+            LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("markdown-view")){
+                item(key="note-title"){Text(n.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.padding(vertical=12.dp))}
+                if(n.folderName.isNotBlank()||n.tagIds.isNotBlank())item(key="note-folder"){Text(n.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}
+                item(key="note-markdown"){MarkdownView(n.body.ifBlank{"*暂无正文*"},Modifier.fillMaxWidth().padding(vertical=12.dp))}
+                if(n.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider()};items(steps,key={"read-step-${it.id}"}){step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
+                items(attachments,key={"read-asset-${it.id}"}){AttachmentView(it)}
             }
         }else{
         OutlinedTextField(n.title,{updateNote(n.copy(title=it))},Modifier.fillMaxWidth().testTag("title-field"),textStyle=MaterialTheme.typography.headlineSmall,label={Text("标题")})

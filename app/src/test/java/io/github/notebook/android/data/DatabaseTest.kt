@@ -30,19 +30,37 @@ class DatabaseTest {
 
     @Test fun `summary query never loads large note payloads`()=runBlocking {
         val body="正文".repeat(2_000)
-        dao.put(NoteEntity("large",title="大笔记",body=body,snapshotJson="x".repeat(3_000_000)))
+        val preview="持久化摘要"
+        dao.put(NoteEntity("large",title="大笔记",body=body,previewText=preview,snapshotJson="x".repeat(3_000_000)))
         val summary=dao.observeNoteSummaries().first().single()
         assertEquals("large",summary.id)
-        assertEquals(body.take(240),summary.preview)
+        assertEquals(preview,summary.preview)
     }
 
     @Test fun `editable partial update preserves sync snapshots`()=runBlocking {
         dao.put(NoteEntity("n",title="旧标题",body="旧正文",snapshotJson="local-snapshot",conflictSnapshotJson="remote-snapshot"))
-        dao.updateEditable(NoteEditableUpdate("n","新标题","新正文",1,2,null,"未分类",null,"none",2,"",null,"note",null,null,false,true,false,0))
+        dao.updateEditable(NoteEditableUpdate("n","新标题","新正文","新摘要",1,2,null,"未分类",null,"none",2,"",null,"note",null,null,false,true,false,0))
         val stored=dao.get("n")!!
         assertEquals("新正文",stored.body)
         assertEquals("local-snapshot",stored.snapshotJson)
         assertEquals("remote-snapshot",stored.conflictSnapshotJson)
+    }
+
+    @Test fun `large body and snapshots can be read in cursor safe chunks`()=runBlocking {
+        val body="正文块".repeat(800_000)
+        val snapshot="快照块".repeat(800_000)
+        dao.put(NoteEntity("chunked",body=body,snapshotJson=snapshot))
+        suspend fun chunks(length:Int?,read:suspend(Int,Int)->String?)=buildString{var start=1;while(start<=(length?:0)){val chunk=read(start,64*1024)?:break;append(chunk);start+=chunk.length}}
+        assertEquals(body,chunks(dao.bodyLength("chunked")){start,length->dao.bodyChunk("chunked",start,length)})
+        assertEquals(snapshot,chunks(dao.snapshotLength("chunked")){start,length->dao.snapshotChunk("chunked",start,length)})
+    }
+
+    @Test fun `large crash draft can be recovered in cursor safe chunks`()=runBlocking {
+        val payload="草稿".repeat(900_000)
+        dao.putDraft(DraftEntity("large-draft",payload,42))
+        val rebuilt=buildString{var start=1;while(start<=(dao.draftPayloadLength("large-draft")?:0)){val chunk=dao.draftPayloadChunk("large-draft",start,64*1024)?:break;append(chunk);start+=chunk.length}}
+        assertEquals(payload,rebuilt)
+        assertEquals(listOf("large-draft"),dao.draftNoteIds())
     }
 
     @Test fun `full body search returns ids without loading payloads`()=runBlocking {
