@@ -39,9 +39,10 @@ class DatabaseTest {
 
     @Test fun `editable partial update preserves sync snapshots`()=runBlocking {
         dao.put(NoteEntity("n",title="旧标题",body="旧正文",snapshotJson="local-snapshot",conflictSnapshotJson="remote-snapshot"))
-        dao.updateEditable(NoteEditableUpdate("n","新标题","新正文","新摘要",1,2,null,"未分类",null,"none",2,"",null,"note",null,null,false,true,false,0))
+        dao.updateEditable(NoteEditableUpdate("n","新标题","新正文","新摘要",1,2,null,"未分类",null,"none",2,"",null,"note",null,null,false,"preview",true,false,0))
         val stored=dao.get("n")!!
         assertEquals("新正文",stored.body)
+        assertEquals("preview",stored.viewMode)
         assertEquals("local-snapshot",stored.snapshotJson)
         assertEquals("remote-snapshot",stored.conflictSnapshotJson)
     }

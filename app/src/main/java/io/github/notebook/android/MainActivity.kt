@@ -55,11 +55,16 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
 import java.text.DateFormat
 import java.util.*
 import kotlin.math.roundToInt
 import android.text.method.LinkMovementMethod
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.BackgroundColorSpan
 import android.util.TypedValue
 import android.widget.TextView
 import io.noties.markwon.Markwon
@@ -163,7 +168,7 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
             Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
-        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={IconButton({textImporter.launch(arrayOf("text/plain","text/markdown","application/octet-stream"))}){Icon(Icons.Default.UploadFile,"导入 txt/md")};UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination!=Destination.Trash&&destination!=Destination.Completed)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val todo=destination in setOf(Destination.Today,Destination.Important,Destination.Todos)||folder?.type=="todoList";val id=UUID.randomUUID().toString();if(folder?.type=="encryptedFolder")repo.markEncrypted(id,folder.id);startInEditMode=true;editing=NoteEntity(id,itemType=if(todo)"todo" else "note",important=destination==Destination.Important,folderId=folderId,folderName=folder?.name?:"未分类",tagIds=tagId?:"")},Modifier.testTag("new-item")){Icon(Icons.Default.Add,"新建")}}){pad->
+        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={IconButton({textImporter.launch(arrayOf("text/plain","text/markdown","application/octet-stream"))}){Icon(Icons.Default.UploadFile,"导入 txt/md")};UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination!=Destination.Trash&&destination!=Destination.Completed)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val todo=destination in setOf(Destination.Today,Destination.Important,Destination.Todos)||folder?.type=="todoList";val id=UUID.randomUUID().toString();if(folder?.type=="encryptedFolder")repo.markEncrypted(id,folder.id);startInEditMode=true;editing=NoteEntity(id,itemType=if(todo)"todo" else "note",important=destination==Destination.Important,folderId=folderId,folderName=folder?.name?:"未分类",tagIds=tagId?:"",viewMode="text")},Modifier.testTag("new-item")){Icon(Icons.Default.Add,"新建")}}){pad->
             Column(Modifier.padding(pad).fillMaxSize().background(MaterialTheme.colorScheme.background)){
                 OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(12.dp),singleLine=true,shape=MaterialTheme.shapes.large,placeholder={Text("搜索全部笔记")},leadingIcon={Icon(Icons.Default.Search,null)})
                 status?.let{Text(it,Modifier.padding(horizontal=16.dp),color=MaterialTheme.colorScheme.primary)}
@@ -184,12 +189,13 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
 
 @Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,onOpen:(String)->Unit){
     val state=rememberLazyListState()
+    val scrollMetrics by remember(state,notes.size){derivedStateOf{Triple(state.layoutInfo.visibleItemsInfo.size,notes.size,state.firstVisibleItemIndex)}}
     BoxWithConstraints(Modifier.fillMaxSize()){
         LazyColumn(Modifier.fillMaxSize(),state=state){items(notes,key={it.id}){n->NoteRow(n,loadingNoteId==n.id){onOpen(n.id)}}}
-        val visibleCount=state.layoutInfo.visibleItemsInfo.size
+        val (visibleCount,totalCount,firstVisible)=scrollMetrics
         if(notes.size>visibleCount&&visibleCount>0){
-            val thumbFraction=(visibleCount.toFloat()/notes.size).coerceIn(.08f,1f)
-            val progress=(state.firstVisibleItemIndex.toFloat()/(notes.size-visibleCount).coerceAtLeast(1)).coerceIn(0f,1f)
+            val thumbFraction=(visibleCount.toFloat()/totalCount).coerceIn(.08f,1f)
+            val progress=(firstVisible.toFloat()/(totalCount-visibleCount).coerceAtLeast(1)).coerceIn(0f,1f)
             val thumbHeight=maxHeight*thumbFraction
             Box(Modifier.align(androidx.compose.ui.Alignment.TopEnd).padding(end=2.dp).width(4.dp).height(thumbHeight).offset{IntOffset(0,((maxHeight-thumbHeight).toPx()*progress).roundToInt())}.background(MaterialTheme.colorScheme.primary.copy(alpha=.45f),MaterialTheme.shapes.small))
         }
@@ -214,7 +220,7 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
     val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){}
     DisposableEffect(Unit){onDispose{audioRecorder.release()}}
     var reminderDialog by remember{mutableStateOf(false)}
-    var editMode by remember(original.id){mutableStateOf(initiallyEditing)}
+    var editMode by remember(original.id){mutableStateOf(initiallyEditing || original.viewMode == "text")}
     val initialEditableKey=remember(original.id,original.version){editableKey(original)}
     var hasEdited by remember(original.id,original.version){mutableStateOf(false)}
     val currentEditableKey=editableKey(n)
@@ -239,7 +245,7 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
         saveError?.let{Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Row(Modifier.padding(10.dp)){Text(it,Modifier.weight(1f));TextButton({repo.clearSaveError()}){Text("知道了")}}};Spacer(Modifier.height(6.dp))}
         if(n.conflict){Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改",fontWeight=FontWeight.SemiBold);Row{TextButton({scope.launch{repo.keepLocal(n.id)}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id)}}){Text("采用服务器版本")}}}};Spacer(Modifier.height(8.dp))}
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
-        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};Text(if(editMode)"编辑笔记" else "阅读笔记",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));IconButton({if(editMode)repo.flushDraft(n);editMode=!editMode},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
+        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};Text(if(editMode)"编辑笔记" else "阅读笔记",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
             ReadingPane(n,repo,steps,attachments,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
@@ -258,40 +264,81 @@ private enum class Destination(val title:String) { Today("今天"), Important("�
     if(reminderDialog)ReminderDialog(n.reminderAt,n.recurrence,{reminderDialog=false},{at,rule->updateNote(n.copy(reminderAt=at,recurrence=rule));if(at!=null&&android.os.Build.VERSION.SDK_INT>=33)notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS);reminderDialog=false})
 }
 
-private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important)
+private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important,n.viewMode)
 
-private data class MarkdownChunk(val startUtf16:Int,val text:String)
-private fun markdownChunks(markdown:String,maxChars:Int=8*1024):List<MarkdownChunk>{
-    if(markdown.isEmpty())return listOf(MarkdownChunk(0,"*暂无正文*"));val result=mutableListOf<MarkdownChunk>();var start=0
-    while(start<markdown.length){val limit=minOf(start+maxChars,markdown.length);var end=if(limit==markdown.length)limit else markdown.lastIndexOf('\n',limit-1).takeIf{it>=start}?.plus(1)?:limit;if(end<=start)end=limit;result+=MarkdownChunk(start,markdown.substring(start,end));start=end}
-    return result
+private data class ReaderStyle(val fontSizeSp:Float=17f,val lineHeight:Float=1.28f,val maxWidthDp:Float=820f)
+
+@Composable private fun rememberReaderStyle():Pair<ReaderStyle,(ReaderStyle)->Unit>{
+    val context=LocalContext.current;val preferences=remember(context){context.getSharedPreferences("reader_preferences",android.content.Context.MODE_PRIVATE)}
+    var style by remember{mutableStateOf(ReaderStyle(preferences.getFloat("fontSizeSp",17f),preferences.getFloat("lineHeight",1.28f),preferences.getFloat("maxWidthDp",820f)))}
+    val update:(ReaderStyle)->Unit={next->style=next;preferences.edit().putFloat("fontSizeSp",next.fontSizeSp).putFloat("lineHeight",next.lineHeight).putFloat("maxWidthDp",next.maxWidthDp).apply()}
+    return style to update
 }
 
+private sealed interface ReaderDocumentState { data object Loading:ReaderDocumentState;data class Ready(val document:ParsedMarkdownDocument):ReaderDocumentState;data class Failed(val message:String):ReaderDocumentState }
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,modifier:Modifier=Modifier){
-    val chunks=remember(note.id,note.body){markdownChunks(note.body)};val state=rememberLazyListState();val views=remember(note.id){mutableMapOf<Int,TextView>()};val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)2 else 1
+    var documentState by remember(note.id,note.body) { mutableStateOf<ReaderDocumentState>(ReaderDocumentState.Loading) }
+    LaunchedEffect(note.id,note.body) {
+        val parsed = runCatching {
+            withContext(Dispatchers.Default) { MarkdownDocumentParser.parse(note.body) }
+        }
+        documentState = parsed.fold(
+            onSuccess = { ReaderDocumentState.Ready(it) },
+            onFailure = { ReaderDocumentState.Failed(it.localizedMessage ?: "Markdown 解析失败") }
+        )
+    }
+    val ready=documentState as? ReaderDocumentState.Ready
+    if(ready==null){Box(modifier,contentAlignment=androidx.compose.ui.Alignment.Center){when(val current=documentState){ReaderDocumentState.Loading->Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){CircularProgressIndicator();Spacer(Modifier.height(10.dp));Text("正在准备长文阅读视图…",color=MaterialTheme.colorScheme.onSurfaceVariant)};is ReaderDocumentState.Failed->Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){Icon(Icons.Default.ErrorOutline,null,tint=MaterialTheme.colorScheme.error);Text(current.message,color=MaterialTheme.colorScheme.error)};is ReaderDocumentState.Ready->Unit}};return}
+    val document=ready.document;val blocks=document.blocks;val state=remember(note.id){androidx.compose.foundation.lazy.LazyListState()};val scope=rememberCoroutineScope();val views=remember(note.id,note.body){mutableMapOf<Int,TextView>()};val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)3 else 2
+    val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
+    val searchMatches=remember(note.body,searchQuery){if(searchQuery.isBlank())emptyList()else buildList{var start=0;while(size<10_000){val found=note.body.indexOf(searchQuery,start,ignoreCase=true);if(found<0)break;add(found);start=found+searchQuery.length.coerceAtLeast(1)}}}
+    fun navigateSearch(delta:Int){if(searchMatches.isEmpty())return;searchIndex=(searchIndex+delta).mod(searchMatches.size);val offset=searchMatches[searchIndex];val blockIndex=blocks.indexOfLast{it.startUtf16<=offset}.coerceAtLeast(0);launchScroll(scope,state,bodyStart+blockIndex)}
     var restored by remember(note.id){mutableStateOf(false)};val latestRestored by rememberUpdatedState(restored)
     fun capturedPosition():Pair<Int,Double>{
         val first=state.firstVisibleItemIndex;val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);if(first<bodyStart)return 0 to 0.0
-        val chunkIndex=first-bodyStart;if(chunkIndex !in chunks.indices)return note.body.length to 0.0;val chunk=chunks[chunkIndex];val view=views[chunkIndex];val layout=view?.layout
-        if(layout==null||view.text.isEmpty())return chunk.startUtf16 to 0.0
-        val localY=state.firstVisibleItemScrollOffset.coerceIn(0,maxOf(0,layout.height-1));val line=layout.getLineForVertical(localY);val renderedOffset=layout.getLineStart(line);val sourceOffset=(renderedOffset.toDouble()/view.text.length.coerceAtLeast(1)*chunk.text.length).roundToInt().coerceIn(0,chunk.text.length);val fraction=((layout.getLineTop(line)-localY).toDouble()/viewport).coerceIn(-1.0,1.0)
-        return (chunk.startUtf16+sourceOffset).coerceIn(0,note.body.length) to fraction
+        val blockIndex=first-bodyStart;if(blockIndex !in blocks.indices)return note.body.length to 0.0;val block=blocks[blockIndex];val view=views[blockIndex];val layout=view?.layout
+        if(layout==null||view.text.isEmpty())return block.startUtf16 to 0.0
+        val localY=state.firstVisibleItemScrollOffset.coerceIn(0,maxOf(0,layout.height-1));val line=layout.getLineForVertical(localY);val renderedOffset=layout.getLineStart(line);val sourceOffset=(renderedOffset.toDouble()/view.text.length.coerceAtLeast(1)*block.text.length).roundToInt().coerceIn(0,block.text.length);val fraction=((layout.getLineTop(line)-localY).toDouble()/viewport).coerceIn(-1.0,1.0)
+        return (block.startUtf16+sourceOffset).coerceIn(0,note.body.length) to fraction
     }
     LaunchedEffect(note.id,note.body){
         val position=repo.readingPosition(note.id);if(position!=null&&note.body.isNotEmpty()){
-            val anchor=position.anchorUtf16Offset.coerceIn(0,note.body.length);val chunkIndex=chunks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+chunkIndex;state.scrollToItem(itemIndex)
-            for(attempt in 0 until 30){val view=views[chunkIndex];val layout=view?.layout;if(layout!=null&&view.text.isNotEmpty()){val chunk=chunks[chunkIndex];val sourceLocal=(anchor-chunk.startUtf16).coerceIn(0,chunk.text.length);val rendered=(sourceLocal.toDouble()/chunk.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1));val line=layout.getLineForOffset(rendered);val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);val desired=(layout.getLineTop(line)-position.viewportOffsetFraction*viewport).roundToInt().coerceAtLeast(0);state.scrollToItem(itemIndex,desired);break};delay(16)}
+            val anchor=position.anchorUtf16Offset.coerceIn(0,note.body.length);val blockIndex=blocks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+blockIndex;state.scrollToItem(itemIndex)
+            for(attempt in 0 until 30){val view=views[blockIndex];val layout=view?.layout;if(layout!=null&&view.text.isNotEmpty()){val block=blocks[blockIndex];val sourceLocal=(anchor-block.startUtf16).coerceIn(0,block.text.length);val rendered=(sourceLocal.toDouble()/block.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1));val line=layout.getLineForOffset(rendered);val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);val desired=(layout.getLineTop(line)-position.viewportOffsetFraction*viewport).roundToInt().coerceAtLeast(0);state.scrollToItem(itemIndex,desired);break};delay(16)}
         }
         restored=true
     }
-    LaunchedEffect(note.id,restored,chunks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
+    LaunchedEffect(note.id,restored,blocks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
     DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
-    LazyColumn(modifier,state=state){
-        item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.padding(vertical=12.dp))}
-        if(hasMetadata)item(key="note-folder"){Text(note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)}
-        items(chunks.size,key={"note-markdown-${chunks[it].startUtf16}"}){index->val chunk=chunks[index];MarkdownView(chunk.text,Modifier.fillMaxWidth().padding(vertical=if(index==0)12.dp else 0.dp),onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})}
-        if(note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider()};items(steps,key={"read-step-${it.id}"}){step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
-        items(attachments,key={"read-asset-${it.id}"}){AttachmentView(it)}
+    Box(modifier){LazyColumn(Modifier.fillMaxSize(),state=state,contentPadding=PaddingValues(top=if(showingSearch)64.dp else 0.dp,bottom=36.dp),horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){
+        item(key="reader-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Text("${blocks.size} 个内容块",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=14.dp));Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};if(document.headings.isNotEmpty())IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
+        item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=12.dp))}
+        if(hasMetadata)item(key="note-folder"){Text(note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp))}
+        if(blocks.isEmpty())item(key="empty-note"){Text("暂无正文",Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)}
+        items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->val block=blocks[index];if(block.kind==MarkdownBlockKind.Blank)Spacer(Modifier.fillMaxWidth().height(8.dp))else MarkdownView(markdown=block.text,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=if(index==0)12.dp else 0.dp),style=readerStyle,highlightQuery=searchQuery,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})}
+        if(note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider(Modifier.widthIn(max=readerStyle.maxWidthDp.dp))};items(steps,key={"read-step-${it.id}"}){step->Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
+        items(attachments,key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
+    };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
+    if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
+    if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
+}
+
+@Composable private fun ReaderSettingsDialog(current:ReaderStyle,onDismiss:()->Unit,onConfirm:(ReaderStyle)->Unit){
+    var fontSize by remember(current){mutableFloatStateOf(current.fontSizeSp)};var lineHeight by remember(current){mutableFloatStateOf(current.lineHeight)};var width by remember(current){mutableFloatStateOf(current.maxWidthDp)}
+    AlertDialog(onDismissRequest=onDismiss,title={Text("阅读设置")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("字号 ${fontSize.roundToInt()} sp");Slider(fontSize,{fontSize=it},valueRange=13f..30f,steps=16);Text("行高 ${String.format(Locale.ROOT,"%.2f",lineHeight)}");Slider(lineHeight,{lineHeight=it},valueRange=1.05f..1.8f);Text("正文最大宽度 ${width.roundToInt()} dp");Slider(width,{width=it},valueRange=480f..1200f,steps=8)}},confirmButton={Button({onConfirm(ReaderStyle(fontSize,lineHeight,width))}){Text("保存")}},dismissButton={TextButton(onDismiss){Text("取消")}})
+}
+
+private fun launchScroll(scope:kotlinx.coroutines.CoroutineScope,state:androidx.compose.foundation.lazy.LazyListState,item:Int){scope.launch{state.scrollToItem(item)}}
+
+@Composable private fun BoxScope.ReaderScrollIndicator(state:androidx.compose.foundation.lazy.LazyListState){
+    val metrics by remember(state){derivedStateOf{Triple(state.layoutInfo.totalItemsCount,state.layoutInfo.visibleItemsInfo.size,state.firstVisibleItemIndex)}}
+    val (total,visible,firstVisible)=metrics
+    if(total<=visible||visible<=0)return
+    BoxWithConstraints(Modifier.align(androidx.compose.ui.Alignment.CenterEnd).fillMaxHeight().width(7.dp).padding(end=2.dp)){
+        val fraction=(visible.toFloat()/total).coerceIn(.06f,1f);val height=maxHeight*fraction;val progress=(firstVisible.toFloat()/(total-visible).coerceAtLeast(1)).coerceIn(0f,1f)
+        Box(Modifier.align(androidx.compose.ui.Alignment.TopEnd).width(4.dp).height(height).offset{IntOffset(0,((maxHeight-height).toPx()*progress).roundToInt())}.background(MaterialTheme.colorScheme.primary.copy(alpha=.48f),MaterialTheme.shapes.small))
     }
 }
 
@@ -301,7 +348,7 @@ internal fun createMarkdownRenderer(context:android.content.Context):Markwon=Mar
     .usePlugin(TablePlugin.create(context))
     .build()
 
-@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val markwon=remember(context){createMarkdownRenderer(context)};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;setTextSize(TypedValue.COMPLEX_UNIT_SP,17f);setLineSpacing(0f,1.18f);isSingleLine=false;setHorizontallyScrolling(false);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true)}},update={view->view.setTextColor(color);if(view.tag!==markdown){markwon.setMarkdown(view,markdown);view.tag=markdown};onViewReady(view)},modifier=modifier)}
+@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,style:ReaderStyle=ReaderStyle(),highlightQuery:String="",onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val highlight=MaterialTheme.colorScheme.tertiaryContainer.toArgb();val markwon=remember(context){createMarkdownRenderer(context)};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;isSingleLine=false;setHorizontallyScrolling(false);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true);importantForAccessibility=android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES}},update={view->view.setTextColor(color);view.setTextSize(TypedValue.COMPLEX_UNIT_SP,style.fontSizeSp);view.setLineSpacing(0f,style.lineHeight);val renderKey=Triple(markdown,style.fontSizeSp,highlightQuery);if(view.tag!=renderKey){markwon.setMarkdown(view,markdown);if(highlightQuery.isNotBlank()){val highlighted=SpannableString(view.text);var start=0;while(start<highlighted.length){val found=highlighted.toString().indexOf(highlightQuery,start,ignoreCase=true);if(found<0)break;highlighted.setSpan(BackgroundColorSpan(highlight),found,found+highlightQuery.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);start=found+highlightQuery.length.coerceAtLeast(1)};view.text=highlighted};view.tag=renderKey};onViewReady(view)},modifier=modifier)}
 
 @Composable private fun AttachmentView(asset:AssetEntity){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Card(Modifier.fillMaxWidth().padding(vertical=4.dp).clickable{open()}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().heightIn(max=180.dp))}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)"${asset.size/1024} KB" else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
 
