@@ -34,7 +34,7 @@ object AppUpdater {
         val apk=assets.firstOrNull{it["name"].asString=="notebook-android.apk"}?:assets.firstOrNull{it["name"].asString.endsWith(".apk")}
         if(apk==null||compareVersions(version,BuildConfig.VERSION_NAME)<=0)return@withContext null
         val checksum=assets.firstOrNull{it["name"].asString.endsWith(".sha256")}
-        GithubRelease(version,root["name"]?.asString?.ifBlank{tag}?:tag,root["body"]?.asString.orEmpty(),apk["browser_download_url"].asString,checksum?.get("browser_download_url")?.asString)
+        GithubRelease(version,root["name"]?.asString?.ifBlank{tag}?:tag,root["body"]?.asString.orEmpty(),preferredAssetUrl(apk["url"]?.asString,apk["browser_download_url"].asString),checksum?.let{preferredAssetUrl(it["url"]?.asString,it["browser_download_url"].asString)})
     }
 
     suspend fun cachedDownload(context:Context,release:GithubRelease):File?=withContext(Dispatchers.IO){
@@ -62,8 +62,8 @@ object AppUpdater {
     internal fun compareVersions(a:String,b:String):Int{val x=a.substringBefore('-').split('.').map{it.toIntOrNull()?:0};val y=b.substringBefore('-').split('.').map{it.toIntOrNull()?:0};for(i in 0 until maxOf(x.size,y.size)){val c=(x.getOrElse(i){0}).compareTo(y.getOrElse(i){0});if(c!=0)return c};return 0}
     private fun targetFile(context:Context,release:GithubRelease)=File(context.cacheDir,"updates/notebook-${release.version}.apk")
     private fun markerFile(target:File)=File(target.parentFile,"${target.name}.sha256")
-    private fun connection(url:String)=(URL(url).openConnection() as HttpURLConnection).apply{connectTimeout=30_000;readTimeout=120_000;instanceFollowRedirects=true;setRequestProperty("Accept","application/octet-stream, application/vnd.github+json");setRequestProperty("Accept-Encoding","identity");setRequestProperty("User-Agent","Notebook-Android/${BuildConfig.VERSION_NAME}")}
-    private fun getText(url:String):String=connection(url).run{try{require(responseCode in 200..299){"GitHub 请求失败：HTTP $responseCode"};inputStream.bufferedReader().use{it.readText()}}finally{disconnect()}}
+    private fun connection(url:String,binary:Boolean=false)=(URL(url).openConnection() as HttpURLConnection).apply{connectTimeout=12_000;readTimeout=120_000;instanceFollowRedirects=true;setRequestProperty("Accept",if(binary)"application/octet-stream" else "application/vnd.github+json");setRequestProperty("Accept-Encoding","identity");setRequestProperty("User-Agent","Notebook-Android/${BuildConfig.VERSION_NAME}");setRequestProperty("X-GitHub-Api-Version","2022-11-28")}
+    private fun getText(url:String):String=connection(url,isReleaseAssetUrl(url)).run{try{require(responseCode in 200..299){"GitHub 请求失败：HTTP $responseCode"};inputStream.bufferedReader().use{it.readText()}}finally{disconnect()}}
     private fun sha256(file:File):String{val digest=MessageDigest.getInstance("SHA-256");file.inputStream().buffered().use{input->val buffer=ByteArray(DEFAULT_BUFFER_SIZE);while(true){val count=input.read(buffer);if(count<0)break;digest.update(buffer,0,count)}};return digest.digest().joinToString(""){"%02x".format(it)}}
 
     private suspend fun downloadTo(url:String,file:File,onProgress:suspend (DownloadProgress)->Unit){
@@ -72,7 +72,7 @@ object AppUpdater {
         downloadSingleTo(url,file,onProgress)
     }
 
-    private fun probeRangeTotal(url:String):Long?=connection(url).run{setRequestProperty("Range","bytes=0-0");try{if(responseCode!=HttpURLConnection.HTTP_PARTIAL)return@run null;val parsed=parseContentRange(getHeaderField("Content-Range"))?:return@run null;inputStream.use{it.read()};parsed.total}finally{disconnect()}}
+    private fun probeRangeTotal(url:String):Long?=connection(url,true).run{setRequestProperty("Range","bytes=0-0");try{if(responseCode!=HttpURLConnection.HTTP_PARTIAL)return@run null;val parsed=parseContentRange(getHeaderField("Content-Range"))?:return@run null;inputStream.use{it.read()};parsed.total}finally{disconnect()}}
 
     private suspend fun downloadInRanges(url:String,file:File,total:Long,onProgress:suspend (DownloadProgress)->Unit)=coroutineScope{
         if(file.isFile&&file.length()==total){onProgress(DownloadProgress(total,total));return@coroutineScope}
@@ -90,7 +90,7 @@ object AppUpdater {
         repeat(3){attempt->try{
             val existing=file.takeIf{it.isFile}?.length()?:0L;if(existing==expected){onProgress();return}
             val start=range.first+existing
-            connection(url).run{setRequestProperty("Range","bytes=$start-${range.last}");try{require(responseCode==HttpURLConnection.HTTP_PARTIAL){"服务器未返回分段内容：HTTP $responseCode"};val received=parseContentRange(getHeaderField("Content-Range"));require(received!=null&&received.start==start&&received.end==range.last&&received.total==total){"服务器返回了无效的 Content-Range"};inputStream.use{input->FileOutputStream(file,true).buffered().use{output->val buffer=ByteArray(64*1024);while(true){val count=input.read(buffer);if(count<0)break;output.write(buffer,0,count);onProgress()}}}}finally{disconnect()}}
+            connection(url,true).run{setRequestProperty("Range","bytes=$start-${range.last}");try{require(responseCode==HttpURLConnection.HTTP_PARTIAL){"服务器未返回分段内容：HTTP $responseCode"};val received=parseContentRange(getHeaderField("Content-Range"));require(received!=null&&received.start==start&&received.end==range.last&&received.total==total){"服务器返回了无效的 Content-Range"};inputStream.use{input->FileOutputStream(file,true).buffered().use{output->val buffer=ByteArray(64*1024);while(true){val count=input.read(buffer);if(count<0)break;output.write(buffer,0,count);onProgress()}}}}finally{disconnect()}}
             require(file.length()==expected){"分段下载长度不一致"};return
         }catch(error:Throwable){if(error is CancellationException)throw error;lastFailure=error;if(attempt<2)delay((attempt+1)*1_500L)}}
         throw lastFailure?:IllegalStateException("分段下载失败")
@@ -98,7 +98,7 @@ object AppUpdater {
 
     private suspend fun downloadSingleTo(url:String,file:File,onProgress:suspend (DownloadProgress)->Unit){
         var existing=file.takeIf{it.isFile}?.length()?:0L
-        suspend fun transfer(allowRetry:Boolean){connection(url).run{
+        suspend fun transfer(allowRetry:Boolean){connection(url,true).run{
             existing=file.takeIf{it.isFile}?.length()?:0L
             if(existing>0)setRequestProperty("Range","bytes=$existing-")
             try{
@@ -129,6 +129,15 @@ object AppUpdater {
 
 internal fun releaseVersion(tag:String)=tag.removePrefix("android-v").removePrefix("v")
 internal fun newestVersion(versions:List<String>)=versions.maxWithOrNull(Comparator(AppUpdater::compareVersions))
+
+internal fun preferredAssetUrl(apiUrl:String?,browserUrl:String):String{
+    val trustedApi=apiUrl?.takeIf(::isTrustedAssetApiUrl)
+    return trustedApi?:browserUrl
+}
+
+internal fun isTrustedAssetApiUrl(candidate:String):Boolean=runCatching{val parsed=URL(candidate);parsed.protocol.equals("https",true)&&parsed.host.equals("api.github.com",true)&&parsed.path.startsWith("/repos/")&&parsed.path.contains("/releases/assets/")}.getOrDefault(false)
+
+internal fun isReleaseAssetUrl(candidate:String):Boolean=isTrustedAssetApiUrl(candidate)||runCatching{val parsed=URL(candidate);parsed.protocol.equals("https",true)&&parsed.host.equals("github.com",true)&&parsed.path.contains("/releases/download/")}.getOrDefault(false)
 
 internal data class ParsedContentRange(val start:Long,val end:Long,val total:Long)
 internal fun parseContentRange(value:String?):ParsedContentRange?{val match=Regex("bytes (\\d+)-(\\d+)/(\\d+)",RegexOption.IGNORE_CASE).matchEntire(value.orEmpty())?:return null;val (start,end,total)=match.destructured;return ParsedContentRange(start.toLong(),end.toLong(),total.toLong()).takeIf{it.start<=it.end&&it.end<it.total}}
