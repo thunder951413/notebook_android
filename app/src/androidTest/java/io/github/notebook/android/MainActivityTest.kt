@@ -96,7 +96,7 @@ class MainActivityTest {
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("todo-list-test","工作提醒",0,"todoList"));app.database.dao().put(NoteEntity("todo-in-list",title="列表中的待办",itemType="todo",folderId="todo-list-test",folderName="工作提醒"))};rule.activityRule.scenario.recreate()
         if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isNotEmpty())rule.onNodeWithContentDescription("导航").performClick()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("工作提醒"));rule.onNodeWithText("工作提醒").assertIsDisplayed().performClick();rule.onNodeWithText("列表中的待办").assertIsDisplayed()
-        rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
+        rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("编辑计划").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
     }
 
     @Test fun encryptedFoldersAreShownLockedAndNotesStayOutOfAllNotes(){
