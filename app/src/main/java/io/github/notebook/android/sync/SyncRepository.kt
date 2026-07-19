@@ -35,6 +35,15 @@ data class SshSettings(val host:String,val port:Int,val username:String,val pass
 class HostKeyChangedException(val expected:String,val actual:String):Exception("服务器身份已变化，请确认新的主机指纹")
 enum class NoteSaveState { Pending, Saving, Saved, Failed }
 
+internal object RemoteRepositoryLockContract {
+    const val DIRECTORY_NAME=".index-write.lock"
+    const val OWNER_FILE_NAME="owner"
+    const val MAXIMUM_ATTEMPTS=30
+    const val RETRY_DELAY_MILLISECONDS=1_000L
+    const val STALE_AFTER_SECONDS=1_800L
+    fun lockPath(repositoryPath:String)="$repositoryPath/notes/$DIRECTORY_NAME"
+}
+
 /** Compatible with the macOS SSH JSON store. Swift JSONEncoder dates are seconds since 2001-01-01. */
 class SyncRepository(context:Context, private val dao:NotebookDao) {
     private val appContext=context.applicationContext
@@ -51,6 +60,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     val saveError=_saveError.asStateFlow()
     private val _noteSaveStates=MutableStateFlow<Map<String,NoteSaveState>>(emptyMap())
     val noteSaveStates=_noteSaveStates.asStateFlow()
+    private data class RemoteRepositoryWriteLock(val path:String,val ownerID:String){val ownerPath="$path/${RemoteRepositoryLockContract.OWNER_FILE_NAME}"}
     private fun setSaveState(noteId:String,state:NoteSaveState){_noteSaveStates.update{it+mapOf(noteId to state)}}
     fun markUnsaved(noteId:String){setSaveState(noteId,NoteSaveState.Pending)}
     fun acknowledgeSaved(noteId:String){_noteSaveStates.update{states->if(states[noteId]==NoteSaveState.Saved)states-noteId else states}}
@@ -148,10 +158,15 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         val resolved=s.copy(path=resolveRemoteRepositoryPath(s.path,ch.home))
         try {
             mkdirs(ch,resolved.path);mkdirs(ch,"${resolved.path}/notes");mkdirs(ch,"${resolved.path}/attachments")
-            pullLibrary(ch,resolved);pullNotes(ch,resolved);pullAssets(ch,resolved);syncReadingPositions(ch,resolved)
-            // Assets and metadata must exist before note JSON and index.json publish references to them.
-            pushLibrary(ch,resolved);pushAssets(ch,resolved);pushNotes(ch,resolved)
-            Reminders.reconcile(appContext,dao.reminders())
+            withRemoteRepositoryWriteLock(ch,resolved){lock->
+                pullLibrary(ch,resolved);pullNotes(ch,resolved);pullAssets(ch,resolved);syncReadingPositions(ch,resolved)
+                refreshRemoteRepositoryWriteLock(ch,lock)
+                // Assets and metadata must exist before note JSON and index.json publish references to them.
+                pushLibrary(ch,resolved);pushAssets(ch,resolved)
+                refreshRemoteRepositoryWriteLock(ch,lock)
+                pushNotes(ch,resolved)
+                Reminders.reconcile(appContext,dao.reminders())
+            }
         } finally { ch.disconnect();session.disconnect() }
     }}
 
@@ -214,16 +229,59 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         val envelope=JsonObject().apply{addProperty("schemaVersion",ReadingPositionProtocol.SCHEMA_VERSION);addProperty("exportedAt",Instant.now().toString());addProperty("deviceID",deviceId());add("positions",JsonArray().apply{merged.forEach{add(ReadingPositionProtocol.encode(it))}})}
         atomicWrite(c,"${s.path}/notes/reading_positions.json",gson.toJson(envelope))
     }
-    private suspend fun pushNotes(c:ChannelSftp,s:SshSettings){
-        val lock="${s.path}/notes/.index-write.lock";var acquired=false
-        for(attempt in 0 until 30){
-            try{c.mkdir(lock);acquired=true;break}catch(_:Exception){runCatching{val stat=c.stat(lock);if(System.currentTimeMillis()/1000-stat.mTime>300)c.rmdir(lock)}}
-            delay(1_000)
+    private suspend fun <T> withRemoteRepositoryWriteLock(
+        c:ChannelSftp,
+        s:SshSettings,
+        block:suspend (RemoteRepositoryWriteLock)->T
+    ):T{
+        val lock=acquireRemoteRepositoryWriteLock(c,s)
+        return try{
+            val result=block(lock)
+            releaseRemoteRepositoryWriteLock(c,lock)
+            result
+        }catch(error:Throwable){
+            runCatching{releaseRemoteRepositoryWriteLock(c,lock)}
+            throw error
         }
-        check(acquired){"远端索引正在被其他设备写入，请稍后重试"}
-        try{pushNotesUnlocked(c,s)}finally{runCatching{c.rmdir(lock)}}
     }
-    private suspend fun pushNotesUnlocked(c:ChannelSftp,s:SshSettings){
+    private suspend fun acquireRemoteRepositoryWriteLock(c:ChannelSftp,s:SshSettings):RemoteRepositoryWriteLock{
+        val lock=RemoteRepositoryWriteLock(RemoteRepositoryLockContract.lockPath(s.path),UUID.randomUUID().toString())
+        repeat(RemoteRepositoryLockContract.MAXIMUM_ATTEMPTS){attempt->
+            if(runCatching{c.mkdir(lock.path)}.isSuccess){
+                try{
+                    c.put(ByteArrayInputStream("${lock.ownerID}\n".toByteArray(StandardCharsets.UTF_8)),lock.ownerPath)
+                    return lock
+                }catch(error:Throwable){
+                    runCatching{c.rm(lock.ownerPath)};runCatching{c.rmdir(lock.path)}
+                    throw error
+                }
+            }
+            runCatching{
+                val ageSeconds=System.currentTimeMillis()/1_000-c.stat(lock.path).mTime
+                if(ageSeconds>RemoteRepositoryLockContract.STALE_AFTER_SECONDS){
+                    val quarantine="${lock.path}.stale-${lock.ownerID}"
+                    c.rename(lock.path,quarantine)
+                    runCatching{c.rm("$quarantine/${RemoteRepositoryLockContract.OWNER_FILE_NAME}")}
+                    runCatching{c.rmdir(quarantine)}
+                }
+            }
+            if(attempt<RemoteRepositoryLockContract.MAXIMUM_ATTEMPTS-1)delay(RemoteRepositoryLockContract.RETRY_DELAY_MILLISECONDS)
+        }
+        error("另一个设备正在发布远程数据，请稍后重试")
+    }
+    private fun refreshRemoteRepositoryWriteLock(c:ChannelSftp,lock:RemoteRepositoryWriteLock){
+        check(readRemoteLockOwner(c,lock)==lock.ownerID){"远程发布锁所有权已变化，已停止同步"}
+        c.setMtime(lock.path,(System.currentTimeMillis()/1_000).toInt())
+    }
+    private fun releaseRemoteRepositoryWriteLock(c:ChannelSftp,lock:RemoteRepositoryWriteLock){
+        if(readRemoteLockOwner(c,lock)!=lock.ownerID)return
+        c.rm(lock.ownerPath)
+        c.rmdir(lock.path)
+    }
+    private fun readRemoteLockOwner(c:ChannelSftp,lock:RemoteRepositoryWriteLock):String?=runCatching{
+        val output=ByteArrayOutputStream();c.get(lock.ownerPath,output);String(output.toByteArray(),StandardCharsets.UTF_8).trim()
+    }.getOrNull()
+    private suspend fun pushNotes(c:ChannelSftp,s:SshSettings){
         val remote=readJson(c,"${s.path}/notes/index.json")
         val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
         val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{deleted[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}

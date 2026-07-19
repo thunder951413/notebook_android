@@ -36,6 +36,13 @@ class ProtocolTest {
         assertThrows(IllegalArgumentException::class.java){resolveRemoteRepositoryPath("/","/home/user")}
     }
 
+    @Test fun `remote write lock contract matches mac client`() {
+        assertEquals("/srv/notebook/notes/.index-write.lock",RemoteRepositoryLockContract.lockPath("/srv/notebook"))
+        assertEquals("owner",RemoteRepositoryLockContract.OWNER_FILE_NAME)
+        assertEquals(30,RemoteRepositoryLockContract.MAXIMUM_ATTEMPTS)
+        assertEquals(1_800L,RemoteRepositoryLockContract.STALE_AFTER_SECONDS)
+    }
+
     @Test fun `markdown semantic blocks round trip`() {
         val source="# 标题\n普通段落\n- 项目\n2. 第二项\n- [x] 完成\n- [ ] 待办"
         val blocks=BlockDocumentCodec.encodeMarkdown(source)
