@@ -90,7 +90,7 @@ class MainActivityTest {
         rule.onNodeWithTag("edit-mode").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed()
     }
 
-    @Test fun newNoteStartsInEditMode(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed()}
+    @Test fun newNoteStartsInEditModeAndCanBeExplicitlySaved(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed();rule.onNodeWithContentDescription("保存").assertIsDisplayed().performClick();rule.waitUntil(5_000){rule.onAllNodesWithContentDescription("已保存").fetchSemanticsNodes().isNotEmpty()};rule.onNodeWithContentDescription("已保存").assertIsDisplayed()}
 
     @Test fun todoListsAppearInDrawerAndCreateTodos(){
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("todo-list-test","工作提醒",0,"todoList"));app.database.dao().put(NoteEntity("todo-in-list",title="列表中的待办",itemType="todo",folderId="todo-list-test",folderName="工作提醒"))};rule.activityRule.scenario.recreate()

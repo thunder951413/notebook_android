@@ -31,6 +31,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import io.github.notebook.android.data.NoteEntity
 import io.github.notebook.android.data.NoteSummary
@@ -48,6 +49,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import io.github.notebook.android.reminder.Reminders
 import io.github.notebook.android.sync.SshSettings
 import io.github.notebook.android.sync.SyncRepository
+import io.github.notebook.android.sync.NoteSaveState
 import io.github.notebook.android.sync.parseSyncQrConfig
 import io.github.notebook.android.sync.HostKeyChangedException
 import io.github.notebook.android.ui.NotebookTheme
@@ -173,7 +175,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
             Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
-        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={IconButton({textImporter.launch(arrayOf("text/plain","text/markdown","application/octet-stream"))}){Icon(Icons.Default.UploadFile,"导入 txt/md")};UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination.newItemType!=null)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday);if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id);startInEditMode=true;editing=draft},Modifier.testTag("new-item")){Icon(Icons.Default.Add,if(destination.newItemType=="todo"||folders.firstOrNull{it.id==folderId}?.type=="todoList")"新建计划" else "新建笔记")}}){pad->
+        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={IconButton({textImporter.launch(arrayOf("text/plain","text/markdown","application/octet-stream"))}){Icon(Icons.Default.UploadFile,"导入 txt/md")};UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination.newItemType!=null)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday);if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id);repo.markUnsaved(draft.id);startInEditMode=true;editing=draft},Modifier.testTag("new-item")){Icon(Icons.Default.Add,if(destination.newItemType=="todo"||folders.firstOrNull{it.id==folderId}?.type=="todoList")"新建计划" else "新建笔记")}}){pad->
             Column(Modifier.padding(pad).fillMaxSize().background(MaterialTheme.colorScheme.background)){
                 OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(12.dp),singleLine=true,shape=MaterialTheme.shapes.large,placeholder={Text("搜索全部笔记")},leadingIcon={Icon(Icons.Default.Search,null)})
                 status?.let{Text(it,Modifier.padding(horizontal=16.dp),color=MaterialTheme.colorScheme.primary)}
@@ -217,6 +219,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
     var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body))}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
     val saveError by repo.saveError.collectAsState()
+    val saveStates by repo.noteSaveStates.collectAsState();val saveState=saveStates[n.id]?:NoteSaveState.Saved
     val context=LocalContext.current;val lifecycleOwner=LocalLifecycleOwner.current;val audioRecorder=remember{AudioRecorder(context)};var recording by remember{mutableStateOf(false)};var recordingFile by remember{mutableStateOf<java.io.File?>(null)}
     val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)}
     val steps by repo.steps(n.id).collectAsState(initial=emptyList());var newStep by remember{mutableStateOf("")}
@@ -250,7 +253,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
         saveError?.let{Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Row(Modifier.padding(10.dp)){Text(it,Modifier.weight(1f));TextButton({repo.clearSaveError()}){Text("知道了")}}};Spacer(Modifier.height(6.dp))}
         if(n.conflict){Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改",fontWeight=FontWeight.SemiBold);Row{TextButton({scope.launch{repo.keepLocal(n.id)}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id)}}){Text("采用服务器版本")}}}};Spacer(Modifier.height(8.dp))}
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
-        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
+        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,{repo.flushDraft(n)});IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
             ReadingPane(n,repo,steps,attachments,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
@@ -270,6 +273,15 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
 }
 
 private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important,n.viewMode)
+
+@Composable private fun SaveStatusAction(state:NoteSaveState,onSave:()->Unit){
+    when(state){
+        NoteSaveState.Pending->IconButton(onSave,modifier=Modifier.testTag("save-status")){Icon(Icons.Default.Save,"保存",tint=MaterialTheme.colorScheme.primary)}
+        NoteSaveState.Saving->Box(Modifier.size(48.dp).testTag("save-status"),contentAlignment=androidx.compose.ui.Alignment.Center){CircularProgressIndicator(Modifier.size(21.dp),strokeWidth=2.5.dp)}
+        NoteSaveState.Saved->Box(Modifier.size(48.dp).testTag("save-status"),contentAlignment=androidx.compose.ui.Alignment.Center){Icon(Icons.Default.CheckCircle,"已保存",tint=Color(0xFF34A853))}
+        NoteSaveState.Failed->IconButton(onSave,modifier=Modifier.testTag("save-status")){Icon(Icons.Default.Error,"保存失败，点击重试",tint=MaterialTheme.colorScheme.error)}
+    }
+}
 
 private data class ReaderStyle(val fontSizeSp:Float=17f,val lineHeight:Float=1.28f,val maxWidthDp:Float=820f)
 

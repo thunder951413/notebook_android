@@ -20,6 +20,7 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
@@ -31,6 +32,7 @@ import java.util.UUID
 
 data class SshSettings(val host:String,val port:Int,val username:String,val password:String,val path:String,val fingerprint:String="")
 class HostKeyChangedException(val expected:String,val actual:String):Exception("服务器身份已变化，请确认新的主机指纹")
+enum class NoteSaveState { Pending, Saving, Saved, Failed }
 
 /** Compatible with the macOS SSH JSON store. Swift JSONEncoder dates are seconds since 2001-01-01. */
 class SyncRepository(context:Context, private val dao:NotebookDao) {
@@ -45,6 +47,10 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private var syncRequestJob:Job?=null
     private val _saveError=MutableStateFlow<String?>(null)
     val saveError=_saveError.asStateFlow()
+    private val _noteSaveStates=MutableStateFlow<Map<String,NoteSaveState>>(emptyMap())
+    val noteSaveStates=_noteSaveStates.asStateFlow()
+    private fun setSaveState(noteId:String,state:NoteSaveState){_noteSaveStates.update{it+mapOf(noteId to state)}}
+    fun markUnsaved(noteId:String){setSaveState(noteId,NoteSaveState.Pending)}
     fun clearSaveError(){_saveError.value=null}
     private val prefs=encryptedPrefs(context)
     val notes=dao.observeNoteSummaries()
@@ -64,11 +70,11 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     fun moveEncrypted(noteId:String,folderId:String)=markEncrypted(noteId,folderId)
     private fun encryptedNoteIds():Set<String> = runCatching{gson.fromJson(prefs.getString("encryptedNoteIds","[]"),Array<String>::class.java).toSet()}.getOrDefault(emptySet())
     private fun encryptedMappings():Map<String,String> = runCatching{gson.fromJson(prefs.getString("encryptedMappings","{}"),JsonObject::class.java).entrySet().associate{it.key to it.value.asString}}.getOrDefault(emptyMap())
-    suspend fun save(n:NoteEntity):NoteEntity{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));return persistDraft(n)}
-    fun queueDraft(n:NoteEntity){pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();draftJobs[n.id]=appScope.launch{runCatching{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;persistDraft(latest);pendingDrafts.remove(n.id,latest);draftJobs.remove(n.id)}.onFailure{if(it !is CancellationException)_saveError.value="自动保存失败：${it.localizedMessage}"}}}
-    fun flushDraft(n:NoteEntity){pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();appScope.launch{runCatching{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);pendingDrafts.remove(n.id,latest)}.onFailure{_saveError.value="保存失败，草稿仍保留：${it.localizedMessage}"}}}
+    suspend fun save(n:NoteEntity):NoteEntity{setSaveState(n.id,NoteSaveState.Saving);return try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));persistDraft(n).also{setSaveState(n.id,NoteSaveState.Saved)}}catch(error:Throwable){setSaveState(n.id,NoteSaveState.Failed);throw error}}
+    fun queueDraft(n:NoteEntity){setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
+    fun flushDraft(n:NoteEntity):Job{setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
     fun flushAllAsync(){pendingDrafts.values.toList().forEach(::flushDraft)}
-    suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);pendingDrafts.remove(draft.id,draft)}}
+    suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);throw error}}}
     suspend fun recoverDrafts(){dao.draftNoteIds().forEach{id->readLargeText(dao.draftPayloadLength(id)){start,length->dao.draftPayloadChunk(id,start,length)}?.let{payload->runCatching{gson.fromJson(payload,NoteEntity::class.java)}.getOrNull()?.let{persistDraft(it)}}}}
     fun recoverDraftsAsync(){appScope.launch{runCatching{recoverDrafts()}.onFailure{_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
 
