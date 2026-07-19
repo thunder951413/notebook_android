@@ -90,7 +90,9 @@ class MainActivityTest {
         rule.onNodeWithTag("edit-mode").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed()
     }
 
-    @Test fun newNoteStartsInEditModeAndCanBeExplicitlySaved(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed();rule.onNodeWithContentDescription("保存").assertIsDisplayed().performClick();rule.waitUntil(5_000){rule.onAllNodesWithContentDescription("已保存").fetchSemanticsNodes().isNotEmpty()};rule.onNodeWithContentDescription("已保存").assertIsDisplayed()}
+    @Test fun newNoteStartsInEditModeAndShowsBriefSavedConfirmation(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed();rule.onNodeWithContentDescription("保存").assertIsDisplayed().performClick();rule.waitUntil(5_000){rule.onAllNodesWithContentDescription("已保存").fetchSemanticsNodes().isNotEmpty()};rule.waitUntil(2_000){rule.onAllNodesWithContentDescription("已保存").fetchSemanticsNodes().isEmpty()}}
+
+    @Test fun topDeleteRequiresConfirmationAndMovesNoteToTrash(){val title="明确删除-${System.nanoTime()}";val app=rule.activity.application as NotebookApp;rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("title-field").performTextInput(title);rule.onNodeWithTag("delete-item").assertIsDisplayed().performClick();rule.onNodeWithText("删除笔记？").assertIsDisplayed();rule.onNodeWithText("删除").performClick();rule.waitUntil(5_000){runBlocking{app.database.dao().allNotes().any{it.title==title&&it.deletedAt!=null}}}}
 
     @Test fun todoListsAppearInDrawerAndCreateTodos(){
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("todo-list-test","工作提醒",0,"todoList"));app.database.dao().put(NoteEntity("todo-in-list",title="列表中的待办",itemType="todo",folderId="todo-list-test",folderName="工作提醒"))};rule.activityRule.scenario.recreate()

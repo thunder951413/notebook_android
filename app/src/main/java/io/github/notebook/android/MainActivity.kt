@@ -219,7 +219,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
     var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body))}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
     val saveError by repo.saveError.collectAsState()
-    val saveStates by repo.noteSaveStates.collectAsState();val saveState=saveStates[n.id]?:NoteSaveState.Saved
+    val saveStates by repo.noteSaveStates.collectAsState();val saveState=saveStates[n.id]
     val context=LocalContext.current;val lifecycleOwner=LocalLifecycleOwner.current;val audioRecorder=remember{AudioRecorder(context)};var recording by remember{mutableStateOf(false)};var recordingFile by remember{mutableStateOf<java.io.File?>(null)}
     val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)}
     val steps by repo.steps(n.id).collectAsState(initial=emptyList());var newStep by remember{mutableStateOf("")}
@@ -227,12 +227,13 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
     val microphonePermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->if(granted){runCatching{repo.recordingFile(n.id).also{recordingFile=it;audioRecorder.start(it);recording=true}}}}
     val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){}
     DisposableEffect(Unit){onDispose{audioRecorder.release()}}
-    var reminderDialog by remember{mutableStateOf(false)}
+    var reminderDialog by remember{mutableStateOf(false)};var deleteDialog by remember{mutableStateOf(false)};var showSavedCheck by remember(original.id){mutableStateOf(false)}
     var editMode by remember(original.id){mutableStateOf(initiallyEditing || original.viewMode == "text")}
     val initialEditableKey=remember(original.id,original.version){editableKey(original)}
     var hasEdited by remember(original.id,original.version){mutableStateOf(false)}
     val currentEditableKey=editableKey(n)
     val latestNote by rememberUpdatedState(n)
+    LaunchedEffect(saveState){if(saveState==NoteSaveState.Saved){showSavedCheck=true;delay(200);showSavedCheck=false;repo.acknowledgeSaved(n.id)}else showSavedCheck=false}
     fun updateNote(next:NoteEntity){n=next;repo.queueDraft(next)}
     LaunchedEffect(currentEditableKey){
         if(currentEditableKey!=initialEditableKey)hasEdited=true
@@ -253,7 +254,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
         saveError?.let{Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Row(Modifier.padding(10.dp)){Text(it,Modifier.weight(1f));TextButton({repo.clearSaveError()}){Text("知道了")}}};Spacer(Modifier.height(6.dp))}
         if(n.conflict){Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改",fontWeight=FontWeight.SemiBold);Row{TextButton({scope.launch{repo.keepLocal(n.id)}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id)}}){Text("采用服务器版本")}}}};Spacer(Modifier.height(8.dp))}
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
-        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,{repo.flushDraft(n)});IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
+        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(n)};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
             ReadingPane(n,repo,steps,attachments,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
@@ -266,20 +267,22 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
         OutlinedTextField(bodyValue,{bodyValue=it;updateNote(n.copy(body=it.text))},Modifier.fillMaxWidth().weight(1f).testTag("body-field"),label={Text("开始记录…")})
         if(n.itemType=="todo"){Row{Checkbox(n.completedAt!=null,{updateNote(n.copy(completedAt=if(it)System.currentTimeMillis() else null))});Text("已完成",Modifier.padding(top=12.dp));Checkbox(n.important,{updateNote(n.copy(important=it))});Text("重要",Modifier.padding(top=12.dp))};LazyColumn(Modifier.heightIn(max=180.dp)){items(steps,key={it.id}){step->Row{Checkbox(step.checked,{checked->scope.launch{repo.saveStep(step.copy(checked=checked))}});Text(step.text,Modifier.weight(1f).padding(top=12.dp));IconButton({scope.launch{repo.deleteStep(step.id)}}){Icon(Icons.Default.Close,"删除步骤")}}}};Row{OutlinedTextField(newStep,{newStep=it},Modifier.weight(1f),singleLine=true,label={Text("添加步骤")});IconButton({if(newStep.isNotBlank()){scope.launch{repo.saveStep(TodoStepEntity(UUID.randomUUID().toString(),n.id,newStep.trim(),sortOrder=steps.size))};newStep=""}}){Icon(Icons.Default.Add,"添加")}}}
         if(attachments.isNotEmpty())LazyColumn(Modifier.heightIn(max=220.dp)){items(attachments,key={it.id}){a->AttachmentView(a)}}
-        FlowRow{TextButton({picker.launch("*/*")}){Icon(Icons.Default.AttachFile,null);Text("附件")};TextButton({if(recording){val ok=audioRecorder.stop();recording=false;if(ok)recordingFile?.let{file->scope.launch{repo.addRecordedAudio(n.id,file)}}}else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)}){Icon(if(recording)Icons.Default.Stop else Icons.Default.Mic,null,tint=if(recording)MaterialTheme.colorScheme.error else LocalContentColor.current);Text(if(recording)"停止录音" else "录音")};TextButton({reminderDialog=true}){Icon(Icons.Default.Notifications,null);Text(if(n.reminderAt==null)"提醒" else DateFormat.getDateTimeInstance(DateFormat.SHORT,DateFormat.SHORT).format(Date(n.reminderAt!!)))};TextButton({updateNote(n.copy(deletedAt=System.currentTimeMillis()))}){Icon(Icons.Default.Delete,null);Text("删除")}}
+        FlowRow{TextButton({picker.launch("*/*")}){Icon(Icons.Default.AttachFile,null);Text("附件")};TextButton({if(recording){val ok=audioRecorder.stop();recording=false;if(ok)recordingFile?.let{file->scope.launch{repo.addRecordedAudio(n.id,file)}}}else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)}){Icon(if(recording)Icons.Default.Stop else Icons.Default.Mic,null,tint=if(recording)MaterialTheme.colorScheme.error else LocalContentColor.current);Text(if(recording)"停止录音" else "录音")};TextButton({reminderDialog=true}){Icon(Icons.Default.Notifications,null);Text(if(n.reminderAt==null)"提醒" else DateFormat.getDateTimeInstance(DateFormat.SHORT,DateFormat.SHORT).format(Date(n.reminderAt!!)))}}
         }
     }
     if(reminderDialog)ReminderDialog(n.reminderAt,n.recurrence,{reminderDialog=false},{at,rule->updateNote(n.copy(reminderAt=at,recurrence=rule));if(at!=null&&android.os.Build.VERSION.SDK_INT>=33)notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS);reminderDialog=false})
+    if(deleteDialog){val itemLabel=if(n.itemType=="todo")"计划" else "笔记";AlertDialog(onDismissRequest={deleteDialog=false},icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除$itemLabel？")},text={Text("删除后会移入回收站，可以稍后恢复。")},confirmButton={Button({val deleted=n.copy(deletedAt=System.currentTimeMillis());n=deleted;repo.flushDraft(deleted);deleteDialog=false;onDone(deleted)},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({deleteDialog=false}){Text("取消")}})}
 }
 
 private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important,n.viewMode)
 
-@Composable private fun SaveStatusAction(state:NoteSaveState,onSave:()->Unit){
+@Composable private fun SaveStatusAction(state:NoteSaveState?,showSavedCheck:Boolean,onSave:()->Unit){
     when(state){
         NoteSaveState.Pending->IconButton(onSave,modifier=Modifier.testTag("save-status")){Icon(Icons.Default.Save,"保存",tint=MaterialTheme.colorScheme.primary)}
         NoteSaveState.Saving->Box(Modifier.size(48.dp).testTag("save-status"),contentAlignment=androidx.compose.ui.Alignment.Center){CircularProgressIndicator(Modifier.size(21.dp),strokeWidth=2.5.dp)}
-        NoteSaveState.Saved->Box(Modifier.size(48.dp).testTag("save-status"),contentAlignment=androidx.compose.ui.Alignment.Center){Icon(Icons.Default.CheckCircle,"已保存",tint=Color(0xFF34A853))}
+        NoteSaveState.Saved->Box(Modifier.size(48.dp).testTag("save-status"),contentAlignment=androidx.compose.ui.Alignment.Center){if(showSavedCheck)Icon(Icons.Default.CheckCircle,"已保存",tint=Color(0xFF34A853))}
         NoteSaveState.Failed->IconButton(onSave,modifier=Modifier.testTag("save-status")){Icon(Icons.Default.Error,"保存失败，点击重试",tint=MaterialTheme.colorScheme.error)}
+        null->Spacer(Modifier.size(48.dp).testTag("save-status"))
     }
 }
 

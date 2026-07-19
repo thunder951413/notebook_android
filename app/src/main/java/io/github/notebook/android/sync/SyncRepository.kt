@@ -51,6 +51,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     val noteSaveStates=_noteSaveStates.asStateFlow()
     private fun setSaveState(noteId:String,state:NoteSaveState){_noteSaveStates.update{it+mapOf(noteId to state)}}
     fun markUnsaved(noteId:String){setSaveState(noteId,NoteSaveState.Pending)}
+    fun acknowledgeSaved(noteId:String){_noteSaveStates.update{states->if(states[noteId]==NoteSaveState.Saved)states-noteId else states}}
     fun clearSaveError(){_saveError.value=null}
     private val prefs=encryptedPrefs(context)
     val notes=dao.observeNoteSummaries()
