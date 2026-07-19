@@ -21,6 +21,10 @@
 - 字符偏移使用 UTF-16 code unit，与 Swift `NSString` 和 Kotlin `String` 一致。
 - 阅读位置不增加正文 `version`、不写正文历史、也不把笔记标记为 `dirty`。
 - SSH 文件为 `<repositoryPath>/notes/reading_positions.json`，日期必须使用 ISO-8601；这点与普通笔记 JSON 使用的 Swift 2001 epoch 数字日期不同。
+- 两端的新配置默认目录统一为 `~/notebook_backup`。Android 会只展开开头的 `~`，拒绝 `..`、控制字符和根目录，避免配置路径越界。
+- Android 与 macOS 都先上传唯一临时文件并回读 SHA-256；附件和附件清单先发布，笔记 JSON 随后发布，`notes/index.json` 最后发布。删除仅通过墓碑隐藏，应用不自动物理清理远端旧 JSON/附件。
+- Android 彻底删除前先持久化 `note|<id>` 墓碑；即使笔记实体已经从 Room 删除，下一次同步仍会发布删除状态，且墓碑不会因一次成功同步而清理，避免长期离线设备让笔记复活。
+- 需要整体重建时，在 macOS 设置 → 数据管理执行“无损重建远程仓库”。成功切换到新目录后，让 Android 重新扫描 Mac 二维码或手工填入新路径；旧目录继续作为恢复快照保留。
 - 冲突合并采用 LWW：`updatedAt` 较新者胜；时间相同则 `deviceID` 字典序较大者胜。
 - 阅读位置写入远端前与远端现有值合并，并过滤已删除笔记。临时文件上传后做 SHA-256 回读校验，再原子改名。
 

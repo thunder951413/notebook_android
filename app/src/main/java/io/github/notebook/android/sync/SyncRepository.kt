@@ -29,6 +29,7 @@ import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.UUID
+import java.io.InputStream
 
 data class SshSettings(val host:String,val port:Int,val username:String,val password:String,val path:String,val fingerprint:String="")
 class HostKeyChangedException(val expected:String,val actual:String):Exception("服务器身份已变化，请确认新的主机指纹")
@@ -58,7 +59,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     val notes=dao.observeNoteSummaries()
     val folders=dao.observeFolders()
     val tags=dao.observeTags()
-    fun settings()=SshSettings(prefs.getString("host","")!!,prefs.getInt("port",22),prefs.getString("user","")!!,prefs.getString("password","")!!,prefs.getString("path","~/NotebookSync")!!,prefs.getString("fingerprint","")!!)
+    fun settings()=SshSettings(prefs.getString("host","")!!,prefs.getInt("port",22),prefs.getString("user","")!!,prefs.getString("password","")!!,prefs.getString("path","~/notebook_backup")!!,prefs.getString("fingerprint","")!!)
     fun saveSettings(s:SshSettings){prefs.edit().putString("host",s.host).putInt("port",s.port).putString("user",s.username).putString("password",s.password).putString("path",s.path).putString("fingerprint",s.fingerprint.trim()).apply()}
     fun hasRemoteConfiguration()=settings().let{it.host.isNotBlank()&&it.username.isNotBlank()&&it.path.isNotBlank()}
     fun trustHostKey(fingerprint:String){saveSettings(settings().copy(fingerprint=fingerprint))}
@@ -105,7 +106,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         }catch(error:Throwable){trashedNoteIds.remove(id);throw error}
     }
     suspend fun restore(id:String){trashedNoteIds.remove(id);loadEditable(id)?.let{save(it.copy(deletedAt=null))}}
-    suspend fun deletePermanently(id:String){Reminders.cancel(appContext,id);dao.deleteReadingPosition(id);dao.deleteNotePermanently(id);requestSyncIfConfigured()}
+    suspend fun deletePermanently(id:String){Reminders.cancel(appContext,id);dao.putTombstone(TombstoneEntity("note|$id",id,"note",System.currentTimeMillis(),deviceId()));dao.deleteReadingPosition(id);dao.deleteNotePermanently(id);requestSyncIfConfigured()}
     suspend fun keepLocal(id:String){loadEditable(id)?.let{local->val remoteVersion=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=loadSnapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}
     suspend fun acceptRemote(id:String){val local=loadEditable(id)?:return;val snapshot=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;val env=JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)};val remote=fromEnvelope(env);dao.put(remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion))}
     suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString())=dao.putFolder(FolderEntity(id,name,dao.allFolders().size,type))
@@ -144,7 +145,14 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         try{session.connect(15_000)}catch(error:com.jcraft.jsch.JSchException){verifier?.presentedFingerprint?.takeIf{it!=s.fingerprint}?.let{throw HostKeyChangedException(s.fingerprint,it)};throw error}
         if(s.fingerprint.isBlank())saveSettings(s.copy(fingerprint=sshSha256Fingerprint(java.util.Base64.getDecoder().decode(session.hostKey.key))))
         val ch=(session.openChannel("sftp") as ChannelSftp).apply{connect(15_000)}
-        try { mkdirs(ch,s.path); mkdirs(ch,"${s.path}/notes");mkdirs(ch,"${s.path}/attachments");pullLibrary(ch,s);pullNotes(ch,s);pullAssets(ch,s);syncReadingPositions(ch,s);pushLibrary(ch,s);pushNotes(ch,s);pushAssets(ch,s);Reminders.reconcile(appContext,dao.reminders()) } finally { ch.disconnect();session.disconnect() }
+        val resolved=s.copy(path=resolveRemoteRepositoryPath(s.path,ch.home))
+        try {
+            mkdirs(ch,resolved.path);mkdirs(ch,"${resolved.path}/notes");mkdirs(ch,"${resolved.path}/attachments")
+            pullLibrary(ch,resolved);pullNotes(ch,resolved);pullAssets(ch,resolved);syncReadingPositions(ch,resolved)
+            // Assets and metadata must exist before note JSON and index.json publish references to them.
+            pushLibrary(ch,resolved);pushAssets(ch,resolved);pushNotes(ch,resolved)
+            Reminders.reconcile(appContext,dao.reminders())
+        } finally { ch.disconnect();session.disconnect() }
     }}
 
     private suspend fun pullLibrary(c:ChannelSftp,s:SshSettings){
@@ -182,7 +190,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     }
     private suspend fun pushAssets(c:ChannelSftp,s:SshSettings){
         val remote=readJson(c,"${s.path}/notes/assets_manifest.json");val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("relativePath")]=it.asJsonObject.deepCopy()}
-        val confirmed=mutableListOf<AssetEntity>();dao.dirtyAssets().forEach{a->val file=a.localPath?.let{path->java.io.File(path)}?.takeIf{it.isFile}?:return@forEach;val relative=safeRelative(a.relativePath);mkdirs(c,"${s.path}/attachments/${relative.substringBeforeLast('/',"")}");val tmp="${s.path}/attachments/$relative.tmp.android";c.put(file.inputStream(),tmp);c.rename(tmp,"${s.path}/attachments/$relative");val hash=sha(file.readBytes());entries[relative]=JsonObject().apply{addProperty("relativePath",relative);addProperty("contentHash",hash);addProperty("size",file.length())};confirmed+=a.copy(contentHash=hash,size=file.length(),dirty=false)}
+        val confirmed=mutableListOf<AssetEntity>();dao.dirtyAssets().forEach{a->val file=a.localPath?.let{path->java.io.File(path)}?.takeIf{it.isFile}?:error("本地附件文件缺失，已取消远程发布");val relative=safeRelative(a.relativePath);mkdirs(c,"${s.path}/attachments/${relative.substringBeforeLast('/',"")}");val target="${s.path}/attachments/$relative";val hash=file.inputStream().use(::sha);atomicUpload(c,target,file,hash);entries[relative]=JsonObject().apply{addProperty("relativePath",relative);addProperty("contentHash",hash);addProperty("size",file.length())};confirmed+=a.copy(contentHash=hash,size=file.length(),dirty=false)}
         val manifest=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)})};atomicWrite(c,"${s.path}/notes/assets_manifest.json",gson.toJson(manifest))
         if(confirmed.isNotEmpty())dao.putAssets(confirmed)
     }
@@ -219,6 +227,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         val remote=readJson(c,"${s.path}/notes/index.json")
         val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
         val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{deleted[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
+        dao.tombstones().filter{it.itemType=="note"}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Pair<String,Long>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=n.id to n.version}
             else {val env=toEnvelope(n);atomicWrite(c,"${s.path}/notes/${n.id}.json",gson.toJson(env));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",sha(gson.toJson(env["currentSnapshot"])));addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);confirmed+=n.id to n.version}
@@ -246,12 +255,14 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private fun stepsFromEnvelope(o:JsonObject):List<TodoStepEntity>{val s=o["currentSnapshot"].asJsonObject;return s["todoSteps"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{raw->val x=raw.asJsonObject;TodoStepEntity(x.str("id"),x.str("noteID"),x.str("text"),x["checked"]?.asBoolean?:false,x.int("order"),x.dateMs("createdAt"))}.orEmpty()}
     private fun readJson(c:ChannelSftp,p:String)=try{val out=ByteArrayOutputStream();c.get(p,out);JsonParser.parseString(out.toString("UTF-8")).asJsonObject}catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
     private fun atomicWrite(c:ChannelSftp,p:String,text:String){val bytes=text.toByteArray();val tmp="$p.tmp.android.${UUID.randomUUID()}";try{c.put(ByteArrayInputStream(bytes),tmp);val remote=ByteArrayOutputStream();c.get(tmp,remote);require(sha(remote.toByteArray())==sha(bytes)){"远端临时文件校验失败：$p"};c.rename(tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
-    private fun mkdirs(c:ChannelSftp,path:String){var cur="";path.replace("~",c.home).split('/').filter{it.isNotBlank()}.forEach{cur+="/$it";try{c.mkdir(cur)}catch(_:Exception){}}}
+    private fun atomicUpload(c:ChannelSftp,p:String,file:java.io.File,expectedHash:String){val tmp="$p.tmp.android.${UUID.randomUUID()}";try{file.inputStream().use{c.put(it,tmp)};val remoteHash=c.get(tmp).use(::sha);require(remoteHash==expectedHash){"远端附件临时文件校验失败"};c.rename(tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
+    private fun mkdirs(c:ChannelSftp,path:String){var cur="";path.split('/').filter{it.isNotBlank()}.forEach{cur+="/$it";try{c.mkdir(cur)}catch(_:Exception){}}}
     private fun deviceId()=prefs.getString("device",null)?:UUID.randomUUID().toString().also{prefs.edit().putString("device",it).apply()}
     private fun swiftDate(ms:Long)=SwiftDateCodec.encode(ms)
     private fun sha(s:String)=MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString(""){"%02x".format(it)}
     private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}
-    private fun safeRelative(path:String):String{val normalized=path.replace('\\','/').trimStart('/');require(normalized.isNotBlank()&&!normalized.split('/').any{it==".."||it.isBlank()}){"非法附件路径"};return normalized}
+    private fun sha(input:InputStream):String{val digest=MessageDigest.getInstance("SHA-256");val buffer=ByteArray(1024*1024);while(true){val count=input.read(buffer);if(count<0)break;if(count>0)digest.update(buffer,0,count)};return digest.digest().joinToString(""){"%02x".format(it)}}
+    private fun safeRelative(path:String):String{val normalized=path.replace('\\','/');require(normalized.isNotBlank()&&!normalized.startsWith('/')&&!normalized.startsWith('~')&&normalized.none{it.isISOControl()}&&!normalized.split('/').any{it==".."||it=="."||it.isBlank()}){"非法附件路径"};return normalized}
     private fun decodeText(bytes:ByteArray):String{
         val candidates=when{bytes.size>=2&&bytes[0]==0xFF.toByte()&&bytes[1]==0xFE.toByte()->listOf(StandardCharsets.UTF_16LE);bytes.size>=2&&bytes[0]==0xFE.toByte()&&bytes[1]==0xFF.toByte()->listOf(StandardCharsets.UTF_16BE);else->listOf(StandardCharsets.UTF_8,StandardCharsets.UTF_16LE,StandardCharsets.UTF_16BE,StandardCharsets.ISO_8859_1)}
         return candidates.firstNotNullOfOrNull{charset->runCatching{charset.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()}.getOrNull()}?:error("无法识别文档编码")
@@ -266,6 +277,15 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         createEncryptedPrefs(context)
     }
     private fun createEncryptedPrefs(context:Context)=EncryptedSharedPreferences.create(context,"ssh",MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
+}
+
+internal fun resolveRemoteRepositoryPath(configuredPath:String,home:String):String{
+    val path=configuredPath.trim().trimEnd('/')
+    require(path.isNotEmpty()){"远程目录不能为空"}
+    require(path.none{it.isISOControl()}){"远程目录不能包含控制字符"}
+    val resolved=when{path=="~"->home;path.startsWith("~/")->home.trimEnd('/')+"/"+path.removePrefix("~/");path.startsWith("/")->path;else->home.trimEnd('/')+"/"+path}
+    require(resolved!="/"&&!resolved.split('/').any{it=="."||it==".."}){"远程目录不安全"}
+    return resolved
 }
 private fun JsonObject.str(k:String,d:String="")=get(k)?.takeUnless{it.isJsonNull}?.asString?:d
 private fun JsonObject.optStr(k:String)=get(k)?.takeUnless{it.isJsonNull}?.asString

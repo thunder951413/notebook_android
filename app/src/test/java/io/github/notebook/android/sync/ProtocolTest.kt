@@ -28,6 +28,14 @@ class ProtocolTest {
         assertEquals("SHA256:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ",sshSha256Fingerprint("hello".toByteArray()))
     }
 
+    @Test fun `remote repository path expands only leading tilde and rejects traversal`() {
+        assertEquals("/home/user/notebook backup",resolveRemoteRepositoryPath("~/notebook backup/","/home/user"))
+        assertEquals("/srv/notebook",resolveRemoteRepositoryPath("/srv/notebook","/home/user"))
+        assertEquals("/home/user/notebook",resolveRemoteRepositoryPath("notebook","/home/user"))
+        assertThrows(IllegalArgumentException::class.java){resolveRemoteRepositoryPath("~/../escape","/home/user")}
+        assertThrows(IllegalArgumentException::class.java){resolveRemoteRepositoryPath("/","/home/user")}
+    }
+
     @Test fun `markdown semantic blocks round trip`() {
         val source="# 标题\n普通段落\n- 项目\n2. 第二项\n- [x] 完成\n- [ ] 待办"
         val blocks=BlockDocumentCodec.encodeMarkdown(source)
