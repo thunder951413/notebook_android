@@ -43,6 +43,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private val syncMutex=Mutex()
     private val pendingDrafts=ConcurrentHashMap<String,NoteEntity>()
     private val draftJobs=ConcurrentHashMap<String,Job>()
+    private val trashedNoteIds=ConcurrentHashMap.newKeySet<String>()
     private val syncRequestLock=Any()
     private var syncRequestJob:Job?=null
     private val _saveError=MutableStateFlow<String?>(null)
@@ -72,8 +73,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private fun encryptedNoteIds():Set<String> = runCatching{gson.fromJson(prefs.getString("encryptedNoteIds","[]"),Array<String>::class.java).toSet()}.getOrDefault(emptySet())
     private fun encryptedMappings():Map<String,String> = runCatching{gson.fromJson(prefs.getString("encryptedMappings","{}"),JsonObject::class.java).entrySet().associate{it.key to it.value.asString}}.getOrDefault(emptyMap())
     suspend fun save(n:NoteEntity):NoteEntity{setSaveState(n.id,NoteSaveState.Saving);return try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));persistDraft(n).also{setSaveState(n.id,NoteSaveState.Saved)}}catch(error:Throwable){setSaveState(n.id,NoteSaveState.Failed);throw error}}
-    fun queueDraft(n:NoteEntity){setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
-    fun flushDraft(n:NoteEntity):Job{setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
+    fun queueDraft(n:NoteEntity){if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return;setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
+    fun flushDraft(n:NoteEntity):Job{if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return appScope.launch{};setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
     fun flushAllAsync(){pendingDrafts.values.toList().forEach(::flushDraft)}
     suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);throw error}}}
     suspend fun recoverDrafts(){dao.draftNoteIds().forEach{id->readLargeText(dao.draftPayloadLength(id)){start,length->dao.draftPayloadChunk(id,start,length)}?.let{payload->runCatching{gson.fromJson(payload,NoteEntity::class.java)}.getOrNull()?.let{persistDraft(it)}}}}
@@ -94,7 +95,16 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());dao.deleteDraft(draft.id);if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important&&a.viewMode==b.viewMode
-    suspend fun restore(id:String){loadEditable(id)?.let{save(it.copy(deletedAt=null))}}
+    suspend fun moveToTrash(id:String){
+        trashedNoteIds.add(id)
+        try{
+            val pending=pendingDrafts.remove(id)
+            draftJobs.remove(id)?.cancelAndJoin()
+            val current=pending?:loadEditable(id)?:run{trashedNoteIds.remove(id);return}
+            save(current.copy(deletedAt=System.currentTimeMillis()))
+        }catch(error:Throwable){trashedNoteIds.remove(id);throw error}
+    }
+    suspend fun restore(id:String){trashedNoteIds.remove(id);loadEditable(id)?.let{save(it.copy(deletedAt=null))}}
     suspend fun deletePermanently(id:String){Reminders.cancel(appContext,id);dao.deleteReadingPosition(id);dao.deleteNotePermanently(id);requestSyncIfConfigured()}
     suspend fun keepLocal(id:String){loadEditable(id)?.let{local->val remoteVersion=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=loadSnapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}
     suspend fun acceptRemote(id:String){val local=loadEditable(id)?:return;val snapshot=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;val env=JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)};val remote=fromEnvelope(env);dao.put(remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion))}

@@ -182,7 +182,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
                 loadingNoteId?.let{LinearProgressIndicator(Modifier.fillMaxWidth())}
                 saveError?.let{Text(it,Modifier.padding(horizontal=16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
                 Row(Modifier.fillMaxSize()){
-                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else VirtualNoteList(visible,loadingNoteId){openNote(it)}}
+                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else VirtualNoteList(visible,loadingNoteId,repo,{openNote(it)},{deletedID->if(editing?.id==deletedID)editing=null}){message->status=message}}
                     if(isTablet){VerticalDivider();Box(Modifier.weight(1.65f).fillMaxHeight().background(MaterialTheme.colorScheme.background)){editing?.let{note->EditorPane(note,repo,initiallyEditing=startInEditMode,onDone={editing=null})}?:Box(Modifier.fillMaxSize().padding(40.dp)){Text("选择一篇笔记开始阅读",color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
                 }
             }
@@ -194,11 +194,11 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
 
 @Composable private fun DrawerRow(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,selected:Boolean,count:Int?=null,onClick:()->Unit){NavigationDrawerItem(label={Row{Text(label);Spacer(Modifier.weight(1f));count?.let{Text(it.toString(),style=MaterialTheme.typography.labelMedium)}}},icon={Icon(icon,null)},selected=selected,onClick=onClick,modifier=Modifier.padding(horizontal=8.dp,vertical=1.dp))}
 
-@Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,onOpen:(String)->Unit){
+@Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,repo:SyncRepository,onOpen:(String)->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
     val state=rememberLazyListState()
     val scrollMetrics by remember(state,notes.size){derivedStateOf{Triple(state.layoutInfo.visibleItemsInfo.size,notes.size,state.firstVisibleItemIndex)}}
     BoxWithConstraints(Modifier.fillMaxSize()){
-        LazyColumn(Modifier.fillMaxSize(),state=state){items(notes,key={it.id}){n->NoteRow(n,loadingNoteId==n.id){onOpen(n.id)}}}
+        LazyColumn(Modifier.fillMaxSize(),state=state){items(notes,key={it.id}){n->SwipeDeleteNoteRow(n,loadingNoteId==n.id,repo,{onOpen(n.id)},onDeleted,onStatus)}}
         val (visibleCount,totalCount,firstVisible)=scrollMetrics
         if(notes.size>visibleCount&&visibleCount>0){
             val thumbFraction=(visibleCount.toFloat()/totalCount).coerceIn(.08f,1f)
@@ -207,6 +207,59 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
             Box(Modifier.align(androidx.compose.ui.Alignment.TopEnd).padding(end=2.dp).width(4.dp).height(thumbHeight).offset{IntOffset(0,((maxHeight-thumbHeight).toPx()*progress).roundToInt())}.background(MaterialTheme.colorScheme.primary.copy(alpha=.45f),MaterialTheme.shapes.small))
         }
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun SwipeDeleteNoteRow(note:NoteSummary,loading:Boolean,repo:SyncRepository,onClick:()->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
+    var deleteDialog by remember(note.id){mutableStateOf(false)}
+    var deleting by remember(note.id){mutableStateOf(false)}
+    val scope=rememberCoroutineScope()
+    val itemLabel=if(note.itemType=="todo")"计划" else "笔记"
+    val swipeEnabled=note.deletedAt==null&&!loading&&!deleting
+    val dismissState=rememberSwipeToDismissBoxState(
+        confirmValueChange={value->
+            if(value==SwipeToDismissBoxValue.EndToStart&&swipeEnabled){deleteDialog=true}
+            false
+        },
+        positionalThreshold={distance->distance*.35f}
+    )
+    SwipeToDismissBox(
+        state=dismissState,
+        backgroundContent={
+            Box(
+                Modifier.fillMaxSize().background(MaterialTheme.colorScheme.errorContainer).padding(horizontal=24.dp),
+                contentAlignment=androidx.compose.ui.Alignment.CenterEnd
+            ){
+                Row(horizontalArrangement=Arrangement.spacedBy(8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
+                    Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.onErrorContainer)
+                    Text("删除",color=MaterialTheme.colorScheme.onErrorContainer,fontWeight=FontWeight.SemiBold)
+                }
+            }
+        },
+        modifier=Modifier.testTag("swipe-delete-${note.id}"),
+        enableDismissFromStartToEnd=false,
+        enableDismissFromEndToStart=swipeEnabled
+    ){NoteRow(note,loading,onClick)}
+    if(deleteDialog)AlertDialog(
+        onDismissRequest={deleteDialog=false},
+        icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},
+        title={Text("删除$itemLabel？")},
+        text={Text("删除后会移入回收站，可以稍后恢复。")},
+        confirmButton={Button(
+            onClick={
+                deleteDialog=false
+                deleting=true
+                scope.launch{
+                    runCatching{repo.moveToTrash(note.id)}
+                        .onSuccess{onDeleted(note.id);onStatus("已移入回收站")}
+                        .onFailure{onStatus("删除失败：${it.localizedMessage}")}
+                    deleting=false
+                }
+            },
+            colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)
+        ){Text("删除")}},
+        dismissButton={TextButton({deleteDialog=false}){Text("取消")}}
+    )
 }
 
 @Composable private fun NoteRow(note:NoteSummary,loading:Boolean,onClick:()->Unit){ListItem(headlineContent={Row{Text(note.title.ifBlank{"无标题"},fontWeight=FontWeight.Medium);Spacer(Modifier.weight(1f));if(loading)CircularProgressIndicator(Modifier.size(15.dp),strokeWidth=2.dp)else if(note.reminderAt!=null)Icon(Icons.Default.Notifications,null,Modifier.size(15.dp),tint=MaterialTheme.colorScheme.primary)}},supportingContent={Column{Text(note.preview,maxLines=2);Spacer(Modifier.height(5.dp));Text("${DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt))}  ·  ${note.folderName}",style=MaterialTheme.typography.labelSmall)}},leadingContent={if(note.itemType=="todo")Icon(Icons.Default.CheckCircle,null,tint=if(note.completedAt==null)MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary)},modifier=Modifier.clickable(enabled=!loading,onClick=onClick).padding(horizontal=4.dp));HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant)}
