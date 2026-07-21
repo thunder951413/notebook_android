@@ -62,6 +62,26 @@ class MainActivityTest {
         rule.onNodeWithText("设置与同步").assertIsDisplayed()
     }
 
+    @Test fun folderBelowSelectedFolderRemainsClickable(){
+        val suffix=System.nanoTime().toString()
+        val selectedId="selected-folder-$suffix";val targetId="target-folder-$suffix"
+        val selectedName="已选目录-$suffix";val targetName="下方目录-$suffix";val targetNote="下方目录笔记-$suffix"
+        val app=rule.activity.application as NotebookApp
+        runBlocking{
+            app.database.dao().putFolder(FolderEntity(selectedId,selectedName,10_000,"noteFolder"))
+            app.database.dao().putFolder(FolderEntity(targetId,targetName,10_001,"noteFolder"))
+            app.database.dao().put(NoteEntity("target-note-$suffix",title=targetNote,folderId=targetId,folderName=targetName))
+        }
+        rule.activityRule.scenario.recreate()
+        rule.onNodeWithContentDescription("导航").performClick()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText(selectedName))
+        rule.onNodeWithText(selectedName).performClick()
+        rule.onNodeWithContentDescription("导航").performClick()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText(targetName))
+        rule.onNodeWithText(targetName).assertIsDisplayed().performClick()
+        rule.onNodeWithText(targetNote).assertIsDisplayed()
+    }
+
     @Test fun existingNoteOpensInMarkdownAndCanSwitchToEdit(){
         val app=rule.activity.application as NotebookApp;val title="Markdown 阅读-${System.nanoTime()}"
         runBlocking{app.database.dao().put(NoteEntity("markdown-mode-test",title=title,body="# 一级标题\n\n**粗体内容**"))}
@@ -70,13 +90,30 @@ class MainActivityTest {
         rule.onNodeWithTag("edit-mode").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed()
     }
 
-    @Test fun newNoteStartsInEditMode(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed()}
+    @Test fun newNoteStartsInEditModeAndShowsBriefSavedConfirmation(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithTag("preview-mode").assertIsDisplayed();rule.onNodeWithContentDescription("保存").assertIsDisplayed().performClick();rule.waitUntil(5_000){rule.onAllNodesWithContentDescription("已保存").fetchSemanticsNodes().isNotEmpty()};rule.waitUntil(2_000){rule.onAllNodesWithContentDescription("已保存").fetchSemanticsNodes().isEmpty()}}
+
+    @Test fun topDeleteRequiresConfirmationAndMovesNoteToTrash(){val title="明确删除-${System.nanoTime()}";val app=rule.activity.application as NotebookApp;rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("title-field").performTextInput(title);rule.onNodeWithTag("delete-item").assertIsDisplayed().performClick();rule.onNodeWithText("删除笔记？").assertIsDisplayed();rule.onNodeWithText("删除").performClick();rule.waitUntil(5_000){runBlocking{app.database.dao().allNotes().any{it.title==title&&it.deletedAt!=null}}}}
+
+    @Test fun swipeLeftRequiresConfirmationAndMovesNoteToTrash(){
+        val suffix=System.nanoTime().toString();val id="swipe-delete-$suffix";val title="左滑删除-$suffix"
+        val app=rule.activity.application as NotebookApp
+        runBlocking{app.database.dao().put(NoteEntity(id,title=title,body="保留到确认后再删除"))}
+        rule.activityRule.scenario.recreate()
+        rule.onNodeWithTag("swipe-delete-$id").assertIsDisplayed().performTouchInput{swipeLeft()}
+        rule.onNodeWithTag("delete-action-$id").assertIsDisplayed().performClick()
+        rule.onNodeWithText("删除笔记？").assertIsDisplayed()
+        assertTrue(runBlocking{app.database.dao().allNotes().any{it.id==id&&it.deletedAt==null}})
+        rule.onNodeWithText("删除").performClick()
+        rule.waitUntil(5_000){runBlocking{app.database.dao().allNotes().any{it.id==id&&it.deletedAt!=null}}}
+        runBlocking{app.repository.flushDraft(NoteEntity(id,title=title,body="迟到的编辑器草稿")).join()}
+        assertTrue(runBlocking{app.database.dao().allNotes().any{it.id==id&&it.deletedAt!=null}})
+    }
 
     @Test fun todoListsAppearInDrawerAndCreateTodos(){
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("todo-list-test","工作提醒",0,"todoList"));app.database.dao().put(NoteEntity("todo-in-list",title="列表中的待办",itemType="todo",folderId="todo-list-test",folderName="工作提醒"))};rule.activityRule.scenario.recreate()
         if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isNotEmpty())rule.onNodeWithContentDescription("导航").performClick()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("工作提醒"));rule.onNodeWithText("工作提醒").assertIsDisplayed().performClick();rule.onNodeWithText("列表中的待办").assertIsDisplayed()
-        rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
+        rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("编辑计划").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
     }
 
     @Test fun encryptedFoldersAreShownLockedAndNotesStayOutOfAllNotes(){

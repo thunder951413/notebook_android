@@ -1,6 +1,7 @@
 package io.github.notebook.android.sync
 
 import com.google.gson.JsonObject
+import io.github.notebook.android.data.ReadingPositionEntity
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -27,6 +28,21 @@ class ProtocolTest {
         assertEquals("SHA256:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ",sshSha256Fingerprint("hello".toByteArray()))
     }
 
+    @Test fun `remote repository path expands only leading tilde and rejects traversal`() {
+        assertEquals("/home/user/notebook backup",resolveRemoteRepositoryPath("~/notebook backup/","/home/user"))
+        assertEquals("/srv/notebook",resolveRemoteRepositoryPath("/srv/notebook","/home/user"))
+        assertEquals("/home/user/notebook",resolveRemoteRepositoryPath("notebook","/home/user"))
+        assertThrows(IllegalArgumentException::class.java){resolveRemoteRepositoryPath("~/../escape","/home/user")}
+        assertThrows(IllegalArgumentException::class.java){resolveRemoteRepositoryPath("/","/home/user")}
+    }
+
+    @Test fun `remote write lock contract matches mac client`() {
+        assertEquals("/srv/notebook/notes/.index-write.lock",RemoteRepositoryLockContract.lockPath("/srv/notebook"))
+        assertEquals("owner",RemoteRepositoryLockContract.OWNER_FILE_NAME)
+        assertEquals(30,RemoteRepositoryLockContract.MAXIMUM_ATTEMPTS)
+        assertEquals(1_800L,RemoteRepositoryLockContract.STALE_AFTER_SECONDS)
+    }
+
     @Test fun `markdown semantic blocks round trip`() {
         val source="# 标题\n普通段落\n- 项目\n2. 第二项\n- [x] 完成\n- [ ] 待办"
         val blocks=BlockDocumentCodec.encodeMarkdown(source)
@@ -48,6 +64,24 @@ class ProtocolTest {
         assertTrue(spans.any{it.asJsonObject["italic"]?.asBoolean==true})
         assertTrue(spans.any{it.asJsonObject["link"]?.asString=="https://example.com"})
         assertEquals(source,BlockDocumentCodec.decodeMarkdown(blocks))
+    }
+
+    @Test fun `large markdown is compacted without changing content`() {
+        val source=(0 until 1_200).joinToString("\n"){"第 $it 行"}
+        val first=BlockDocumentCodec.encodeMarkdown(source,"note")
+        val second=BlockDocumentCodec.encodeMarkdown(source,"note")
+        assertTrue(first.size()<10)
+        assertEquals(source,BlockDocumentCodec.decodeMarkdown(first))
+        assertEquals(first.map{it.asJsonObject["id"].asString},second.map{it.asJsonObject["id"].asString})
+    }
+
+    @Test fun `reading position uses mac ISO dates and deterministic last writer wins`() {
+        val older=ReadingPositionEntity("note",10,0.0,1_700_000_000_000,"phone-a")
+        val tieWinner=older.copy(anchorUtf16Offset=30,deviceId="phone-z")
+        val encoded=ReadingPositionProtocol.encode(older)
+        assertTrue(encoded["updatedAt"].asString.endsWith("Z"))
+        assertEquals(older,ReadingPositionProtocol.decode(encoded))
+        assertEquals(tieWinner,ReadingPositionProtocol.merge(listOf(older),listOf(tieWinner)).single())
     }
 
     private fun entry(id:String,version:Long)=JsonObject().apply{addProperty("noteID",id);addProperty("version",version);addProperty("contentHash","");addProperty("historyCount",0)}

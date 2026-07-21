@@ -3,7 +3,9 @@ package io.github.notebook.android.sync
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonElement
+import io.github.notebook.android.data.ReadingPositionEntity
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Base64
 
 object SwiftDateCodec {
@@ -23,13 +25,53 @@ object RemoteIndexMerger {
     }
 }
 
+object ReadingPositionProtocol {
+    const val SCHEMA_VERSION=1
+
+    fun wins(candidate:ReadingPositionEntity,current:ReadingPositionEntity?):Boolean=
+        current==null||candidate.updatedAt>current.updatedAt||
+            (candidate.updatedAt==current.updatedAt&&candidate.deviceId>current.deviceId)
+
+    fun merge(local:Collection<ReadingPositionEntity>,remote:Collection<ReadingPositionEntity>):List<ReadingPositionEntity>{
+        val merged=local.associateByTo(linkedMapOf(),ReadingPositionEntity::noteId)
+        remote.forEach{candidate->if(wins(candidate,merged[candidate.noteId]))merged[candidate.noteId]=candidate}
+        return merged.values.sortedBy(ReadingPositionEntity::noteId)
+    }
+
+    fun encode(position:ReadingPositionEntity)=JsonObject().apply{
+        addProperty("noteID",position.noteId)
+        addProperty("anchorUTF16Offset",position.anchorUtf16Offset)
+        addProperty("viewportOffsetFraction",position.viewportOffsetFraction.coerceIn(-1.0,1.0))
+        addProperty("updatedAt",Instant.ofEpochMilli(position.updatedAt).toString())
+        addProperty("deviceID",position.deviceId)
+    }
+
+    fun decode(value:JsonObject)=ReadingPositionEntity(
+        noteId=value["noteID"].asString,
+        anchorUtf16Offset=(value["anchorUTF16Offset"]?.asInt?:0).coerceAtLeast(0),
+        viewportOffsetFraction=(value["viewportOffsetFraction"]?.asDouble?:0.0).coerceIn(-1.0,1.0),
+        updatedAt=Instant.parse(value["updatedAt"].asString).toEpochMilli(),
+        deviceId=value["deviceID"]?.asString.orEmpty()
+    )
+}
+
 fun sshSha256Fingerprint(key:ByteArray):String="SHA256:"+Base64.getEncoder().withoutPadding().encodeToString(MessageDigest.getInstance("SHA-256").digest(key))
 
 object BlockDocumentCodec {
-    fun encodeMarkdown(markdown:String):JsonArray=JsonArray().apply{
-        markdown.split('\n').forEach{line->
+    private const val COMPACT_THRESHOLD=512
+    private const val COMPACT_GROUP_LINES=256
+
+    fun encodeMarkdown(markdown:String,idPrefix:String="android"):JsonArray=JsonArray().apply{
+        val lines=markdown.split('\n')
+        if(lines.size>COMPACT_THRESHOLD){
+            lines.chunked(COMPACT_GROUP_LINES).forEachIndexed{index,group->
+                add(JsonObject().apply{addProperty("id","$idPrefix-$index");addProperty("type","paragraph");add("text",encodeInline(group.joinToString("\n")))})
+            }
+            return@apply
+        }
+        lines.forEachIndexed{index,line->
             val heading=Regex("^(#{1,6})\\s+(.*)$").matchEntire(line);val check=Regex("^- \\[( |x|X)]\\s+(.*)$").matchEntire(line);val ordered=Regex("^(\\d+)\\.\\s+(.*)$").matchEntire(line);val bullet=Regex("^[-*+]\\s+(.*)$").matchEntire(line)
-            val block=JsonObject();block.addProperty("id",java.util.UUID.randomUUID().toString())
+            val block=JsonObject();block.addProperty("id","$idPrefix-$index")
             val content=when{heading!=null->{block.addProperty("type","heading");block.addProperty("level",heading.groupValues[1].length);heading.groupValues[2]};check!=null->{block.addProperty("type","todo_item");block.addProperty("checked",check.groupValues[1].lowercase()=="x");check.groupValues[2]};ordered!=null->{block.addProperty("type","list_item");block.addProperty("listStyle","ordered");block.addProperty("order",ordered.groupValues[1].toInt());ordered.groupValues[2]};bullet!=null->{block.addProperty("type","list_item");block.addProperty("listStyle","unordered");bullet.groupValues[1]};else->{block.addProperty("type","paragraph");line}}
             block.add("text",encodeInline(content));add(block)
         }
