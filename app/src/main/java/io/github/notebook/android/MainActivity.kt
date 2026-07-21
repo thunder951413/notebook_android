@@ -13,6 +13,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -20,10 +23,12 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.animation.core.animate
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.TextRange
@@ -96,6 +101,13 @@ internal enum class Destination(val title:String,val newItemType:String?="note")
 internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:String?,tagId:String?,endOfToday:Long,id:String=UUID.randomUUID().toString()):NoteEntity {
     val itemType=when(folder?.type){"todoList"->"todo";"noteFolder","encryptedFolder"->"note";else->destination.newItemType?:"note"}
     return NoteEntity(id,itemType=itemType,important=itemType=="todo"&&destination==Destination.Important,dueAt=endOfToday.takeIf{itemType=="todo"&&destination==Destination.Today},folderId=folderId,folderName=folder?.name?:"未分类",tagIds=tagId.orEmpty(),viewMode="text")
+}
+
+internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocityPxPerSecond:Float):Float {
+    if(actionWidthPx<=0f)return 0f
+    val shouldOpen=velocityPxPerSecond< -500f||
+        (velocityPxPerSecond<=500f&&offsetPx<=-actionWidthPx*.35f)
+    return if(shouldOpen)-actionWidthPx else 0f
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -213,35 +225,60 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
 @Composable private fun SwipeDeleteNoteRow(note:NoteSummary,loading:Boolean,repo:SyncRepository,onClick:()->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
     var deleteDialog by remember(note.id){mutableStateOf(false)}
     var deleting by remember(note.id){mutableStateOf(false)}
+    var offsetPx by remember(note.id){mutableFloatStateOf(0f)}
+    var settleJob by remember(note.id){mutableStateOf<kotlinx.coroutines.Job?>(null)}
     val scope=rememberCoroutineScope()
     val itemLabel=if(note.itemType=="todo")"计划" else "笔记"
     val swipeEnabled=note.deletedAt==null&&!loading&&!deleting
-    val dismissState=rememberSwipeToDismissBoxState(
-        confirmValueChange={value->
-            if(value==SwipeToDismissBoxValue.EndToStart&&swipeEnabled){deleteDialog=true}
-            false
-        },
-        positionalThreshold={distance->distance*.35f}
-    )
-    SwipeToDismissBox(
-        state=dismissState,
-        backgroundContent={
+    val actionWidth=96.dp
+    val actionWidthPx=with(LocalDensity.current){actionWidth.toPx()}
+    fun settle(target:Float){
+        settleJob?.cancel()
+        settleJob=scope.launch{animate(offsetPx,target){value,_->offsetPx=value}}
+    }
+    val dragState=rememberDraggableState{delta->
+        settleJob?.cancel()
+        offsetPx=(offsetPx+delta).coerceIn(-actionWidthPx,0f)
+    }
+    LaunchedEffect(swipeEnabled){if(!swipeEnabled&&offsetPx!=0f)settle(0f)}
+    Box(Modifier.fillMaxWidth().testTag("swipe-delete-${note.id}")){
+        if(offsetPx<-.5f){
             Box(
-                Modifier.fillMaxSize().background(MaterialTheme.colorScheme.errorContainer).padding(horizontal=24.dp),
+                Modifier.matchParentSize().background(MaterialTheme.colorScheme.errorContainer),
                 contentAlignment=androidx.compose.ui.Alignment.CenterEnd
             ){
-                Row(horizontalArrangement=Arrangement.spacedBy(8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
-                    Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.onErrorContainer)
-                    Text("删除",color=MaterialTheme.colorScheme.onErrorContainer,fontWeight=FontWeight.SemiBold)
+                Button(
+                    onClick={deleteDialog=true;settle(0f)},
+                    modifier=Modifier.width(actionWidth).fillMaxHeight().testTag("delete-action-${note.id}"),
+                    enabled=swipeEnabled,
+                    shape=androidx.compose.ui.graphics.RectangleShape,
+                    colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error),
+                    contentPadding=PaddingValues(0.dp)
+                ){
+                    Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(4.dp)){
+                        Icon(Icons.Default.Delete,"删除$itemLabel")
+                        Text("删除",fontWeight=FontWeight.SemiBold)
+                    }
                 }
             }
-        },
-        modifier=Modifier.testTag("swipe-delete-${note.id}"),
-        enableDismissFromStartToEnd=false,
-        enableDismissFromEndToStart=swipeEnabled
-    ){NoteRow(note,loading,onClick)}
+        }
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .offset{IntOffset(offsetPx.roundToInt(),0)}
+                .background(MaterialTheme.colorScheme.surface)
+                .draggable(
+                    state=dragState,
+                    orientation=Orientation.Horizontal,
+                    enabled=swipeEnabled,
+                    onDragStopped={velocity->
+                        settle(swipeDeleteTargetOffset(offsetPx,actionWidthPx,velocity))
+                    }
+                )
+        ){NoteRow(note,loading){if(offsetPx<-.5f)settle(0f)else onClick()}}
+    }
     if(deleteDialog)AlertDialog(
-        onDismissRequest={deleteDialog=false},
+        onDismissRequest={deleteDialog=false;settle(0f)},
         icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},
         title={Text("删除$itemLabel？")},
         text={Text("删除后会移入回收站，可以稍后恢复。")},
@@ -258,7 +295,7 @@ internal fun newItemDraft(destination:Destination,folder:FolderEntity?,folderId:
             },
             colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)
         ){Text("删除")}},
-        dismissButton={TextButton({deleteDialog=false}){Text("取消")}}
+        dismissButton={TextButton({deleteDialog=false;settle(0f)}){Text("取消")}}
     )
 }
 

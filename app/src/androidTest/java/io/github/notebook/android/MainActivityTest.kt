@@ -100,6 +100,7 @@ class MainActivityTest {
         runBlocking{app.database.dao().put(NoteEntity(id,title=title,body="保留到确认后再删除"))}
         rule.activityRule.scenario.recreate()
         rule.onNodeWithTag("swipe-delete-$id").assertIsDisplayed().performTouchInput{swipeLeft()}
+        rule.onNodeWithTag("delete-action-$id").assertIsDisplayed().performClick()
         rule.onNodeWithText("删除笔记？").assertIsDisplayed()
         assertTrue(runBlocking{app.database.dao().allNotes().any{it.id==id&&it.deletedAt==null}})
         rule.onNodeWithText("删除").performClick()
