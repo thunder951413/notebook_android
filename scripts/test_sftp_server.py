@@ -44,6 +44,14 @@ class SFTP(paramiko.SFTPServerInterface):
     def rmdir(self,path):
         try:os.rmdir(self._p(path));return paramiko.SFTP_OK
         except OSError as e:return paramiko.SFTPServer.convert_errno(e.errno)
+    def chattr(self,path,attr):
+        try:
+            target=self._p(path)
+            if attr.st_atime is not None or attr.st_mtime is not None:
+                current=os.stat(target)
+                os.utime(target,(attr.st_atime if attr.st_atime is not None else current.st_atime,attr.st_mtime if attr.st_mtime is not None else current.st_mtime))
+            return paramiko.SFTP_OK
+        except OSError as e:return paramiko.SFTPServer.convert_errno(e.errno)
     def canonicalize(self,path): return "/"+os.path.relpath(self._p(path),self.root).replace(os.sep,"/") if self._p(path)!=self.root else "/"
 
 def main():

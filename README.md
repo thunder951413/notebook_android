@@ -2,12 +2,17 @@
 
 项目迁移、架构约束、自动保存/提醒说明、完整使用场景审计和 AI 接手步骤见 [`AI_HANDOFF.md`](AI_HANDOFF.md)。后续开发应先阅读该文档。
 
-这是 macOS Notebook 的 Android 移动端子项目。应用离线优先，本地使用 Room 保存数据；服务器只作为交换目录，通过 SSH/SFTP 与 macOS 端读写同一套文件：
+这是 Notebook 的 Android 移动端子项目。应用离线优先，本地使用 Room 保存数据。当前推荐与 Electron 桌面版共用 SSH/SFTP Markdown v3 仓库；Notebook Next HTTP API 保留为可选的多用户或公网服务方案。
+
+SSH/SFTP Markdown v3 的交换文件包括：
 
 - `library.json`：文件夹和标签
 - `notes/index.json`：笔记版本索引与删除记录
-- `notes/<UUID>.json`：笔记/Todo 的版本化快照
-- `attachments/` 与 `notes/assets_manifest.json`：带 SHA-256 校验的附件
+- `notes/<UUID>.json.gz`：GFM Markdown 正文、哈希引用历史和页面元数据
+- `objects/<前两位>/<SHA-256>`：图片、音频和附件的内容寻址资源
+- `notes/assets_manifest.json`：资源索引和校验信息
+
+读取端仍兼容旧版 UUID JSON 与 `attachments/`，但新写入只使用紧凑的 v3 格式。
 
 ## 已实现
 
@@ -17,13 +22,15 @@
 - 无保存按钮的自动保存、后台/返回强制刷新与崩溃草稿恢复
 - SSH 设置的加密保存
 - macOS Swift `JSONEncoder` 日期（2001 reference date）兼容
-- `library.json`、索引和逐笔记 JSON 的双向 SFTP 同步
+- `library.json`、gzip 笔记、内容寻址资源和哈希历史的双向 SFTP 同步
 - 本地脏数据、远端版本检测及冲突标记
 - 图片、音频、文件附件的上传、下载、预览和系统打开
 - 原生语音录制和 Todo 步骤
 - 文件夹/标签管理、冲突解决、回收站恢复与彻底删除
 - 手机抽屉式导航和 Pad 常驻三栏布局
 - 远端索引互斥锁、删除墓碑、后台同步与开机提醒恢复
+- Notebook Next 游标同步、幂等 outbox、乐观冲突、附件二进制往返，以及网页 TipTap JSON 与 Android Markdown 的转换
+- Notebook Next 服务地址、工作区 ID 和 Token 的加密保存
 
 ## 构建
 
@@ -39,11 +46,13 @@
 
 ## 同步设置
 
-在 macOS 和 Android 中填写相同的 SSH 主机、用户名和远程目录。Android 当前使用密码认证，并强制校验 SSH SHA-256 主机指纹。服务器目录必须允许该用户创建目录、上传临时文件和原子重命名。可在可信电脑上查询指纹并与服务器管理员提供的值核对：
+与 Electron 新版同步时，在 Android 设置中选择“旧版 SSH”（后续界面会改名为“SSH/SFTP”），填写与桌面端“设置 → 同步与连接”相同的主机、端口、用户名、密码和远程目录。Android 使用密码认证，并强制校验 SSH SHA-256 主机指纹。服务器目录必须允许该用户创建目录、上传临时文件和原子重命名。可在可信电脑上查询指纹并与服务器管理员提供的值核对：
 
 ```bash
 ssh-keyscan -p 22 your-server.example | ssh-keygen -lf - -E sha256
 ```
+
+Notebook Next HTTP API 是可选同步方式。使用时填写相同的服务地址、工作区 ID 和访问 Token；正式 Android 构建要求 HTTPS，通过 ADB 验证的 debug 构建才允许 `http://127.0.0.1`。
 
 ## 界面设计
 
@@ -58,7 +67,14 @@ Pad 宽度达到 840dp 后使用“常驻侧栏 + 摘要列表 + 编辑器”三
 ./gradlew connectedDebugAndroidTest
 ```
 
-当前测试覆盖协议日期、索引墓碑合并、OpenSSH 指纹、块文档与富文本往返、Room 持久化/级联删除/并发同步确认，以及设备环境下的新建、编辑和保存主流程。
+当前测试覆盖协议日期、索引墓碑合并、OpenSSH 指纹、块文档与富文本往返、Room 持久化/级联删除/并发同步确认、Notebook Next HTTP 契约，以及设备环境下的新建、编辑和保存主流程。
+
+Notebook Next 真机往返测试要求本机 8787 端口运行隔离服务并执行 `adb reverse tcp:8787 tcp:8787`，随后运行：
+
+```bash
+./gradlew connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=io.github.notebook.android.ApiSyncDeviceTest
+```
 
 真实 SFTP 往返测试可使用隔离服务器运行：
 

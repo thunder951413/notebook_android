@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Local adb-reverse/LAN test servers are allowed only in debug builds. -->
+    <application android:usesCleartextTraffic="true">
+        <activity android:name=".DebugSyncActivity" android:exported="true" />
+    </application>
+</manifest>
