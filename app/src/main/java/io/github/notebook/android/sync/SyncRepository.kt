@@ -235,11 +235,13 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         try {
             mkdirs(ch,resolved.path);mkdirs(ch,"${resolved.path}/notes");mkdirs(ch,"${resolved.path}/attachments")
             withRemoteRepositoryWriteLock(ch,resolved){lock->
+                verifyPrivacyKeyCheck(ch,resolved)
                 pullLibrary(ch,resolved);pullNotes(ch,resolved);pullAssets(ch,resolved);syncReadingPositions(ch,resolved)
                 refreshRemoteRepositoryWriteLock(ch,lock)
                 // Assets and metadata must exist before note JSON and index.json publish references to them.
                 pushLibrary(ch,resolved);pushAssets(ch,resolved)
                 refreshRemoteRepositoryWriteLock(ch,lock)
+                ensurePrivacyKeyCheck(ch,resolved)
                 pushNotes(ch,resolved)
                 Reminders.reconcile(appContext,dao.reminders())
             }
@@ -268,12 +270,12 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
             val local=loadEditable(id)
             if(local!=null && (!local.dirty || deletedAt>=local.updatedAt)) dao.put(local.copy(deletedAt=deletedAt,dirty=false))
         }
-        idx["entries"]?.asJsonArray?.forEach { e ->
-            val id=e.asJsonObject.str("noteID");val remoteVersion=e.asJsonObject["version"].asLong;val local=loadEditable(id)
-            if(local==null||(!local.dirty&&remoteVersion>local.version)) readNoteJson(c,s,id,idx)?.let{env->validateMarkdownEnvelope(env,e.asJsonObject.str("contentHash"));dao.put(decodeEnvelope(env));dao.putAssets(decodedAssets(env));decodedSteps(env).forEach{dao.putStep(it)}}
+        normalizedIndexEntries(idx).forEach { entry ->
+            val e=entry;val id=e.str("noteID");val remoteVersion=e["version"].asLong;val local=loadEditable(id)
+            if(local==null||(!local.dirty&&remoteVersion>local.version)) readNoteJson(c,s,id,idx)?.let{env->validateMarkdownEnvelope(env,e.str("contentHash"));dao.put(decodeEnvelope(env));dao.putAssets(decodedAssets(env));decodedSteps(env).forEach{dao.putStep(it)}}
             else if(local.dirty&&remoteVersion>local.lastSyncedVersion) readNoteJson(c,s,id,idx)?.let{remote->
                 if(remote["schemaVersion"]?.asInt==3){
-                    validateMarkdownEnvelope(remote,e.asJsonObject.str("contentHash"))
+                    validateMarkdownEnvelope(remote,e.str("contentHash"))
                     val remoteHash=remote.str("currentContentHash")
                     val baselineHash=loadSnapshot(id)?.let{snapshot->runCatching{JsonParser.parseString(snapshot).asJsonObject["currentContentHash"]?.asString}.getOrNull()}
                     val storedConflictHash=loadConflictSnapshot(id)?.let{snapshot->runCatching{JsonParser.parseString(snapshot).asJsonObject["currentContentHash"]?.asString}.getOrNull()}
@@ -381,7 +383,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private suspend fun pushNotes(c:ChannelSftp,s:SshSettings){
         val remote=readJson(c,"${s.path}/notes/index.json")
         val compressed=CompressedRepositoryContract.enabled(remote)
-        val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
+        val entries=linkedMapOf<String,JsonObject>();normalizedIndexEntries(remote).forEach{entries[it.str("noteID")]=it.deepCopy()}
         val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{deleted[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
         dao.tombstones().filter{it.itemType=="note"}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Triple<String,Long,String?>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
@@ -460,7 +462,23 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         require(sha(current)==currentHash){"笔记 $id 的当前正文 SHA-256 校验失败"}
         o["history"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val entry=raw.asJsonObject;val hash=entry.str("contentHash");val text=objects[hash]?.takeUnless{it.isJsonNull}?.asString?:error("笔记 $id 的历史版本缺少正文对象");require(sha(text)==hash){"笔记 $id 的历史版本 SHA-256 校验失败"}}
     }
+    private fun normalizedIndexEntries(index:JsonObject?):List<JsonObject>{
+        val entries=linkedMapOf<String,JsonObject>()
+        index?.get("entries")?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val candidate=raw.asJsonObject;val id=candidate.str("noteID");if(id.isBlank())return@forEach;val current=entries[id];val version=candidate["version"]?.asLong?:0;val currentVersion=current?.get("version")?.asLong?:0;if(current==null||version>currentVersion||(version==currentVersion&&candidate.toString()>current.toString()))entries[id]=candidate}
+        return entries.values.sortedBy{it.str("noteID")}
+    }
     private fun privacyKey(secret:String,salt:ByteArray,iterations:Int)=SecretKeySpec(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(PBEKeySpec(secret.toCharArray(),salt,iterations,256)).encoded,"AES")
+    private val privacyCheckText="notebook-next-private-notes-v1"
+    private fun verifyPrivacyKeyCheck(c:ChannelSftp,s:SshSettings){
+        val check=readJson(c,"${s.path}/notes/privacy.json")?:return
+        try{val iterations=check["iterations"].asInt;require(check["schemaVersion"].asInt==1&&check.str("algorithm")=="AES-256-GCM"&&check.str("kdf")=="PBKDF2-SHA256"&&iterations==310_000);val salt=Base64.decode(check.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(check.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));require(String(cipher.doFinal(Base64.decode(check.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)==privacyCheckText)}catch(error:Throwable){throw IllegalStateException("隐私笔记密钥验证失败：SSH 密码与远端仓库不一致，已停止同步且未修改任何笔记",error)}
+    }
+    private fun ensurePrivacyKeyCheck(c:ChannelSftp,s:SshSettings){
+        if(encryptedNoteIds().isEmpty()||readJson(c,"${s.path}/notes/privacy.json")!=null)return
+        val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=310_000;val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(privacyCheckText.toByteArray(StandardCharsets.UTF_8))
+        val check=JsonObject().apply{addProperty("schemaVersion",1);addProperty("algorithm","AES-256-GCM");addProperty("kdf","PBKDF2-SHA256");addProperty("iterations",iterations);addProperty("salt",Base64.encodeToString(salt,Base64.NO_WRAP));addProperty("iv",Base64.encodeToString(iv,Base64.NO_WRAP));addProperty("ciphertext",Base64.encodeToString(encrypted,Base64.NO_WRAP))}
+        atomicWrite(c,"${s.path}/notes/privacy.json",gson.toJson(check))
+    }
     private fun encryptPrivacyEnvelope(note:JsonObject,secret:String):JsonObject{
         val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=310_000
         val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(note.str("noteID").toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(gson.toJson(note).toByteArray(StandardCharsets.UTF_8))
