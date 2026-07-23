@@ -32,6 +32,13 @@ import java.util.UUID
 import java.io.InputStream
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
+import android.util.Base64
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
 
 data class SshSettings(val host:String,val port:Int,val username:String,val password:String,val path:String,val fingerprint:String="")
 enum class SyncBackend { API, SSH }
@@ -263,9 +270,10 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         }
         idx["entries"]?.asJsonArray?.forEach { e ->
             val id=e.asJsonObject.str("noteID");val remoteVersion=e.asJsonObject["version"].asLong;val local=loadEditable(id)
-            if(local==null||(!local.dirty&&remoteVersion>local.version)) readNoteJson(c,s,id,idx)?.let{env->dao.put(decodeEnvelope(env));dao.putAssets(decodedAssets(env));decodedSteps(env).forEach{dao.putStep(it)}}
+            if(local==null||(!local.dirty&&remoteVersion>local.version)) readNoteJson(c,s,id,idx)?.let{env->validateMarkdownEnvelope(env,e.asJsonObject.str("contentHash"));dao.put(decodeEnvelope(env));dao.putAssets(decodedAssets(env));decodedSteps(env).forEach{dao.putStep(it)}}
             else if(local.dirty&&remoteVersion>local.lastSyncedVersion) readNoteJson(c,s,id,idx)?.let{remote->
                 if(remote["schemaVersion"]?.asInt==3){
+                    validateMarkdownEnvelope(remote,e.asJsonObject.str("contentHash"))
                     val remoteHash=remote.str("currentContentHash")
                     val baselineHash=loadSnapshot(id)?.let{snapshot->runCatching{JsonParser.parseString(snapshot).asJsonObject["currentContentHash"]?.asString}.getOrNull()}
                     val storedConflictHash=loadConflictSnapshot(id)?.let{snapshot->runCatching{JsonParser.parseString(snapshot).asJsonObject["currentContentHash"]?.asString}.getOrNull()}
@@ -378,7 +386,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
         dao.tombstones().filter{it.itemType=="note"}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Triple<String,Long,String?>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=Triple(n.id,n.version,null)}
-            else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);val text=gson.toJson(env);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)text else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
+            else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);val stored=if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())encryptPrivacyEnvelope(env,s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
         }
         val idx=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)});add("deletedEntries",JsonArray().apply{deleted.values.forEach(::add)});remote?.get("repositoryFormat")?.takeIf{it.isJsonObject}?.let{add("repositoryFormat",it.deepCopy())}}
         atomicWrite(c,"${s.path}/notes/index.json",gson.toJson(idx))
@@ -423,7 +431,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     }
     private fun decodeEnvelope(o:JsonObject)=if(o["schemaVersion"]?.asInt==3)fromMarkdownEnvelope(o)else fromEnvelope(o)
     private fun fromMarkdownEnvelope(o:JsonObject):NoteEntity{
-        val m=o["metadata"].asJsonObject;val hash=o.str("currentContentHash");val body=o["contentObjects"].asJsonObject[hash]?.asString.orEmpty();val version=maxOf(m["legacyVersion"]?.asLong?:0,m.isoMs("updatedAt"))
+        validateMarkdownEnvelope(o);val m=o["metadata"].asJsonObject;val hash=o.str("currentContentHash");val body=o["contentObjects"].asJsonObject[hash].asString;val version=maxOf(m["legacyVersion"]?.asLong?:0,m.isoMs("updatedAt"))
         return NoteEntity(id=o.str("noteID"),title=m.str("title"),body=body,previewText=m.str("preview",previewText(body)),createdAt=m.isoMs("createdAt"),updatedAt=m.isoMs("updatedAt"),folderId=m.optStr("sectionId"),folderName="",reminderAt=m.optIsoMs("reminderAt"),recurrence=m.str("recurrenceRule","none"),version=version,tagIds=o["tagIDs"]?.asJsonArray?.joinToString(","){it.asString}.orEmpty(),deletedAt=m.optIsoMs("deletedAt"),itemType=if(m.str("kind")=="task")"todo" else "note",dueAt=m.optIsoMs("dueAt"),completedAt=m.optIsoMs("completedAt"),important=m["important"]?.asBoolean?:m["favorite"]?.asBoolean?:false,viewMode="preview",dirty=false,snapshotJson=gson.toJson(o),lastSyncedVersion=version)
     }
     private fun decodedAssets(o:JsonObject):List<AssetEntity>{if(o["schemaVersion"]?.asInt!=3)return assetsFromEnvelope(o);val noteId=o.str("noteID");return o["assets"]?.asJsonArray?.map{raw->val a=raw.asJsonObject;val relative=safeRelative(a.str("localPath"));AssetEntity(a.str("id"),noteId,a.str("kind"),a.str("filename"),a.str("mimeType"),relative,contentHash=a.str("objectHash",a.str("checksum")),size=a["byteSize"]?.asLong?:0)}.orEmpty()}
@@ -432,7 +440,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private fun assetsFromEnvelope(o:JsonObject):List<AssetEntity>{val noteId=o.str("noteID");return o["currentSnapshot"].asJsonObject["assets"]?.asJsonArray?.mapNotNull{raw->val a=raw.asJsonObject;val ref=a["reference"]?.asJsonObject?:return@mapNotNull null;val relative=runCatching{safeRelative(a.str("relativeFilePath"))}.getOrNull()?:return@mapNotNull null;AssetEntity(ref.str("id"),noteId,ref.str("kind"),ref.str("filename"),ref.str("mimeType"),relative)}.orEmpty()}
     private fun stepsFromEnvelope(o:JsonObject):List<TodoStepEntity>{val s=o["currentSnapshot"].asJsonObject;return s["todoSteps"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{raw->val x=raw.asJsonObject;TodoStepEntity(x.str("id"),x.str("noteID"),x.str("text"),x["checked"]?.asBoolean?:false,x.int("order"),x.dateMs("createdAt"))}.orEmpty()}
     private fun readJson(c:ChannelSftp,p:String)=try{val out=ByteArrayOutputStream();c.get(p,out);JsonParser.parseString(out.toString("UTF-8")).asJsonObject}catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
-    private fun readNoteJson(c:ChannelSftp,s:SshSettings,noteID:String,index:JsonObject?)=try{val out=ByteArrayOutputStream();c.get(CompressedRepositoryContract.notePath(s.path,noteID,index),out);val text=if(CompressedRepositoryContract.enabled(index))CompressedRepositoryContract.decode(out.toByteArray())else out.toString("UTF-8");JsonParser.parseString(text).asJsonObject}catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
+    private fun readNoteJson(c:ChannelSftp,s:SshSettings,noteID:String,index:JsonObject?)=try{val out=ByteArrayOutputStream();c.get(CompressedRepositoryContract.notePath(s.path,noteID,index),out);val text=if(CompressedRepositoryContract.enabled(index))CompressedRepositoryContract.decode(out.toByteArray())else out.toString("UTF-8");decryptPrivacyEnvelope(JsonParser.parseString(text).asJsonObject,s.password)}catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
     private fun atomicWrite(c:ChannelSftp,p:String,text:String)=atomicWrite(c,p,text.toByteArray(StandardCharsets.UTF_8))
     private fun atomicWrite(c:ChannelSftp,p:String,bytes:ByteArray){val tmp="$p.tmp.android.${UUID.randomUUID()}";try{c.put(ByteArrayInputStream(bytes),tmp);val remote=ByteArrayOutputStream();c.get(tmp,remote);require(sha(remote.toByteArray())==sha(bytes)){"远端临时文件校验失败：$p"};c.rename(tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
     private fun atomicUpload(c:ChannelSftp,p:String,file:java.io.File,expectedHash:String){val tmp="$p.tmp.android.${UUID.randomUUID()}";try{file.inputStream().use{c.put(it,tmp)};val remoteHash=c.get(tmp).use(::sha);require(remoteHash==expectedHash){"远端附件临时文件校验失败"};c.rename(tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
@@ -443,6 +451,26 @@ class SyncRepository(context:Context, private val dao:NotebookDao) {
     private fun sha(s:String)=MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString(""){"%02x".format(it)}
     private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}
     private fun sha(input:InputStream):String{val digest=MessageDigest.getInstance("SHA-256");val buffer=ByteArray(1024*1024);while(true){val count=input.read(buffer);if(count<0)break;if(count>0)digest.update(buffer,0,count)};return digest.digest().joinToString(""){"%02x".format(it)}}
+    private fun validateMarkdownEnvelope(o:JsonObject,expectedHash:String=""){
+        if(o["schemaVersion"]?.asInt!=3)return
+        val id=o.str("noteID");val currentHash=o.str("currentContentHash")
+        require(expectedHash.isBlank()||expectedHash==currentHash){"笔记 $id 与索引中的内容哈希不一致"}
+        val objects=o["contentObjects"]?.takeIf{it.isJsonObject}?.asJsonObject?:error("笔记 $id 缺少正文对象表")
+        val current=objects[currentHash]?.takeUnless{it.isJsonNull}?.asString?:error("笔记 $id 缺少当前正文对象")
+        require(sha(current)==currentHash){"笔记 $id 的当前正文 SHA-256 校验失败"}
+        o["history"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val entry=raw.asJsonObject;val hash=entry.str("contentHash");val text=objects[hash]?.takeUnless{it.isJsonNull}?.asString?:error("笔记 $id 的历史版本缺少正文对象");require(sha(text)==hash){"笔记 $id 的历史版本 SHA-256 校验失败"}}
+    }
+    private fun privacyKey(secret:String,salt:ByteArray,iterations:Int)=SecretKeySpec(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(PBEKeySpec(secret.toCharArray(),salt,iterations,256)).encoded,"AES")
+    private fun encryptPrivacyEnvelope(note:JsonObject,secret:String):JsonObject{
+        val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=310_000
+        val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(note.str("noteID").toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(gson.toJson(note).toByteArray(StandardCharsets.UTF_8))
+        val redacted=note["metadata"].asJsonObject.deepCopy().apply{addProperty("title","隐私笔记");addProperty("preview","");addProperty("locked",true);remove("legacyMetadata")}
+        return JsonObject().apply{addProperty("schemaVersion",3);addProperty("noteID",note.str("noteID"));add("metadata",redacted);addProperty("currentContentHash",note.str("currentContentHash"));add("contentObjects",JsonObject());add("history",JsonArray());add("assets",JsonArray());add("taskSteps",JsonArray());add("tagIDs",JsonArray());add("linkedPageIDs",JsonArray());add("privacyEncryption",JsonObject().apply{addProperty("version",1);addProperty("algorithm","AES-256-GCM");addProperty("kdf","PBKDF2-SHA256");addProperty("iterations",iterations);addProperty("salt",Base64.encodeToString(salt,Base64.NO_WRAP));addProperty("iv",Base64.encodeToString(iv,Base64.NO_WRAP));addProperty("ciphertext",Base64.encodeToString(encrypted,Base64.NO_WRAP))})}
+    }
+    private fun decryptPrivacyEnvelope(stored:JsonObject,secret:String):JsonObject{
+        val encryption=stored["privacyEncryption"]?.takeIf{it.isJsonObject}?.asJsonObject?:return stored
+        try{val iterations=encryption["iterations"].asInt;require(encryption.str("algorithm")=="AES-256-GCM"&&encryption.str("kdf")=="PBKDF2-SHA256"&&iterations==310_000);val salt=Base64.decode(encryption.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(encryption.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(stored.str("noteID").toByteArray(StandardCharsets.UTF_8));val decoded=JsonParser.parseString(String(cipher.doFinal(Base64.decode(encryption.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)).asJsonObject;require(decoded.str("noteID")==stored.str("noteID"));return decoded}catch(error:Throwable){throw IllegalStateException("隐私笔记 ${stored.str("noteID")} 解密失败：SSH 密码不一致或远端数据已损坏",error)}
+    }
     private fun safeRelative(path:String):String{val normalized=path.replace('\\','/');require(normalized.isNotBlank()&&!normalized.startsWith('/')&&!normalized.startsWith('~')&&normalized.none{it.isISOControl()}&&!normalized.split('/').any{it==".."||it=="."||it.isBlank()}){"非法附件路径"};return normalized}
     private fun decodeText(bytes:ByteArray):String{
         val candidates=when{bytes.size>=2&&bytes[0]==0xFF.toByte()&&bytes[1]==0xFE.toByte()->listOf(StandardCharsets.UTF_16LE);bytes.size>=2&&bytes[0]==0xFE.toByte()&&bytes[1]==0xFF.toByte()->listOf(StandardCharsets.UTF_16BE);else->listOf(StandardCharsets.UTF_8,StandardCharsets.UTF_16LE,StandardCharsets.UTF_16BE,StandardCharsets.ISO_8859_1)}
