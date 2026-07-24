@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.github.notebook.android.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -26,9 +27,9 @@ class AppUpdateViewModel(application:Application):AndroidViewModel(application){
     private var checkJob:Job?=null
     private var lastCheckStartedAt:Long?=null
 
-    init{checkForUpdate(force=true)}
+    init{if(BuildConfig.DEBUG)phase=UpdatePhase.Failed else checkForUpdate(force=true)}
 
-    fun checkForUpdate(force:Boolean=false){val now=SystemClock.elapsedRealtime();if(checkJob?.isActive==true||!updateCheckDue(lastCheckStartedAt,now,force))return;lastCheckStartedAt=now
+    fun checkForUpdate(force:Boolean=false){if(BuildConfig.DEBUG)return;val now=SystemClock.elapsedRealtime();if(checkJob?.isActive==true||!updateCheckDue(lastCheckStartedAt,now,force))return;lastCheckStartedAt=now
         checkJob=viewModelScope.launch{runCatching{AppUpdater.latestRelease()}.onSuccess{available->
             val previousVersion=release?.version;release=available
             if(available!=null){downloaded=AppUpdater.cachedDownload(getApplication(),available);phase=if(downloaded!=null)UpdatePhase.Ready else UpdatePhase.Available;message=if(downloaded!=null)"安装包已下载并校验，可以继续安装" else null;if(previousVersion!=available.version)showDialog=true}

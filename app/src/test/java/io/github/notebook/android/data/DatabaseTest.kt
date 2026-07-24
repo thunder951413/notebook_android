@@ -13,6 +13,9 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import android.app.Application
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
+import io.github.notebook.android.sync.SyncRepository
 
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest=Config.NONE,application=Application::class)
@@ -39,10 +42,12 @@ class DatabaseTest {
 
     @Test fun `editable partial update preserves sync snapshots`()=runBlocking {
         dao.put(NoteEntity("n",title="旧标题",body="旧正文",snapshotJson="local-snapshot",conflictSnapshotJson="remote-snapshot"))
-        dao.updateEditable(NoteEditableUpdate("n","新标题","新正文","新摘要",1,2,null,"未分类",null,"none",2,"",null,"note",null,null,false,"preview",true,false,0))
+        dao.updateEditable(NoteEditableUpdate(id="n",title="新标题",body="新正文",previewText="新摘要",createdAt=1,updatedAt=2,folderId=null,folderName="未分类",icon="📝",parentPageId="parent",sortOrder=2000.0,treeUpdatedAt=2,reminderAt=null,recurrence="none",version=2,tagIds="",deletedAt=null,itemType="note",dueAt=null,completedAt=null,important=false,viewMode="preview",dirty=true,conflict=false,lastSyncedVersion=0))
         val stored=dao.get("n")!!
         assertEquals("新正文",stored.body)
         assertEquals("preview",stored.viewMode)
+        assertEquals("📝",stored.icon)
+        assertEquals("parent",stored.parentPageId)
         assertEquals("local-snapshot",stored.snapshotJson)
         assertEquals("remote-snapshot",stored.conflictSnapshotJson)
     }
@@ -70,9 +75,48 @@ class DatabaseTest {
     }
 
     @Test fun `note deletion cascades steps and assets`()=runBlocking {
-        dao.put(NoteEntity("n"));dao.putStep(TodoStepEntity("s","n","步骤"));dao.putAssets(listOf(AssetEntity("a","n","file","a.txt","text/plain","n/a.txt")));dao.putReadingPosition(ReadingPositionEntity("n",42,.1,99,"phone"))
+        dao.put(NoteEntity("n"));dao.putStep(TodoStepEntity("s","n","步骤"));dao.putAssets(listOf(AssetEntity("a","n","file","a.txt","text/plain","n/a.txt")));dao.putReadingPosition(ReadingPositionEntity("n",42,.1,99,"phone"));dao.putPageLinks(listOf(PageLinkEntity("l","n","target","page",null,null,false,0,1)))
         dao.deleteNotePermanently("n")
-        assertTrue(dao.steps("n").isEmpty());assertTrue(dao.assets("n").isEmpty());assertNull(dao.readingPosition("n"))
+        assertTrue(dao.steps("n").isEmpty());assertTrue(dao.assets("n").isEmpty());assertNull(dao.readingPosition("n"));assertTrue(dao.pageLinks("n").isEmpty())
+    }
+
+    @Test fun `reference index replacement is atomic and backlinks remain queryable`()=runBlocking {
+        dao.put(NoteEntity("source",title="来源"))
+        dao.replacePageLinks("source",listOf(PageLinkEntity("first","source","target","block","b-one",null,true,12,10)))
+        assertEquals("b-one",dao.pageLinks("source").single().targetId)
+        assertEquals("source",dao.observeBacklinks("target").first().single().sourceNoteId)
+        dao.replacePageLinks("source",listOf(PageLinkEntity("second","source","target","page",null,"别名",false,4,20)))
+        assertEquals(listOf("second"),dao.pageLinks("source").map{it.id})
+    }
+
+    @Test fun `v3 history can be previewed and restored as a new current revision`()=runBlocking {
+        val old="# 旧版本\n\n历史正文"
+        val envelope=JsonObject().apply{
+            addProperty("schemaVersion",3)
+            add("contentObjects",JsonObject().apply{addProperty("old-hash",old)})
+            add("history",JsonArray().apply{add(JsonObject().apply{addProperty("id","revision-1");addProperty("createdAt","2026-07-20T00:00:00Z");addProperty("reason","autosave");addProperty("contentHash","old-hash")})})
+        }
+        dao.put(NoteEntity("history",title="历史",body="当前正文",snapshotJson=envelope.toString(),dirty=false))
+        val context=ApplicationProvider.getApplicationContext<Context>()
+        val repository=SyncRepository(context,dao,context.getSharedPreferences("history-test",Context.MODE_PRIVATE))
+        val revision=repository.revisions("history").single()
+        assertEquals(old,revision.markdown)
+        val restored=repository.restoreRevision("history","revision-1")
+        assertEquals(old,restored.body)
+        assertTrue(restored.dirty)
+    }
+
+    @Test fun `page move adopts target folder and rejects descendant cycles`()=runBlocking {
+        dao.put(NoteEntity("parent",title="父",folderId="folder-b",folderName="分区 B",sortOrder=1.0))
+        dao.put(NoteEntity("page",title="页面",folderId="folder-a",folderName="分区 A",sortOrder=1.0))
+        dao.put(NoteEntity("child",title="子页",parentPageId="page",folderId="folder-a",folderName="分区 A",sortOrder=1.0))
+        val context=ApplicationProvider.getApplicationContext<Context>()
+        val repository=SyncRepository(context,dao,context.getSharedPreferences("move-test",Context.MODE_PRIVATE))
+        val moved=repository.movePage("page","parent")
+        assertEquals("parent",moved.parentPageId)
+        assertEquals("folder-b",moved.folderId)
+        val error=runCatching{repository.movePage("page","child")}.exceptionOrNull()
+        assertNotNull(error)
     }
 
     @Test fun `updating note never deletes its steps or assets`()=runBlocking {
@@ -106,5 +150,12 @@ class DatabaseTest {
         dao.putReadingPosition(ReadingPositionEntity("n",321,.25,1234,"android"))
         val note=dao.get("n")!!;val position=dao.readingPosition("n")!!
         assertEquals(7,note.version);assertFalse(note.dirty);assertEquals(321,position.anchorUtf16Offset);assertEquals(.25,position.viewportOffsetFraction,0.0)
+    }
+
+    @Test fun `reading position is ignored after its note was deleted`()=runBlocking {
+        dao.put(NoteEntity("gone"))
+        dao.deleteNotePermanently("gone")
+        assertFalse(dao.putReadingPositionIfNoteExists(ReadingPositionEntity("gone",12,.2,99,"android")))
+        assertNull(dao.readingPosition("gone"))
     }
 }

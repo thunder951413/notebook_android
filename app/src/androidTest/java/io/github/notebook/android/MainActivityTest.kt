@@ -5,10 +5,14 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import org.junit.Rule
 import org.junit.Test
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import kotlinx.coroutines.runBlocking
 import androidx.lifecycle.Lifecycle
 import io.github.notebook.android.data.FolderEntity
 import io.github.notebook.android.data.NoteEntity
+import io.github.notebook.android.data.PageLinkEntity
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 
 class MainActivityTest {
     @get:Rule val rule=createAndroidComposeRule<MainActivity>()
@@ -24,9 +28,10 @@ class MainActivityTest {
 
     @Test fun backNavigationFlushesUnsavedTyping(){
         val title="返回自动保存-${System.nanoTime()}"
+        val app=rule.activity.application as NotebookApp
         rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("title-field").performTextInput(title);rule.onNodeWithTag("body-field").performTextInput("没有点击完成")
         rule.activity.runOnUiThread{rule.activity.onBackPressedDispatcher.onBackPressed()}
-        rule.waitUntil(5_000){rule.onAllNodesWithText(title).fetchSemanticsNodes().isNotEmpty()}
+        rule.waitUntil(8_000){runBlocking{app.database.dao().allNotes().any{it.title==title&&it.body=="没有点击完成"}}}
     }
 
     @Test fun debounceSaveSurvivesActivityRecreation(){
@@ -121,6 +126,39 @@ class MainActivityTest {
         rule.onAllNodesWithText("不能公开显示").assertCountEquals(0)
         if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isNotEmpty())rule.onNodeWithContentDescription("导航").performClick()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("加密文件夹"));rule.onNodeWithText("加密文件夹").assertIsDisplayed();rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("点击解锁"));rule.onNodeWithText("点击解锁").assertIsDisplayed();rule.onAllNodesWithText("私人资料").assertCountEquals(0)
+    }
+
+    @Test fun referencePickerInsertsCanonicalPageLink(){
+        val suffix=System.nanoTime().toString();val targetId="reference-target-$suffix";val sourceId="reference-source-$suffix";val targetTitle="双链目标-$suffix";val sourceTitle="双链来源-$suffix"
+        val app=rule.activity.application as NotebookApp
+        runBlocking{app.database.dao().put(NoteEntity(targetId,title=targetTitle,body="目标正文"));app.database.dao().put(NoteEntity(sourceId,title=sourceTitle,body="",viewMode="text"))}
+        rule.activityRule.scenario.recreate();rule.onNodeWithText(sourceTitle).performClick()
+        rule.onNodeWithContentDescription("插入双链").performClick()
+        rule.onNodeWithText(targetTitle).assertIsDisplayed().performClick()
+        rule.onNodeWithTag("body-field").assertTextContains("[[page:$targetId]]")
+    }
+
+    @Test fun backlinksPanelShowsSourcePage(){
+        val suffix=System.nanoTime().toString();val targetId="backlink-target-$suffix";val sourceId="backlink-source-$suffix";val targetTitle="被引用-$suffix";val sourceTitle="引用来源-$suffix"
+        val app=rule.activity.application as NotebookApp
+        runBlocking{app.database.dao().put(NoteEntity(targetId,title=targetTitle));app.database.dao().put(NoteEntity(sourceId,title=sourceTitle,body="[[page:$targetId]]"));app.database.dao().replacePageLinks(sourceId,listOf(PageLinkEntity("link-$suffix",sourceId,targetId,"page",null,null,false,0,System.currentTimeMillis())))}
+        rule.activityRule.scenario.recreate();rule.onNodeWithText(targetTitle).performClick()
+        rule.onNodeWithContentDescription("反向链接").performClick()
+        rule.onNodeWithText(sourceTitle).assertIsDisplayed()
+    }
+
+    @Test fun historyPanelPreviewsRemoteV3Revision(){
+        val suffix=System.nanoTime().toString();val id="history-ui-$suffix";val title="历史界面-$suffix";val old="历史版本正文-$suffix"
+        val envelope=JsonObject().apply{addProperty("schemaVersion",3);add("contentObjects",JsonObject().apply{addProperty("hash-old",old)});add("history",JsonArray().apply{add(JsonObject().apply{addProperty("id","revision-$suffix");addProperty("createdAt","2026-07-20T00:00:00Z");addProperty("reason","autosave");addProperty("contentHash","hash-old")})})}
+        val app=rule.activity.application as NotebookApp
+        runBlocking{app.database.dao().put(NoteEntity(id,title=title,body="当前版本",snapshotJson=envelope.toString(),dirty=false))}
+        assertEquals(1,runBlocking{app.repository.revisions(id).size})
+        rule.activityRule.scenario.recreate();rule.onNodeWithText(title).performClick()
+        rule.onNodeWithContentDescription("版本历史").performClick()
+        rule.waitUntil(5_000){rule.onAllNodesWithTag("history-revision-revision-$suffix",useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()}
+        rule.onNodeWithTag("history-revision-revision-$suffix",useUnmergedTree=true).performClick()
+        rule.onNodeWithTag("history-preview",useUnmergedTree=true).assertIsDisplayed()
+        rule.onNodeWithText("恢复此版本").assertIsDisplayed()
     }
 
 }
