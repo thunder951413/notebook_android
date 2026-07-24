@@ -29,7 +29,11 @@ data class ApiSyncSettings(
 )
 
 /** Versioned HTTP synchronizer shared with Notebook Next web/desktop. */
-class ApiSyncClient(private val context:Context,private val dao:NotebookDao) {
+class ApiSyncClient(
+    private val context:Context,
+    private val dao:NotebookDao,
+    private val allowInsecureHttp:Boolean=BuildConfig.DEBUG
+) {
     private val gson:Gson=GsonBuilder().disableHtmlEscaping().create()
     private val http=OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(60,TimeUnit.SECONDS).writeTimeout(60,TimeUnit.SECONDS).build()
 
@@ -48,7 +52,7 @@ class ApiSyncClient(private val context:Context,private val dao:NotebookDao) {
         require(s.baseUrl.isNotBlank()){"请填写 Notebook Next 服务地址"}
         require(s.workspaceId.isNotBlank()){"工作区 ID 不能为空"}
         val uri=runCatching{URI(s.baseUrl)}.getOrElse{throw IllegalArgumentException("服务地址格式不正确")}
-        require(uri.scheme=="https"||(BuildConfig.DEBUG&&uri.scheme=="http")){"正式版同步服务必须使用 HTTPS"}
+        require(uri.scheme=="https"||(allowInsecureHttp&&uri.scheme=="http")){"正式版同步服务必须使用 HTTPS"}
         require(!uri.host.isNullOrBlank()){"服务地址缺少主机名"}
     }
 

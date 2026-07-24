@@ -36,12 +36,12 @@ class ApiSyncTest {
           {"cursor":4,"entity_type":"document","entity_id":"page","version":1,"operation":"upsert","payload":{"pageId":"page","schemaVersion":1,"tiptapJson":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"来自网页的正文"}]}]},"updatedAt":"2026-01-01T00:00:00Z"}}
         ]}"""))
         server.enqueue(json("""{"cursor":4,"has_more":false,"changes":[]}"""))
-        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao()).sync(settings())
+        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())
         val note=database.dao().get("page")
         assertEquals("迁移完成",note?.title);assertEquals("来自网页的正文",note?.body);assertFalse(note!!.dirty)
         assertEquals("book",database.dao().getFolder("section")?.notebookId)
         assertEquals(4L,database.dao().apiCursor(workspace))
-        val client=ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao())
+        val client=ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true)
         client.queueNote(workspace,note.copy(title="仅修改标题",dirty=true))
         val pagePayload=JsonParser.parseString(database.dao().apiOutbox(workspace).first{it.entityType=="page"}.payloadJson).asJsonObject
         assertTrue(pagePayload["favorite"].asBoolean);assertTrue(pagePayload["locked"].asBoolean);assertEquals("kept",pagePayload["legacyMetadata"].asJsonObject["future"].asString)
@@ -59,7 +59,7 @@ class ApiSyncTest {
             val root=JsonParser.parseString(request.body.clone().readUtf8()).asJsonObject;pushedTypes=root["changes"].asJsonArray.map{it.asJsonObject["entity_type"].asString}.toSet();val applied=root["changes"].asJsonArray.map{raw->val c=raw.asJsonObject;"""{"operation_id":"${c["operation_id"].asString}","entity_type":"${c["entity_type"].asString}","entity_id":"${c["entity_id"].asString}","version":1,"cursor":1}"""}
             return json("""{"applied":[${applied.joinToString(",")}],"conflicts":[]}""")
         }}
-        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao()).sync(settings())
+        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())
         assertEquals(setOf("page","document"),pushedTypes)
         assertTrue(database.dao().apiOutbox(workspace).isEmpty())
     }
@@ -71,7 +71,7 @@ class ApiSyncTest {
           {"cursor":2,"entity_type":"document","entity_id":"same","version":4,"operation":"upsert","payload":{"pageId":"same","schemaVersion":1,"tiptapJson":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"网页正文"}]}]},"updatedAt":"2026-01-01T00:00:00Z"}}
         ]}"""))
         server.enqueue(json("""{"cursor":2,"has_more":false,"changes":[]}"""))
-        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao()).sync(settings())
+        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())
         val note=database.dao().get("same")!!
         assertEquals("手机标题",note.title);assertEquals("手机未同步正文",note.body);assertTrue(note.dirty);assertTrue(note.conflict)
         val conflicts=JsonParser.parseString(note.conflictSnapshotJson).asJsonObject["apiConflicts"].asJsonObject
