@@ -7,5 +7,5 @@ import io.github.notebook.android.sync.SyncWorker
 class NotebookApp:Application(){
     val database by lazy { NotebookDatabase.create(this) }
     val repository by lazy { SyncRepository(this,database.dao()) }
-    override fun onCreate(){super.onCreate();runCatching{repository.recoverDraftsAsync();repository.rebuildReferenceIndexAsync();SyncWorker.schedule(this)}}
+    override fun onCreate(){super.onCreate();runCatching{repository.recoverDraftsAsync();SyncWorker.schedule(this)}}
 }

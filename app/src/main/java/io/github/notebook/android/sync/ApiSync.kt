@@ -65,9 +65,6 @@ class ApiSyncClient(private val context:Context,private val dao:NotebookDao) {
         page.apply{
             addProperty("id",note.id);addProperty("workspaceId",workspaceId)
             if(note.folderId!=null)addProperty("sectionId",note.folderId)else remove("sectionId")
-            if(note.icon!=null)addProperty("icon",note.icon)else remove("icon")
-            if(note.parentPageId!=null)addProperty("parentPageId",note.parentPageId)else remove("parentPageId")
-            addProperty("sortOrder",note.sortOrder);addProperty("treeUpdatedAt",iso(note.treeUpdatedAt))
             addProperty("kind",if(note.itemType=="todo")"task" else string("kind","document"))
             addProperty("title",note.title);addProperty("preview",note.previewText)
             if(!has("favorite"))addProperty("favorite",false);addProperty("createdAt",iso(note.createdAt));addProperty("updatedAt",iso(note.updatedAt))
@@ -172,7 +169,7 @@ class ApiSyncClient(private val context:Context,private val dao:NotebookDao) {
 
     private suspend fun applyPage(id:String,p:JsonObject,serverVersion:Long) {
         val local=dao.get(id);val folderId=p.optionalString("sectionId");val folderName=folderId?.let{dao.getFolder(it)?.name}?:"未分类"
-        val note=NoteEntity(id=id,title=p.string("title"),body=local?.body.orEmpty(),previewText=p.string("preview"),createdAt=p.millis("createdAt"),updatedAt=p.millis("updatedAt"),folderId=folderId,folderName=folderName,icon=p.optionalString("icon"),parentPageId=p.optionalString("parentPageId"),sortOrder=p["sortOrder"]?.asDouble?:local?.sortOrder?:0.0,treeUpdatedAt=p.optionalMillis("treeUpdatedAt")?:local?.treeUpdatedAt?:p.millis("createdAt"),reminderAt=p.optionalMillis("reminderAt"),recurrence=p.string("recurrenceRule","none"),version=p["legacyVersion"]?.asLong?:local?.version?:1,tagIds=local?.tagIds.orEmpty(),deletedAt=p.optionalMillis("deletedAt"),itemType=if(p.string("kind","document")=="task")"todo" else "note",dueAt=p.optionalMillis("dueAt"),completedAt=p.optionalMillis("completedAt"),important=p.boolean("important"),viewMode=local?.viewMode?:"preview",dirty=false,conflict=false,snapshotJson=local?.snapshotJson,conflictSnapshotJson=null,lastSyncedVersion=serverVersion)
+        val note=NoteEntity(id=id,title=p.string("title"),body=local?.body.orEmpty(),previewText=p.string("preview"),createdAt=p.millis("createdAt"),updatedAt=p.millis("updatedAt"),folderId=folderId,folderName=folderName,reminderAt=p.optionalMillis("reminderAt"),recurrence=p.string("recurrenceRule","none"),version=p["legacyVersion"]?.asLong?:local?.version?:1,tagIds=local?.tagIds.orEmpty(),deletedAt=p.optionalMillis("deletedAt"),itemType=if(p.string("kind","document")=="task")"todo" else "note",dueAt=p.optionalMillis("dueAt"),completedAt=p.optionalMillis("completedAt"),important=p.boolean("important"),viewMode=local?.viewMode?:"preview",dirty=false,conflict=false,snapshotJson=local?.snapshotJson,conflictSnapshotJson=null,lastSyncedVersion=serverVersion)
         dao.put(note);dao.putApiPage(ApiPageEntity(id,gson.toJson(p),note.updatedAt))
     }
 

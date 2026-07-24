@@ -5,13 +5,11 @@ import androidx.test.platform.app.InstrumentationRegistry
 import io.github.notebook.android.sync.ApiSyncSettings
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
-import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class ApiSyncDeviceTest {
-    @Ignore("Notebook Next cross-device sync is SSH/SFTP-only; retained as an opt-in API bridge fixture")
     @Test fun migratedWebBundlePullsWithBodyAndAssetThenAndroidEditPushesBack()=runBlocking {
         val app=InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as NotebookApp
         val repo=app.repository

@@ -14,12 +14,6 @@ data class NoteEntity(
     val updatedAt: Long = System.currentTimeMillis(),
     val folderId: String? = null,
     val folderName: String = "未分类",
-    /** Optional user-selected page emoji. Null uses the document/folder fallback. */
-    val icon: String? = null,
-    /** Ordered document-tree position shared with Electron. Null means a root page. */
-    val parentPageId: String? = null,
-    val sortOrder: Double = 0.0,
-    val treeUpdatedAt: Long = createdAt,
     val reminderAt: Long? = null,
     val recurrence: String = "none",
     val version: Long = 1,
@@ -49,10 +43,6 @@ data class NoteSummary(
     val updatedAt:Long,
     val folderId:String?,
     val folderName:String,
-    val icon:String?,
-    val parentPageId:String?,
-    val sortOrder:Double,
-    val treeUpdatedAt:Long,
     val reminderAt:Long?,
     val recurrence:String,
     val version:Long,
@@ -77,10 +67,6 @@ data class NoteEditableUpdate(
     val updatedAt:Long,
     val folderId:String?,
     val folderName:String,
-    val icon:String?,
-    val parentPageId:String?,
-    val sortOrder:Double,
-    val treeUpdatedAt:Long,
     val reminderAt:Long?,
     val recurrence:String,
     val version:Long,
@@ -101,7 +87,7 @@ data class NoteEditableUpdate(
 @Entity(tableName="todo_steps",foreignKeys=[ForeignKey(entity=NoteEntity::class,parentColumns=["id"],childColumns=["noteId"],onDelete=ForeignKey.CASCADE)],indices=[Index("noteId")])
 data class TodoStepEntity(@PrimaryKey val id:String,val noteId:String,val text:String,val checked:Boolean=false,val sortOrder:Int=0,val createdAt:Long=System.currentTimeMillis())
 @Entity(tableName="assets",foreignKeys=[ForeignKey(entity=NoteEntity::class,parentColumns=["id"],childColumns=["noteId"],onDelete=ForeignKey.CASCADE)],indices=[Index("noteId")])
-data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:String,val filename:String,val mimeType:String,val relativePath:String,val localPath:String?=null,val contentHash:String="",val size:Long=0,val dirty:Boolean=false,val width:Int?=null,val height:Int?=null,val durationMs:Long?=null,val caption:String?=null,val displayWidth:Int?=null,val alignment:String?=null)
+data class AssetEntity(@PrimaryKey val id:String,val noteId:String,val kind:String,val filename:String,val mimeType:String,val relativePath:String,val localPath:String?=null,val contentHash:String="",val size:Long=0,val dirty:Boolean=false)
 @Entity(tableName="tombstones") data class TombstoneEntity(@PrimaryKey val itemKey:String,val itemId:String,val itemType:String,val deletedAt:Long,val deviceId:String)
 @Entity(tableName="drafts") data class DraftEntity(@PrimaryKey val noteId:String,val payloadJson:String,val updatedAt:Long=System.currentTimeMillis())
 @Entity(
@@ -114,22 +100,6 @@ data class ReadingPositionEntity(
     val viewportOffsetFraction:Double,
     val updatedAt:Long,
     val deviceId:String
-)
-@Entity(
-    tableName="page_links",
-    foreignKeys=[ForeignKey(entity=NoteEntity::class,parentColumns=["id"],childColumns=["sourceNoteId"],onDelete=ForeignKey.CASCADE)],
-    indices=[Index("sourceNoteId"),Index("targetNoteId")]
-)
-data class PageLinkEntity(
-    @PrimaryKey val id:String,
-    val sourceNoteId:String,
-    val targetNoteId:String,
-    val targetKind:String,
-    val targetId:String?,
-    val alias:String?,
-    val embed:Boolean,
-    val sourceOffset:Int,
-    val updatedAt:Long
 )
 
 /** Raw TipTap JSON is retained separately from the Markdown projection used by the native reader/editor. */
@@ -157,9 +127,9 @@ data class ApiSyncOutboxEntity(
 
 @Dao interface NotebookDao {
     @Query("SELECT * FROM notes ORDER BY updatedAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
-    @Query("SELECT id,title,previewText AS preview,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion FROM notes ORDER BY updatedAt DESC") fun observeNoteSummaries():Flow<List<NoteSummary>>
+    @Query("SELECT id,title,previewText AS preview,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion FROM notes ORDER BY updatedAt DESC") fun observeNoteSummaries():Flow<List<NoteSummary>>
     @Query("SELECT * FROM notes WHERE id=:id") suspend fun get(id:String): NoteEntity?
-    @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE id=:id") suspend fun getNoteHeader(id:String):NoteEntity?
+    @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE id=:id") suspend fun getNoteHeader(id:String):NoteEntity?
     @Query("SELECT length(body) FROM notes WHERE id=:id") suspend fun bodyLength(id:String):Int?
     @Query("SELECT substr(body,:start,:length) FROM notes WHERE id=:id") suspend fun bodyChunk(id:String,start:Int,length:Int):String?
     @Query("SELECT length(snapshotJson) FROM notes WHERE id=:id") suspend fun snapshotLength(id:String):Int?
@@ -171,7 +141,7 @@ data class ApiSyncOutboxEntity(
     @Query("SELECT id FROM notes WHERE title LIKE '%' || :query || '%' OR body LIKE '%' || :query || '%'") suspend fun searchNoteIds(query:String):List<String>
     @Query("SELECT * FROM notes") suspend fun allNotes(): List<NoteEntity>
     @Query("SELECT * FROM notes WHERE dirty=1") suspend fun dirtyNotes(): List<NoteEntity>
-    @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
+    @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
     @Upsert suspend fun put(note:NoteEntity)
     @Upsert suspend fun putNotes(notes:List<NoteEntity>)
     @Update(entity=NoteEntity::class) suspend fun updateEditable(note:NoteEditableUpdate)
@@ -213,17 +183,7 @@ data class ApiSyncOutboxEntity(
     @Query("SELECT * FROM reading_positions WHERE noteId=:noteId") suspend fun readingPosition(noteId:String):ReadingPositionEntity?
     @Query("SELECT * FROM reading_positions") suspend fun allReadingPositions():List<ReadingPositionEntity>
     @Upsert suspend fun putReadingPosition(position:ReadingPositionEntity)
-    @Transaction suspend fun putReadingPositionIfNoteExists(position:ReadingPositionEntity):Boolean{
-        if(get(position.noteId)==null)return false
-        putReadingPosition(position)
-        return true
-    }
     @Query("DELETE FROM reading_positions WHERE noteId=:noteId") suspend fun deleteReadingPosition(noteId:String)
-    @Query("SELECT * FROM page_links WHERE sourceNoteId=:noteId ORDER BY sourceOffset") suspend fun pageLinks(noteId:String):List<PageLinkEntity>
-    @Query("SELECT * FROM page_links WHERE targetNoteId=:noteId ORDER BY updatedAt DESC") fun observeBacklinks(noteId:String):Flow<List<PageLinkEntity>>
-    @Query("DELETE FROM page_links WHERE sourceNoteId=:noteId") suspend fun deletePageLinks(noteId:String)
-    @Upsert suspend fun putPageLinks(items:List<PageLinkEntity>)
-    @Transaction suspend fun replacePageLinks(noteId:String,items:List<PageLinkEntity>){deletePageLinks(noteId);if(items.isNotEmpty())putPageLinks(items)}
     @Query("SELECT id FROM notes WHERE deletedAt IS NULL") suspend fun nonDeletedNoteIds():List<String>
     @Query("SELECT * FROM api_documents WHERE pageId=:pageId") suspend fun apiDocument(pageId:String):ApiDocumentEntity?
     @Upsert suspend fun putApiDocument(document:ApiDocumentEntity)
@@ -246,7 +206,7 @@ data class ApiSyncOutboxEntity(
     @Upsert suspend fun putApiCursor(cursor:ApiSyncCursorEntity)
 }
 
-@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=10, exportSchema=false)
+@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=7, exportSchema=false)
 abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
     companion object {
         private val MIGRATION_1_2=object:androidx.room.migration.Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
@@ -282,26 +242,6 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
             db.execSQL("CREATE TABLE IF NOT EXISTS api_sync_outbox (id TEXT NOT NULL, workspaceId TEXT NOT NULL, entityType TEXT NOT NULL, entityId TEXT NOT NULL, expectedVersion INTEGER NOT NULL, operation TEXT NOT NULL, payloadJson TEXT NOT NULL, createdAt INTEGER NOT NULL, PRIMARY KEY(id))")
             db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_api_sync_outbox_entityType_entityId ON api_sync_outbox(entityType,entityId)")
         }}
-        private val MIGRATION_7_8=object:androidx.room.migration.Migration(7,8){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
-            db.execSQL("ALTER TABLE notes ADD COLUMN parentPageId TEXT")
-            db.execSQL("ALTER TABLE notes ADD COLUMN sortOrder REAL NOT NULL DEFAULT 0")
-            db.execSQL("ALTER TABLE notes ADD COLUMN treeUpdatedAt INTEGER NOT NULL DEFAULT 0")
-            db.execSQL("UPDATE notes SET sortOrder=createdAt, treeUpdatedAt=createdAt")
-        }}
-        private val MIGRATION_8_9=object:androidx.room.migration.Migration(8,9){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
-            db.execSQL("ALTER TABLE notes ADD COLUMN icon TEXT")
-        }}
-        private val MIGRATION_9_10=object:androidx.room.migration.Migration(9,10){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
-            db.execSQL("ALTER TABLE assets ADD COLUMN width INTEGER")
-            db.execSQL("ALTER TABLE assets ADD COLUMN height INTEGER")
-            db.execSQL("ALTER TABLE assets ADD COLUMN durationMs INTEGER")
-            db.execSQL("ALTER TABLE assets ADD COLUMN caption TEXT")
-            db.execSQL("ALTER TABLE assets ADD COLUMN displayWidth INTEGER")
-            db.execSQL("ALTER TABLE assets ADD COLUMN alignment TEXT")
-            db.execSQL("CREATE TABLE IF NOT EXISTS page_links (id TEXT NOT NULL, sourceNoteId TEXT NOT NULL, targetNoteId TEXT NOT NULL, targetKind TEXT NOT NULL, targetId TEXT, alias TEXT, embed INTEGER NOT NULL, sourceOffset INTEGER NOT NULL, updatedAt INTEGER NOT NULL, PRIMARY KEY(id), FOREIGN KEY(sourceNoteId) REFERENCES notes(id) ON UPDATE NO ACTION ON DELETE CASCADE)")
-            db.execSQL("CREATE INDEX IF NOT EXISTS index_page_links_sourceNoteId ON page_links(sourceNoteId)")
-            db.execSQL("CREATE INDEX IF NOT EXISTS index_page_links_targetNoteId ON page_links(targetNoteId)")
-        }}
-        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10).build()
+        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7).build()
     }
 }
