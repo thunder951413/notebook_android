@@ -11,6 +11,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.Orientation
@@ -35,6 +36,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.graphics.Color
@@ -58,6 +60,7 @@ import io.github.notebook.android.sync.ApiSyncSettings
 import io.github.notebook.android.sync.SyncBackend
 import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.sync.NoteSaveState
+import io.github.notebook.android.sync.NoteRevisionSummary
 import io.github.notebook.android.sync.parseSyncQrConfig
 import io.github.notebook.android.sync.HostKeyChangedException
 import io.github.notebook.android.ui.NotebookTheme
@@ -197,7 +200,23 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
                 loadingNoteId?.let{LinearProgressIndicator(Modifier.fillMaxWidth())}
                 saveError?.let{Text(it,Modifier.padding(horizontal=16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
                 Row(Modifier.fillMaxSize()){
-                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else VirtualNoteList(visible,loadingNoteId,repo,{openNote(it)},{deletedID->if(editing?.id==deletedID)editing=null}){message->status=message}}
+                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else VirtualNoteList(
+                        notes=visible,
+                        loadingNoteId=loadingNoteId,
+                        repo=repo,
+                        treeMode=visible.all{it.itemType=="note"}&&destination!=Destination.Trash,
+                        onOpen={openNote(it)},
+                        onNewChild={parent->
+                            val folder=folders.firstOrNull{it.id==parent.folderId}
+                            val nextOrder=(all.filter{it.parentPageId==parent.id}.maxOfOrNull{it.sortOrder}?:0.0)+1000.0
+                            val now=System.currentTimeMillis()
+                            val draft=newItemDraft(Destination.All,folder,parent.folderId,null,endOfToday).copy(parentPageId=parent.id,sortOrder=nextOrder,treeUpdatedAt=now)
+                            repo.markUnsaved(draft.id);startInEditMode=true;editing=draft
+                        },
+                        onPromote={page->scope.launch{repo.loadNote(page.id)?.let{repo.save(it.copy(parentPageId=null,treeUpdatedAt=System.currentTimeMillis()))};status="已提升为顶层页面"}},
+                        onDeleted={deletedID->if(editing?.id==deletedID)editing=null},
+                        onStatus={message->status=message}
+                    )}
                     if(isTablet){VerticalDivider();Box(Modifier.weight(1.65f).fillMaxHeight().background(MaterialTheme.colorScheme.background)){editing?.let{note->EditorPane(note,repo,initiallyEditing=startInEditMode,onDone={editing=null})}?:Box(Modifier.fillMaxSize().padding(40.dp)){Text("选择一篇笔记开始阅读",color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
                 }
             }
@@ -209,13 +228,32 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 
 @Composable private fun DrawerRow(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,selected:Boolean,count:Int?=null,onClick:()->Unit){NavigationDrawerItem(label={Row{Text(label);Spacer(Modifier.weight(1f));count?.let{Text(it.toString(),style=MaterialTheme.typography.labelMedium)}}},icon={Icon(icon,null)},selected=selected,onClick=onClick,modifier=Modifier.padding(horizontal=8.dp,vertical=1.dp))}
 
-@Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,repo:SyncRepository,onOpen:(String)->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
+internal data class VisibleNoteTreeRow(val note:NoteSummary,val depth:Int,val hasChildren:Boolean)
+
+internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean>):List<VisibleNoteTreeRow>{
+    val byId=notes.associateBy{it.id}
+    val children=notes.groupBy{note->note.parentPageId?.takeIf(byId::containsKey)}
+    fun ordered(parent:String?)=children[parent].orEmpty().sortedWith(compareBy<NoteSummary>{it.sortOrder}.thenBy{it.title})
+    val result=mutableListOf<VisibleNoteTreeRow>();val visiting=mutableSetOf<String>()
+    fun visit(parent:String?,depth:Int){ordered(parent).forEach{note->
+        if(!visiting.add(note.id))return@forEach
+        val hasChildren=children[note.id].orEmpty().isNotEmpty()
+        result+=VisibleNoteTreeRow(note,depth,hasChildren)
+        if(hasChildren&&expanded[note.id]!=false)visit(note.id,depth+1)
+        visiting-=note.id
+    }}
+    visit(null,0);return result
+}
+
+@Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,repo:SyncRepository,treeMode:Boolean,onOpen:(String)->Unit,onNewChild:(NoteSummary)->Unit,onPromote:(NoteSummary)->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
     val state=rememberLazyListState()
-    val scrollMetrics by remember(state,notes.size){derivedStateOf{Triple(state.layoutInfo.visibleItemsInfo.size,notes.size,state.firstVisibleItemIndex)}}
+    val expanded=remember{mutableStateMapOf<String,Boolean>()}
+    val rows=if(treeMode)flattenNoteTree(notes,expanded)else notes.map{VisibleNoteTreeRow(it,0,false)}
+    val scrollMetrics by remember(state,rows.size){derivedStateOf{Triple(state.layoutInfo.visibleItemsInfo.size,rows.size,state.firstVisibleItemIndex)}}
     BoxWithConstraints(Modifier.fillMaxSize()){
-        LazyColumn(Modifier.fillMaxSize(),state=state){items(notes,key={it.id}){n->SwipeDeleteNoteRow(n,loadingNoteId==n.id,repo,{onOpen(n.id)},onDeleted,onStatus)}}
+        LazyColumn(Modifier.fillMaxSize(),state=state){items(rows,key={it.note.id}){row->SwipeDeleteNoteRow(row.note,notes,loadingNoteId==row.note.id,repo,row.depth,row.hasChildren,expanded[row.note.id]!=false,{expanded[row.note.id]=!(expanded[row.note.id]!=false)},{onOpen(row.note.id)},{onNewChild(row.note)},{onPromote(row.note)},onDeleted,onStatus)}}
         val (visibleCount,totalCount,firstVisible)=scrollMetrics
-        if(notes.size>visibleCount&&visibleCount>0){
+        if(rows.size>visibleCount&&visibleCount>0){
             val thumbFraction=(visibleCount.toFloat()/totalCount).coerceIn(.08f,1f)
             val progress=(firstVisible.toFloat()/(totalCount-visibleCount).coerceAtLeast(1)).coerceIn(0f,1f)
             val thumbHeight=maxHeight*thumbFraction
@@ -225,8 +263,9 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun SwipeDeleteNoteRow(note:NoteSummary,loading:Boolean,repo:SyncRepository,onClick:()->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
+@Composable private fun SwipeDeleteNoteRow(note:NoteSummary,allNotes:List<NoteSummary>,loading:Boolean,repo:SyncRepository,depth:Int,hasChildren:Boolean,expanded:Boolean,onToggle:()->Unit,onClick:()->Unit,onNewChild:()->Unit,onPromote:()->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
     var deleteDialog by remember(note.id){mutableStateOf(false)}
+    var moveDialog by remember(note.id){mutableStateOf(false)}
     var deleting by remember(note.id){mutableStateOf(false)}
     var offsetPx by remember(note.id){mutableFloatStateOf(0f)}
     var settleJob by remember(note.id){mutableStateOf<kotlinx.coroutines.Job?>(null)}
@@ -278,13 +317,19 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
                         settle(swipeDeleteTargetOffset(offsetPx,actionWidthPx,velocity))
                     }
                 )
-        ){NoteRow(note,loading){if(offsetPx<-.5f)settle(0f)else onClick()}}
+        ){NoteRow(note,loading,depth,hasChildren,expanded,onToggle,{if(offsetPx<-.5f)settle(0f)else onClick()},onNewChild,onPromote,{moveDialog=true}){icon->
+            scope.launch{
+                runCatching{repo.loadNote(note.id)?.let{repo.save(it.copy(icon=icon))}}
+                    .onSuccess{onStatus(if(icon==null)"已恢复默认图标" else "页面图标已更新")}
+                    .onFailure{onStatus("更新图标失败：${it.localizedMessage}")}
+            }
+        }}
     }
     if(deleteDialog)AlertDialog(
         onDismissRequest={deleteDialog=false;settle(0f)},
         icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},
         title={Text("删除$itemLabel？")},
-        text={Text("删除后会移入回收站，可以稍后恢复。")},
+        text={Text(if(hasChildren)"此页面及全部子页面会一起移入回收站，可以稍后恢复。" else "删除后会移入回收站，可以稍后恢复。")},
         confirmButton={Button(
             onClick={
                 deleteDialog=false
@@ -300,9 +345,42 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         ){Text("删除")}},
         dismissButton={TextButton({deleteDialog=false;settle(0f)}){Text("取消")}}
     )
+    if(moveDialog)MovePageDialog(note,allNotes,{moveDialog=false}){parentId->
+        moveDialog=false
+        scope.launch{
+            runCatching{repo.movePage(note.id,parentId)}
+                .onSuccess{onStatus(if(parentId==null)"已移动到顶层" else "已移动到所选页面下")}
+                .onFailure{onStatus("移动失败：${it.localizedMessage}")}
+        }
+    }
 }
 
-@Composable private fun NoteRow(note:NoteSummary,loading:Boolean,onClick:()->Unit){ListItem(headlineContent={Row{Text(note.title.ifBlank{"无标题"},fontWeight=FontWeight.Medium);Spacer(Modifier.weight(1f));if(loading)CircularProgressIndicator(Modifier.size(15.dp),strokeWidth=2.dp)else if(note.reminderAt!=null)Icon(Icons.Default.Notifications,null,Modifier.size(15.dp),tint=MaterialTheme.colorScheme.primary)}},supportingContent={Column{Text(note.preview,maxLines=2);Spacer(Modifier.height(5.dp));Text("${DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt))}  ·  ${note.folderName}",style=MaterialTheme.typography.labelSmall)}},leadingContent={if(note.itemType=="todo")Icon(Icons.Default.CheckCircle,null,tint=if(note.completedAt==null)MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary)},modifier=Modifier.clickable(enabled=!loading,onClick=onClick).padding(horizontal=4.dp));HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant)}
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable private fun NoteRow(note:NoteSummary,loading:Boolean,depth:Int,hasChildren:Boolean,expanded:Boolean,onToggle:()->Unit,onClick:()->Unit,onNewChild:()->Unit,onPromote:()->Unit,onMove:()->Unit,onIconChange:(String?)->Unit){
+    var menu by remember(note.id){mutableStateOf(false)}
+    Row(Modifier.fillMaxWidth().padding(start=(depth*18).dp)){
+        if(note.itemType=="note")IconButton(onToggle,enabled=hasChildren,modifier=Modifier.size(40.dp)){if(hasChildren)Icon(if(expanded)Icons.Default.ExpandMore else Icons.Default.ChevronRight,if(expanded)"收起子页面" else "展开子页面",Modifier.size(20.dp))else Spacer(Modifier.size(20.dp))}
+        Box(Modifier.weight(1f)){
+            ListItem(headlineContent={Row{Text(note.title.ifBlank{"无标题"},fontWeight=FontWeight.Medium,maxLines=1);Spacer(Modifier.weight(1f));if(loading)CircularProgressIndicator(Modifier.size(15.dp),strokeWidth=2.dp)else if(note.reminderAt!=null)Icon(Icons.Default.Notifications,null,Modifier.size(15.dp),tint=MaterialTheme.colorScheme.primary)}},supportingContent={Column{Text(note.preview,maxLines=2);Spacer(Modifier.height(5.dp));Text("${DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt))}  ·  ${note.folderName}",style=MaterialTheme.typography.labelSmall)}},leadingContent={if(note.itemType=="todo")Icon(Icons.Default.CheckCircle,null,tint=if(note.completedAt==null)MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary)else if(note.icon!=null)Text(note.icon,fontSize=20.sp)else Icon(if(hasChildren)Icons.Default.Folder else Icons.Default.Description,null,tint=MaterialTheme.colorScheme.primary)},trailingContent={if(note.itemType=="note")IconButton({menu=true}){Icon(Icons.Default.MoreVert,"页面菜单")}},modifier=Modifier.combinedClickable(enabled=!loading,onClick=onClick,onLongClick={if(note.itemType=="note")menu=true}).padding(horizontal=4.dp))
+            DropdownMenu(menu,{menu=false}){
+                DropdownMenuItem({Text("新建子页面")},{menu=false;onNewChild()})
+                DropdownMenuItem({Text("移动到…")},{menu=false;onMove()})
+                if(note.parentPageId!=null)DropdownMenuItem({Text("提升为顶层页面")},{menu=false;onPromote()})
+                HorizontalDivider()
+                listOf("📄","📝","📒","📌","✅","📅","💡","🚀","🎯","🔐").forEach{icon->DropdownMenuItem({Text(icon)},{menu=false;onIconChange(icon)})}
+                if(note.icon!=null)DropdownMenuItem({Text("恢复默认图标")},{menu=false;onIconChange(null)})
+            }
+        }
+    }
+    HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant)
+}
+
+@Composable private fun MovePageDialog(page:NoteSummary,notes:List<NoteSummary>,onDismiss:()->Unit,onMove:(String?)->Unit){
+    var query by remember{mutableStateOf("")}
+    val descendants=remember(page.id,notes){buildSet{add(page.id);var changed=true;while(changed){changed=false;notes.filter{it.parentPageId in this}.forEach{if(add(it.id))changed=true}}}}
+    val targets=remember(notes,query,descendants){notes.filter{it.itemType=="note"&&it.deletedAt==null&&it.id !in descendants&&(query.isBlank()||it.title.contains(query,true)||it.folderName.contains(query,true))}.sortedWith(compareBy<NoteSummary>{it.folderName}.thenBy{it.title}).take(200)}
+    AlertDialog(onDismissRequest=onDismiss,title={Text("移动页面")},text={Column(Modifier.fillMaxWidth().heightIn(max=540.dp)){OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索目标页面")});LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){item{ListItem(headlineContent={Text("当前分区的顶层")},leadingContent={Icon(Icons.Default.Home,null)},modifier=Modifier.clickable{onMove(null)})};items(targets,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"})},supportingContent={Text(target.folderName)},leadingContent={Icon(if(notes.any{it.parentPageId==target.id})Icons.Default.Folder else Icons.Default.Description,null)},modifier=Modifier.clickable{onMove(target.id)})}}}},confirmButton={},dismissButton={TextButton(onDismiss){Text("取消")}})
+}
 
 @Composable private fun Editor(original:NoteEntity,repo:SyncRepository,initiallyEditing:Boolean,onBack:()->Unit){Scaffold(containerColor=MaterialTheme.colorScheme.background){p->Box(Modifier.padding(p)){EditorPane(original,repo,showBack=true,initiallyEditing=initiallyEditing,onDone={onBack()})}}}
 
@@ -311,16 +389,31 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     var n by remember(original.id,original.version){mutableStateOf(original)}
     var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body))}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
+    val allNotes by repo.notes.collectAsState(initial=emptyList())
     val saveError by repo.saveError.collectAsState()
     val saveStates by repo.noteSaveStates.collectAsState();val saveState=saveStates[n.id]
     val context=LocalContext.current;val lifecycleOwner=LocalLifecycleOwner.current;val audioRecorder=remember{AudioRecorder(context)};var recording by remember{mutableStateOf(false)};var recordingFile by remember{mutableStateOf<java.io.File?>(null)}
-    val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)}
+    val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)};var parentMenu by remember{mutableStateOf(false)}
     val steps by repo.steps(n.id).collectAsState(initial=emptyList());var newStep by remember{mutableStateOf("")}
-    val picker=rememberLauncherForActivityResult(ActivityResultContracts.GetContent()){uri->uri?.let{scope.launch{repo.attach(n.id,it)}}}
+    val picker=rememberLauncherForActivityResult(ActivityResultContracts.GetContent()){uri->uri?.let{source->scope.launch{
+        runCatching{repo.attach(n.id,source)}.onSuccess{asset->
+            if(asset.kind=="image"){
+                val syntax="\n\n${NotebookAssetSyntax.imageMarkdown(asset.id,asset.filename)}\n\n"
+                val start=bodyValue.selection.min
+                val end=bodyValue.selection.max
+                val next=bodyValue.text.substring(0,start)+syntax+bodyValue.text.substring(end)
+                bodyValue=TextFieldValue(next,TextRange(start+syntax.length))
+                val updated=n.copy(body=next)
+                n=updated
+                repo.queueDraft(updated)
+            }
+        }
+    }}}
     val microphonePermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->if(granted){runCatching{repo.recordingFile(n.id).also{recordingFile=it;audioRecorder.start(it);recording=true}}}}
     val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){}
     DisposableEffect(Unit){onDispose{audioRecorder.release()}}
-    var reminderDialog by remember{mutableStateOf(false)};var deleteDialog by remember{mutableStateOf(false)};var showSavedCheck by remember(original.id){mutableStateOf(false)}
+    var reminderDialog by remember{mutableStateOf(false)};var deleteDialog by remember{mutableStateOf(false)};var historyDialog by remember{mutableStateOf(false)};var historyRevisions by remember(original.id){mutableStateOf<List<NoteRevisionSummary>>(emptyList())};var showSavedCheck by remember(original.id){mutableStateOf(false)}
+    var referencePicker by remember(original.id){mutableStateOf(false)}
     var editMode by remember(original.id){mutableStateOf(initiallyEditing || original.viewMode == "text")}
     val initialEditableKey=remember(original.id,original.version){editableKey(original)}
     var hasEdited by remember(original.id,original.version){mutableStateOf(false)}
@@ -342,32 +435,96 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             if(editableKey(latestNote)!=initialEditableKey)repo.flushDraft(latestNote)
         }
     }
-    BackHandler{repo.flushDraft(n);onDone(n)}
+    BackHandler{scope.launch{repo.flushDraft(n).join();onDone(n)}}
     Column(Modifier.fillMaxSize().padding(horizontal=20.dp,vertical=12.dp)){
         saveError?.let{Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Row(Modifier.padding(10.dp)){Text(it,Modifier.weight(1f));TextButton({repo.clearSaveError()}){Text("知道了")}}};Spacer(Modifier.height(6.dp))}
         if(n.conflict){Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改",fontWeight=FontWeight.SemiBold);Row{TextButton({scope.launch{repo.keepLocal(n.id)}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id)}}){Text("采用服务器版本")}}}};Spacer(Modifier.height(8.dp))}
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
-        Row{if(showBack)IconButton({repo.flushDraft(n);onDone(n)}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(n)};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
+        Row{if(showBack)IconButton({scope.launch{repo.flushDraft(n).join();onDone(n)}}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(n)};IconButton({scope.launch{historyRevisions=repo.revisions(n.id);historyDialog=true}}){Icon(Icons.Default.History,"版本历史")};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
             ReadingPane(n,repo,steps,attachments,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
         OutlinedTextField(n.title,{updateNote(n.copy(title=it))},Modifier.fillMaxWidth().testTag("title-field"),textStyle=MaterialTheme.typography.headlineSmall,label={Text("标题")})
         val encrypted=repo.isEncrypted(n)
-        FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){Box{AssistChip(onClick={folderMenu=true},label={Text(n.folderName)},leadingIcon={Icon(if(encrypted)Icons.Default.Lock else Icons.Default.Folder,null)});DropdownMenu(folderMenu,{folderMenu=false}){if(!encrypted)DropdownMenuItem({Text("未分类")},{updateNote(n.copy(folderId=null,folderName="未分类"));folderMenu=false});folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"}.forEach{f->DropdownMenuItem({Text(f.name)},{if(encrypted)repo.moveEncrypted(n.id,f.id);updateNote(n.copy(folderId=f.id,folderName=f.name,tagIds=if(encrypted)"" else n.tagIds));folderMenu=false})}}};if(!encrypted)tags.forEach{tag->val selected=n.tagIds.split(',').contains(tag.id);FilterChip(selected,{val ids=n.tagIds.split(',').filter{it.isNotBlank()}.toMutableSet();if(selected)ids.remove(tag.id)else ids.add(tag.id);updateNote(n.copy(tagIds=ids.joinToString(",")))},{Text(tag.name)})}}
+        FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){Box{AssistChip(onClick={folderMenu=true},label={Text(n.folderName)},leadingIcon={Icon(if(encrypted)Icons.Default.Lock else Icons.Default.Folder,null)});DropdownMenu(folderMenu,{folderMenu=false}){if(!encrypted)DropdownMenuItem({Text("未分类")},{updateNote(n.copy(folderId=null,folderName="未分类",parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));folderMenu=false});folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"}.forEach{f->DropdownMenuItem({Text(f.name)},{if(encrypted)repo.moveEncrypted(n.id,f.id);updateNote(n.copy(folderId=f.id,folderName=f.name,parentPageId=null,treeUpdatedAt=System.currentTimeMillis(),tagIds=if(encrypted)"" else n.tagIds));folderMenu=false})}}};if(n.itemType=="note"){Box{val parentTitle=allNotes.firstOrNull{it.id==n.parentPageId}?.title?:"顶层页面";AssistChip(onClick={parentMenu=true},label={Text("上级：$parentTitle")},leadingIcon={Icon(Icons.Default.AccountTree,null)});DropdownMenu(parentMenu,{parentMenu=false}){DropdownMenuItem({Text("顶层页面")},{updateNote(n.copy(parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));parentMenu=false});val descendants=run{val result=mutableSetOf(n.id);var changed=true;while(changed){changed=false;allNotes.filter{it.parentPageId in result}.forEach{if(result.add(it.id))changed=true}};result};allNotes.filter{it.itemType=="note"&&it.deletedAt==null&&it.folderId==n.folderId&&it.id !in descendants}.sortedBy{it.title}.forEach{candidate->DropdownMenuItem({Text(candidate.title.ifBlank{"无标题"})},{updateNote(n.copy(parentPageId=candidate.id,sortOrder=(allNotes.filter{it.parentPageId==candidate.id}.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,treeUpdatedAt=System.currentTimeMillis()));parentMenu=false})}}}};if(!encrypted)tags.forEach{tag->val selected=n.tagIds.split(',').contains(tag.id);FilterChip(selected,{val ids=n.tagIds.split(',').filter{it.isNotBlank()}.toMutableSet();if(selected)ids.remove(tag.id)else ids.add(tag.id);updateNote(n.copy(tagIds=ids.joinToString(",")))},{Text(tag.name)})}}
         Spacer(Modifier.height(8.dp))
         fun wrap(before:String,after:String=before){val start=bodyValue.selection.min;val end=bodyValue.selection.max;val next=bodyValue.text.substring(0,start)+before+bodyValue.text.substring(start,end)+after+bodyValue.text.substring(end);bodyValue=TextFieldValue(next,TextRange(end+before.length+after.length));updateNote(n.copy(body=next))}
-        Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){IconButton({wrap("**")}){Text("B",fontWeight=FontWeight.Bold)};IconButton({wrap("_")}){Text("I")};IconButton({wrap("# ","")}){Text("H")};IconButton({wrap("- ","")}){Icon(Icons.Default.FormatListBulleted,"列表")};IconButton({wrap("- [ ] ","")}){Icon(Icons.Default.CheckBox,"清单")}}
+        Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){IconButton({wrap("**")}){Text("B",fontWeight=FontWeight.Bold)};IconButton({wrap("_")}){Text("I")};IconButton({wrap("# ","")}){Text("H")};IconButton({wrap("- ","")}){Icon(Icons.Default.FormatListBulleted,"列表")};IconButton({wrap("- [ ] ","")}){Icon(Icons.Default.CheckBox,"清单")};IconButton({referencePicker=true}){Icon(Icons.Default.Link,"插入双链")}}
         OutlinedTextField(bodyValue,{bodyValue=it;updateNote(n.copy(body=it.text))},Modifier.fillMaxWidth().weight(1f).testTag("body-field"),label={Text("开始记录…")})
         if(n.itemType=="todo"){Row{Checkbox(n.completedAt!=null,{updateNote(n.copy(completedAt=if(it)System.currentTimeMillis() else null))});Text("已完成",Modifier.padding(top=12.dp));Checkbox(n.important,{updateNote(n.copy(important=it))});Text("重要",Modifier.padding(top=12.dp))};LazyColumn(Modifier.heightIn(max=180.dp)){items(steps,key={it.id}){step->Row{Checkbox(step.checked,{checked->scope.launch{repo.saveStep(step.copy(checked=checked))}});Text(step.text,Modifier.weight(1f).padding(top=12.dp));IconButton({scope.launch{repo.deleteStep(step.id)}}){Icon(Icons.Default.Close,"删除步骤")}}}};Row{OutlinedTextField(newStep,{newStep=it},Modifier.weight(1f),singleLine=true,label={Text("添加步骤")});IconButton({if(newStep.isNotBlank()){scope.launch{repo.saveStep(TodoStepEntity(UUID.randomUUID().toString(),n.id,newStep.trim(),sortOrder=steps.size))};newStep=""}}){Icon(Icons.Default.Add,"添加")}}}
         if(attachments.isNotEmpty())LazyColumn(Modifier.heightIn(max=220.dp)){items(attachments,key={it.id}){a->AttachmentView(a)}}
         FlowRow{TextButton({picker.launch("*/*")}){Icon(Icons.Default.AttachFile,null);Text("附件")};TextButton({if(recording){val ok=audioRecorder.stop();recording=false;if(ok)recordingFile?.let{file->scope.launch{repo.addRecordedAudio(n.id,file)}}}else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)}){Icon(if(recording)Icons.Default.Stop else Icons.Default.Mic,null,tint=if(recording)MaterialTheme.colorScheme.error else LocalContentColor.current);Text(if(recording)"停止录音" else "录音")};TextButton({reminderDialog=true}){Icon(Icons.Default.Notifications,null);Text(if(n.reminderAt==null)"提醒" else DateFormat.getDateTimeInstance(DateFormat.SHORT,DateFormat.SHORT).format(Date(n.reminderAt!!)))}}
         }
     }
+    if(referencePicker)ReferencePickerDialog(
+        notes=allNotes.filter{it.id!=n.id&&it.deletedAt==null&&it.itemType=="note"},
+        onDismiss={referencePicker=false},
+        onSelect={target,embed->
+            val syntax="${if(embed)"!" else ""}[[page:${target.id}]]"
+            val start=bodyValue.selection.min
+            val end=bodyValue.selection.max
+            val next=bodyValue.text.substring(0,start)+syntax+bodyValue.text.substring(end)
+            bodyValue=TextFieldValue(next,TextRange(start+syntax.length))
+            updateNote(n.copy(body=next))
+            referencePicker=false
+        }
+    )
+    if(historyDialog)RevisionHistoryDialog(
+        revisions=historyRevisions,
+        onDismiss={historyDialog=false},
+        onRestore={revision->
+            scope.launch{
+                runCatching{repo.restoreRevision(n.id,revision.id)}.onSuccess{restored->
+                    n=restored
+                    bodyValue=TextFieldValue(restored.body)
+                    editMode=false
+                    historyDialog=false
+                }
+            }
+        }
+    )
     if(reminderDialog)ReminderDialog(n.reminderAt,n.recurrence,{reminderDialog=false},{at,rule->updateNote(n.copy(reminderAt=at,recurrence=rule));if(at!=null&&android.os.Build.VERSION.SDK_INT>=33)notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS);reminderDialog=false})
-    if(deleteDialog){val itemLabel=if(n.itemType=="todo")"计划" else "笔记";AlertDialog(onDismissRequest={deleteDialog=false},icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除$itemLabel？")},text={Text("删除后会移入回收站，可以稍后恢复。")},confirmButton={Button({val deleted=n.copy(deletedAt=System.currentTimeMillis());n=deleted;repo.flushDraft(deleted);deleteDialog=false;onDone(deleted)},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({deleteDialog=false}){Text("取消")}})}
+    if(deleteDialog){val itemLabel=if(n.itemType=="todo")"计划" else "笔记";val hasChildren=allNotes.any{it.parentPageId==n.id};AlertDialog(onDismissRequest={deleteDialog=false},icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除$itemLabel？")},text={Text(if(hasChildren)"此页面及全部子页面会一起移入回收站，可以稍后恢复。" else "删除后会移入回收站，可以稍后恢复。")},confirmButton={Button({deleteDialog=false;scope.launch{repo.flushDraft(n).join();repo.moveToTrash(n.id);onDone(n.copy(deletedAt=System.currentTimeMillis()))}},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({deleteDialog=false}){Text("取消")}})}
 }
 
-private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important,n.viewMode)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun RevisionHistoryDialog(revisions:List<NoteRevisionSummary>,onDismiss:()->Unit,onRestore:(NoteRevisionSummary)->Unit){
+    var selected by remember(revisions){mutableStateOf<NoteRevisionSummary?>(null)}
+    var confirmRestore by remember{mutableStateOf(false)}
+    ModalBottomSheet(onDismissRequest=onDismiss){
+        Column(Modifier.fillMaxWidth().fillMaxHeight(.9f).padding(horizontal=20.dp)){
+            Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Text("版本历史",style=MaterialTheme.typography.titleLarge);Spacer(Modifier.weight(1f));selected?.let{Button({confirmRestore=true}){Text("恢复此版本")}}}
+            when {
+                selected==null -> {
+                    val items=revisions
+                    if(items.isEmpty())Box(Modifier.fillMaxSize(),contentAlignment=androidx.compose.ui.Alignment.Center){Text("还没有可恢复的历史版本",color=MaterialTheme.colorScheme.onSurfaceVariant)}
+                    else LazyColumn(Modifier.fillMaxSize()){items(items,key={it.id}){revision->ListItem(headlineContent={Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM,DateFormat.SHORT).format(Date(revision.createdAt)))},supportingContent={Text(when(revision.reason){"manual"->"手动快照";"import"->"同步或导入";else->"自动保存"})},leadingContent={Icon(Icons.Default.Restore,null)},modifier=Modifier.testTag("history-revision-${revision.id}").clickable{selected=revision})}}
+                }
+                else -> Column(Modifier.fillMaxSize()){TextButton({selected=null}){Icon(Icons.Default.ArrowBack,null);Text("返回版本列表")};MarkdownView(selected!!.markdown,Modifier.fillMaxWidth().weight(1f).testTag("history-preview").verticalScroll(androidx.compose.foundation.rememberScrollState()))}
+            }
+        }
+    }
+    if(confirmRestore)AlertDialog(onDismissRequest={confirmRestore=false},title={Text("恢复这个版本？")},text={Text("当前正文会先在下一次同步时进入历史，然后以所选版本创建新的当前版本。")},confirmButton={Button({confirmRestore=false;selected?.let(onRestore)}){Text("恢复")}},dismissButton={TextButton({confirmRestore=false}){Text("取消")}})
+}
+
+@Composable private fun ReferencePickerDialog(notes:List<NoteSummary>,onDismiss:()->Unit,onSelect:(NoteSummary,Boolean)->Unit){
+    var query by remember{mutableStateOf("")}
+    var embed by remember{mutableStateOf(false)}
+    val visible=remember(notes,query){notes.filter{query.isBlank()||it.title.contains(query,true)||it.preview.contains(query,true)}.take(100)}
+    AlertDialog(
+        onDismissRequest=onDismiss,
+        title={Text("插入双链")},
+        text={Column(Modifier.fillMaxWidth().heightIn(max=520.dp)){
+            OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索页面标题或内容")})
+            Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Switch(embed,{embed=it});Text(if(embed)"嵌入整篇内容" else "只显示页面链接",Modifier.padding(start=8.dp))}
+            LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){items(visible,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"},maxLines=1)},supportingContent={Text(target.preview,maxLines=2)},leadingContent={Icon(Icons.Default.Description,null)},modifier=Modifier.clickable{onSelect(target,embed)})}}
+        }},
+        confirmButton={},
+        dismissButton={TextButton(onDismiss){Text("取消")}}
+    )
+}
+
+private fun editableKey(n:NoteEntity)=listOf<Any?>(n.title,n.body,n.folderId,n.folderName,n.icon,n.parentPageId,n.sortOrder,n.treeUpdatedAt,n.reminderAt,n.recurrence,n.tagIds,n.deletedAt,n.itemType,n.dueAt,n.completedAt,n.important,n.viewMode)
 
 @Composable private fun SaveStatusAction(state:NoteSaveState?,showSavedCheck:Boolean,onSave:()->Unit){
     when(state){
@@ -392,6 +549,23 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,modifier:Modifier=Modifier){
+    val context=LocalContext.current
+    val allNotes by repo.notes.collectAsState(initial=emptyList())
+    val backlinks by repo.backlinks(note.id).collectAsState(initial=emptyList())
+    val references=remember(note.body){NotebookReferenceSyntax.parse(note.body)}
+    val referencedAssetIds=remember(note.body){NotebookAssetSyntax.images(note.body).map{it.assetId}.toSet()}
+    var referenceTargets by remember(note.id){mutableStateOf<Map<String,NoteEntity>>(emptyMap())}
+    var referenceAssets by remember(note.id){mutableStateOf<Map<String,AssetEntity>>(emptyMap())}
+    LaunchedEffect(note.id,references.map{it.pageId}.distinct()){
+        val targetIds=references.map{it.pageId}.distinct()
+        referenceTargets=targetIds.mapNotNull{id->repo.loadNote(id)?.let{id to it}}.toMap()
+        referenceAssets=targetIds.flatMap{repo.assetList(it)}.associateBy{it.id}
+    }
+    fun openReference(uri:String){
+        val parsed=android.net.Uri.parse(uri)
+        val targetId=parsed.pathSegments.firstOrNull()?:return
+        context.startActivity(Intent(context,MainActivity::class.java).putExtra("noteId",targetId).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP))
+    }
     var documentState by remember(note.id,note.body) { mutableStateOf<ReaderDocumentState>(ReaderDocumentState.Loading) }
     LaunchedEffect(note.id,note.body) {
         val parsed = runCatching {
@@ -405,7 +579,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     val ready=documentState as? ReaderDocumentState.Ready
     if(ready==null){Box(modifier,contentAlignment=androidx.compose.ui.Alignment.Center){when(val current=documentState){ReaderDocumentState.Loading->Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){CircularProgressIndicator();Spacer(Modifier.height(10.dp));Text("正在准备长文阅读视图…",color=MaterialTheme.colorScheme.onSurfaceVariant)};is ReaderDocumentState.Failed->Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){Icon(Icons.Default.ErrorOutline,null,tint=MaterialTheme.colorScheme.error);Text(current.message,color=MaterialTheme.colorScheme.error)};is ReaderDocumentState.Ready->Unit}};return}
     val document=ready.document;val blocks=document.blocks;val state=remember(note.id){androidx.compose.foundation.lazy.LazyListState()};val scope=rememberCoroutineScope();val views=remember(note.id,note.body){mutableMapOf<Int,TextView>()};val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)3 else 2
-    val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
+    val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingBacklinks by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
     val searchMatches=remember(note.body,searchQuery){if(searchQuery.isBlank())emptyList()else buildList{var start=0;while(size<10_000){val found=note.body.indexOf(searchQuery,start,ignoreCase=true);if(found<0)break;add(found);start=found+searchQuery.length.coerceAtLeast(1)}}}
     fun navigateSearch(delta:Int){if(searchMatches.isEmpty())return;searchIndex=(searchIndex+delta).mod(searchMatches.size);val offset=searchMatches[searchIndex];val blockIndex=blocks.indexOfLast{it.startUtf16<=offset}.coerceAtLeast(0);launchScroll(scope,state,bodyStart+blockIndex)}
     var restored by remember(note.id){mutableStateOf(false)};val latestRestored by rememberUpdatedState(restored)
@@ -426,15 +600,27 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     LaunchedEffect(note.id,restored,blocks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
     DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
     Box(modifier){LazyColumn(Modifier.fillMaxSize(),state=state,contentPadding=PaddingValues(top=if(showingSearch)64.dp else 0.dp,bottom=36.dp),horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){
-        item(key="reader-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Text("${blocks.size} 个内容块",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=14.dp));Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};if(document.headings.isNotEmpty())IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
+        item(key="reader-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Text("${blocks.size} 个内容块",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=14.dp));Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};if(document.headings.isNotEmpty())IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};BadgedBox(badge={if(backlinks.isNotEmpty())Badge{Text(backlinks.size.toString())}}){IconButton({showingBacklinks=true}){Icon(Icons.Default.Link,"反向链接")}};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
         item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=12.dp))}
         if(hasMetadata)item(key="note-folder"){Text(note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp))}
         if(blocks.isEmpty())item(key="empty-note"){Text("暂无正文",Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)}
-        items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->val block=blocks[index];if(block.kind==MarkdownBlockKind.Blank)Spacer(Modifier.fillMaxWidth().height(8.dp))else MarkdownView(markdown=block.text,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=if(index==0)12.dp else 0.dp),style=readerStyle,highlightQuery=searchQuery,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})}
+        items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->
+            val block=blocks[index]
+            if(block.kind==MarkdownBlockKind.Blank)Spacer(Modifier.fillMaxWidth().height(8.dp))else{
+                val expandedMarkdown=NotebookReferenceSyntax.forDisplay(block.text,pageTitle={id->allNotes.firstOrNull{it.id==id}?.title},targetContent={reference->referenceTargets[reference.pageId]?.let{NotebookReferenceSyntax.extractTarget(it.body,reference)}})
+                val imageRefs=NotebookAssetSyntax.images(expandedMarkdown)
+                val displayMarkdown=NotebookAssetSyntax.withoutImages(expandedMarkdown)
+                Column(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=if(index==0)12.dp else 0.dp)){
+                    if(displayMarkdown.isNotBlank())MarkdownView(markdown=displayMarkdown,modifier=Modifier.fillMaxWidth(),style=readerStyle,highlightQuery=searchQuery,onNotebookLink=::openReference,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})
+                    imageRefs.forEach{image->(attachments.firstOrNull{it.id==image.assetId}?:referenceAssets[image.assetId])?.let{asset->AttachmentView(asset,caption=image.title?:asset.caption?:image.alt.takeIf(String::isNotBlank))}}
+                }
+            }
+        }
         if(note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider(Modifier.widthIn(max=readerStyle.maxWidthDp.dp))};items(steps,key={"read-step-${it.id}"}){step->Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
-        items(attachments,key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
+        items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
     };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
     if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
+    if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(backlinks.isEmpty())Text("还没有其他页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(backlinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when(link.targetKind){"block"->"引用了内容块";"group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
 }
 
@@ -455,15 +641,21 @@ private fun launchScroll(scope:kotlinx.coroutines.CoroutineScope,state:androidx.
     }
 }
 
-internal fun createMarkdownRenderer(context:android.content.Context):Markwon=Markwon.builder(context)
+internal fun createMarkdownRenderer(context:android.content.Context,onNotebookLink:(String)->Unit={}):Markwon=Markwon.builder(context)
     .usePlugin(SoftBreakAddsNewLinePlugin.create())
     .usePlugin(StrikethroughPlugin.create())
     .usePlugin(TablePlugin.create(context))
+    .usePlugin(object:io.noties.markwon.AbstractMarkwonPlugin(){
+        override fun configureConfiguration(builder:io.noties.markwon.MarkwonConfiguration.Builder){
+            val defaultResolver=io.noties.markwon.LinkResolverDef()
+            builder.linkResolver{view,link->if(link.startsWith("notebook://page/"))onNotebookLink(link)else defaultResolver.resolve(view,link)}
+        }
+    })
     .build()
 
-@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,style:ReaderStyle=ReaderStyle(),highlightQuery:String="",onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val highlight=MaterialTheme.colorScheme.tertiaryContainer.toArgb();val markwon=remember(context){createMarkdownRenderer(context)};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;isSingleLine=false;setHorizontallyScrolling(false);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true);importantForAccessibility=android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES}},update={view->view.setTextColor(color);view.setTextSize(TypedValue.COMPLEX_UNIT_SP,style.fontSizeSp);view.setLineSpacing(0f,style.lineHeight);val renderKey=Triple(markdown,style.fontSizeSp,highlightQuery);if(view.tag!=renderKey){markwon.setMarkdown(view,markdown);if(highlightQuery.isNotBlank()){val highlighted=SpannableString(view.text);var start=0;while(start<highlighted.length){val found=highlighted.toString().indexOf(highlightQuery,start,ignoreCase=true);if(found<0)break;highlighted.setSpan(BackgroundColorSpan(highlight),found,found+highlightQuery.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);start=found+highlightQuery.length.coerceAtLeast(1)};view.text=highlighted};view.tag=renderKey};onViewReady(view)},modifier=modifier)}
+@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,style:ReaderStyle=ReaderStyle(),highlightQuery:String="",onNotebookLink:(String)->Unit={},onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val highlight=MaterialTheme.colorScheme.tertiaryContainer.toArgb();val latestNotebookLink by rememberUpdatedState(onNotebookLink);val markwon=remember(context){createMarkdownRenderer(context){latestNotebookLink(it)}};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;isSingleLine=false;setHorizontallyScrolling(false);movementMethod=LinkMovementMethod.getInstance();setTextIsSelectable(true);importantForAccessibility=android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES}},update={view->view.setTextColor(color);view.setTextSize(TypedValue.COMPLEX_UNIT_SP,style.fontSizeSp);view.setLineSpacing(0f,style.lineHeight);val renderKey=Triple(markdown,style.fontSizeSp,highlightQuery);if(view.tag!=renderKey){markwon.setMarkdown(view,markdown);if(highlightQuery.isNotBlank()){val highlighted=SpannableString(view.text);var start=0;while(start<highlighted.length){val found=highlighted.toString().indexOf(highlightQuery,start,ignoreCase=true);if(found<0)break;highlighted.setSpan(BackgroundColorSpan(highlight),found,found+highlightQuery.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);start=found+highlightQuery.length.coerceAtLeast(1)};view.text=highlighted};view.tag=renderKey};onViewReady(view)},modifier=modifier)}
 
-@Composable private fun AttachmentView(asset:AssetEntity){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Card(Modifier.fillMaxWidth().padding(vertical=4.dp).clickable{open()}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().heightIn(max=180.dp))}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)formatBytes(asset.size) else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
+@Composable private fun AttachmentView(asset:AssetEntity,caption:String?=asset.caption){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Column(Modifier.fillMaxWidth().padding(vertical=6.dp),horizontalAlignment=when(asset.alignment){"center"->androidx.compose.ui.Alignment.CenterHorizontally;"right"->androidx.compose.ui.Alignment.End;else->androidx.compose.ui.Alignment.Start}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().then(asset.displayWidth?.let{Modifier.widthIn(max=it.coerceIn(80,1200).dp)}?:Modifier).heightIn(max=720.dp).clickable{open()},contentScale=androidx.compose.ui.layout.ContentScale.Fit);caption?.takeIf(String::isNotBlank)?.let{Text(it,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)formatBytes(asset.size) else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
 
 private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024->String.format(Locale.getDefault(),"%.1f KB",bytes/1024.0);else->String.format(Locale.getDefault(),"%.1f MB",bytes/(1024.0*1024.0))}
 
