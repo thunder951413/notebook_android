@@ -113,6 +113,9 @@ internal object RemoteTransferLimits {
     fun requireUploadSize(size:Long){
         require(size<=MAX_FILE_BYTES){"单个上传文件超过 $MAX_FILE_MIB MiB，已停止同步"}
     }
+    fun requireDownloadSize(size:Long){
+        require(size<=MAX_FILE_BYTES){"单个下载文件超过 $MAX_FILE_MIB MiB，已停止同步"}
+    }
 }
 
 internal object RepositoryIndexContract {

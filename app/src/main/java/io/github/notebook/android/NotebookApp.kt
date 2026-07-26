@@ -1,5 +1,6 @@
 package io.github.notebook.android
 import android.app.Application
+import android.util.Log
 import io.github.notebook.android.data.NotebookDatabase
 import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.sync.SyncWorker
@@ -7,5 +8,18 @@ import io.github.notebook.android.sync.SyncWorker
 class NotebookApp:Application(){
     val database by lazy { NotebookDatabase.create(this) }
     val repository by lazy { SyncRepository(this,database.dao()) }
-    override fun onCreate(){super.onCreate();runCatching{repository.recoverDraftsAsync();repository.rebuildReferenceIndexAsync();SyncWorker.schedule(this)}}
+    override fun onCreate(){
+        super.onCreate()
+        val activeRepository=runCatching{repository}.onFailure{
+            // Keep the process alive long enough for Android to report the
+            // initialization failure; MainActivity will retry and fail visibly
+            // instead of presenting an empty notebook.
+            Log.e("NotebookApp","Unable to initialize the notebook database or secure settings",it)
+        }.getOrNull()?:return
+        // Both async recovery jobs surface their own failures through saveError.
+        activeRepository.recoverDraftsAsync()
+        activeRepository.rebuildReferenceIndexAsync()
+        runCatching{SyncWorker.schedule(this)}
+            .onFailure{Log.e("NotebookApp","Unable to schedule background sync",it)}
+    }
 }

@@ -12,6 +12,7 @@ import io.github.notebook.android.data.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.net.URI
@@ -40,12 +41,13 @@ class ApiSyncClient(
     suspend fun sync(settings:ApiSyncSettings) {
         val normalized=settings.copy(baseUrl=settings.baseUrl.trim().trimEnd('/'),workspaceId=settings.workspaceId.trim(),token=settings.token.trim())
         validate(normalized)
+        val downloadBudget=RemoteTransferLimits.Budget()
         // On a freshly connected Android install, receive the web migration first.
         // Clean records from the legacy SSH database may then be safely replaced.
-        if((dao.apiCursor(normalized.workspaceId)?:0L)==0L) pullAll(normalized)
+        if((dao.apiCursor(normalized.workspaceId)?:0L)==0L) pullAll(normalized,downloadBudget)
         queueDirtyRecords(normalized.workspaceId)
         push(normalized)
-        pullAll(normalized)
+        pullAll(normalized,downloadBudget)
     }
 
     private fun validate(s:ApiSyncSettings) {
@@ -130,7 +132,8 @@ class ApiSyncClient(
             else {
                 val asset=dao.getAsset(item.entityId)?:error("附件 ${item.entityId} 的元数据不存在")
                 val file=asset.localPath?.let(::File)?.takeIf(File::isFile)?:error("附件 ${asset.filename} 缺少本地文件，已阻止不完整同步")
-                execute(s,Request.Builder().url(url).put(file.readBytes().toRequestBody(asset.mimeType.toMediaType())).build()).close()
+                RemoteTransferLimits.requireUploadSize(file.length())
+                execute(s,Request.Builder().url(url).put(file.asRequestBody(asset.mimeType.toMediaType())).build()).close()
             }
         }
         val requestJson=JsonObject().apply{addProperty("workspace_id",s.workspaceId);add("changes",JsonArray().apply{outgoing.forEach{item->add(JsonObject().apply{
@@ -142,18 +145,18 @@ class ApiSyncClient(
         root["conflicts"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val type=item.string("entity_type");val id=item.string("entity_id");val currentVersion=item["current_version"].asLong;dao.deleteApiOutboxById(item.string("operation_id"));dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),currentVersion));pageIdFor(type,id,item["current_payload"]?.asJsonObject)?.let{pageId->recordConflict(pageId,type,item["current_payload"]?.asJsonObject?:JsonObject())}}
     }
 
-    private suspend fun pullAll(s:ApiSyncSettings) {
+    private suspend fun pullAll(s:ApiSyncSettings,downloadBudget:RemoteTransferLimits.Budget) {
         var cursor=dao.apiCursor(s.workspaceId)?:0L
         do {
             val url="${s.baseUrl}/v1/sync/pull?workspace_id=${encoded(s.workspaceId)}&cursor=$cursor&limit=200"
             val root=execute(s,Request.Builder().url(url).get().build()).use{JsonParser.parseString(it.body?.string().orEmpty()).asJsonObject}
-            root["changes"].asJsonArray.forEach{applyChange(s,it.asJsonObject)}
+            root["changes"].asJsonArray.forEach{applyChange(s,it.asJsonObject,downloadBudget)}
             cursor=root["cursor"].asLong;dao.putApiCursor(ApiSyncCursorEntity(s.workspaceId,cursor))
             val more=root["has_more"].asBoolean
         } while(more)
     }
 
-    private suspend fun applyChange(s:ApiSyncSettings,change:JsonObject) {
+    private suspend fun applyChange(s:ApiSyncSettings,change:JsonObject,downloadBudget:RemoteTransferLimits.Budget) {
         val type=change.string("entity_type");val id=change.string("entity_id");val version=change["version"].asLong;val operation=change.string("operation");val payload=change["payload"].asJsonObject
         val pending=dao.apiOutboxItem(type,id);val affectedPage=pageIdFor(type,id,payload);val locallyDirty=affectedPage?.let{dao.get(it)?.dirty}==true
         if((pending!=null&&version>pending.expectedVersion)||locallyDirty){
@@ -168,7 +171,7 @@ class ApiSyncClient(
             "document"->applyDocument(id,payload)
             "page_tag"->applyPageTag(payload,true)
             "task_step"->dao.putStep(TodoStepEntity(id,payload.string("pageId"),payload.string("text"),payload.boolean("checked"),payload.integer("sortOrder"),payload.millis("createdAt")))
-            "asset"->applyAsset(s,id,payload)
+            "asset"->applyAsset(s,id,payload,downloadBudget)
             "reading_position"->dao.putReadingPosition(ReadingPositionEntity(payload.string("pageId"),payload.integer("anchorUtf16Offset"),payload.double("viewportOffsetFraction"),payload.millis("updatedAt"),payload.string("deviceId")))
         }
         dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),version))
@@ -187,8 +190,40 @@ class ApiSyncClient(
     }
 
     private suspend fun applyPageTag(p:JsonObject,add:Boolean) {val pageId=p.string("pageId");val tagId=p.string("tagId");dao.get(pageId)?.let{note->val ids=note.tagIds.split(',').filter(String::isNotBlank).toMutableSet();if(add)ids+=tagId else ids-=tagId;dao.put(note.copy(tagIds=ids.joinToString(",")))}}
-    private suspend fun applyAsset(s:ApiSyncSettings,id:String,p:JsonObject) {
-        val response=execute(s,Request.Builder().url(assetUrl(s,id)).get().build());val bytes=response.use{it.body?.bytes()?:error("附件 $id 下载为空")};val filename=p.string("filename","attachment").replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_");val relative="next/$id/$filename";val target=File(context.filesDir,"attachments/$relative");target.parentFile?.mkdirs();val temp=File(target.parentFile,"${target.name}.download");temp.writeBytes(bytes);if(!temp.renameTo(target)){temp.copyTo(target,true);temp.delete()};dao.putAssets(listOf(AssetEntity(id,p.string("pageId"),p.string("kind","file"),filename,p.string("mimeType","application/octet-stream"),relative,target.absolutePath,p.optionalString("checksum")?:sha(bytes),bytes.size.toLong(),false)))
+    private suspend fun applyAsset(s:ApiSyncSettings,id:String,p:JsonObject,downloadBudget:RemoteTransferLimits.Budget) {
+        val filename=p.string("filename","attachment").replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_")
+        val relative="next/$id/$filename"
+        val target=File(context.filesDir,"attachments/$relative")
+        target.parentFile?.mkdirs()
+        val temp=File(target.parentFile,"${target.name}.download")
+        val digest=MessageDigest.getInstance("SHA-256")
+        var fileBytes=0L
+        try {
+            execute(s,Request.Builder().url(assetUrl(s,id)).get().build()).use{response->
+                val body=response.body?:error("附件 $id 下载为空")
+                body.contentLength().takeIf{it>=0}?.let{RemoteTransferLimits.requireDownloadSize(it)}
+                body.byteStream().use{input->temp.outputStream().use{output->
+                    val buffer=ByteArray(1024*1024)
+                    while(true){
+                        val count=input.read(buffer)
+                        if(count<0)break
+                        fileBytes+=count
+                        downloadBudget.consume(fileBytes,count.toLong())
+                        digest.update(buffer,0,count)
+                        output.write(buffer,0,count)
+                    }
+                }}
+            }
+            val actualHash=digest.digest().joinToString(""){"%02x".format(it)}
+            p.optionalString("checksum")?.takeIf{it.isNotBlank()}?.let{expected->
+                require(expected.equals(actualHash,ignoreCase=true)){"附件 $id 的 SHA-256 校验失败"}
+            }
+            if(!temp.renameTo(target)){temp.copyTo(target,true);temp.delete()}
+            dao.putAssets(listOf(AssetEntity(id,p.string("pageId"),p.string("kind","file"),filename,p.string("mimeType","application/octet-stream"),relative,target.absolutePath,actualHash,fileBytes,false)))
+        } catch(error:Throwable) {
+            temp.delete()
+            throw error
+        }
     }
 
     private suspend fun recordConflict(pageId:String,type:String,payload:JsonObject){dao.get(pageId)?.let{note->

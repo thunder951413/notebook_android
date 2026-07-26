@@ -29,6 +29,8 @@ class ProtocolTest {
         val budget=RemoteTransferLimits.Budget()
         budget.consume(RemoteTransferLimits.MAX_FILE_BYTES,RemoteTransferLimits.MAX_FILE_BYTES)
         assertThrows(IllegalArgumentException::class.java){budget.consume(RemoteTransferLimits.MAX_FILE_BYTES+1,1)}
+        assertThrows(IllegalArgumentException::class.java){RemoteTransferLimits.requireUploadSize(RemoteTransferLimits.MAX_FILE_BYTES+1)}
+        assertThrows(IllegalArgumentException::class.java){RemoteTransferLimits.requireDownloadSize(RemoteTransferLimits.MAX_FILE_BYTES+1)}
         repeat(4){budget.consume(RemoteTransferLimits.MAX_FILE_BYTES,RemoteTransferLimits.MAX_FILE_BYTES)}
         assertThrows(IllegalArgumentException::class.java){budget.consume(13L*1024*1024,13L*1024*1024)}
     }

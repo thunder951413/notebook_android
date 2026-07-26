@@ -78,6 +78,20 @@ class ApiSyncTest {
         assertTrue(conflicts.has("page"));assertTrue(conflicts.has("document"));assertTrue(database.dao().apiOutbox(workspace).isEmpty())
     }
 
+    @Test fun `asset pull verifies checksum and removes partial download`()=runBlocking {
+        database.dao().put(NoteEntity(id="page",dirty=false))
+        server.enqueue(json("""{"cursor":1,"has_more":false,"changes":[
+          {"cursor":1,"entity_type":"asset","entity_id":"bad-hash","version":1,"operation":"upsert","payload":{"id":"bad-hash","pageId":"page","kind":"file","filename":"asset.bin","mimeType":"application/octet-stream","checksum":"${"0".repeat(64)}"}}
+        ]}"""))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("actual bytes"))
+        val error=runCatching{ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())}.exceptionOrNull()
+        assertNotNull(error)
+        assertTrue(error!!.message.orEmpty().contains("SHA-256"))
+        assertNull(database.dao().getAsset("bad-hash"))
+        val partial=java.io.File(ApplicationProvider.getApplicationContext<Context>().filesDir,"attachments/next/bad-hash/asset.bin.download")
+        assertFalse(partial.exists())
+    }
+
     private fun settings()=ApiSyncSettings(server.url("/").toString().trimEnd('/'),workspace,"")
     private fun json(body:String)=MockResponse().setResponseCode(200).setHeader("Content-Type","application/json").setBody(body)
 }
