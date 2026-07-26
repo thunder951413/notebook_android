@@ -69,6 +69,23 @@ class SyncContractFixtureTest {
         assertEquals(.25,decoded.viewportOffsetFraction,0.0001)
     }
 
+    @Test fun `index timestamps and publisher IDs do not create a remote change`() {
+        val remote=JsonParser.parseString("""{
+          "generatedAt":"2026-07-25T01:00:00Z",
+          "deviceID":"electron",
+          "repositoryFormat":{"version":3},
+          "entries":[{"noteID":"a","version":1,"contentHash":"hash"}],
+          "deletedEntries":[]
+        }""").asJsonObject
+        val next=remote.deepCopy().apply {
+            addProperty("generatedAt","2026-07-25T01:01:00Z")
+            addProperty("deviceID","android")
+        }
+        assertTrue(RepositoryIndexContract.hasSameContent(remote,next))
+        next["entries"].asJsonArray[0].asJsonObject.addProperty("version",2)
+        assertFalse(RepositoryIndexContract.hasSameContent(remote,next))
+    }
+
     private fun fixtureObject(name:String):JsonObject=JsonParser.parseString(fixtureBytes(name).toString(Charsets.UTF_8)).asJsonObject
     private fun fixtureBytes(name:String)=checkNotNull(javaClass.classLoader?.getResourceAsStream("sync-contract/$name")){"Missing fixture $name"}.use{it.readBytes()}
     private fun sha256(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}

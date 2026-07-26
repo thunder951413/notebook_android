@@ -45,6 +45,7 @@ import javax.crypto.spec.SecretKeySpec
 data class SshSettings(val host:String,val port:Int,val username:String,val password:String,val path:String,val fingerprint:String="")
 enum class SyncBackend { API, SSH }
 class HostKeyChangedException(val expected:String,val actual:String):Exception("服务器身份已变化，请确认新的主机指纹")
+class HostKeyConfirmationRequiredException(val actual:String):Exception("首次连接需要确认服务器主机指纹")
 enum class NoteSaveState { Pending, Saving, Saved, Failed }
 data class NoteRevisionSummary(val id:String,val createdAt:Long,val reason:String,val markdown:String,val pageIcon:String?)
 
@@ -63,9 +64,65 @@ internal object CompressedRepositoryContract {
     fun enabled(index:JsonObject?)=index?.get("repositoryFormat")?.takeIf{it.isJsonObject}?.asJsonObject?.let{
         it["version"]?.asInt in setOf(2,VERSION)&&it["noteEncoding"]?.asString=="gzip"
     }==true
-    fun notePath(root:String,noteID:String,index:JsonObject?)="$root/notes/$noteID.json${if(enabled(index))".gz" else ""}"
+    fun notePath(root:String,noteID:String,index:JsonObject?):String {
+        RepositoryIdentityContract.requireNoteID(noteID)
+        return "$root/notes/$noteID.json${if(enabled(index))".gz" else ""}"
+    }
     fun encode(text:String):ByteArray=ByteArrayOutputStream().also{output->GZIPOutputStream(output).use{it.write(text.toByteArray(StandardCharsets.UTF_8))}}.toByteArray()
-    fun decode(bytes:ByteArray):String=GZIPInputStream(ByteArrayInputStream(bytes)).use{String(it.readBytes(),StandardCharsets.UTF_8)}
+    fun decode(bytes:ByteArray,maxOutputBytes:Long=RemoteTransferLimits.MAX_FILE_BYTES):String=
+        GZIPInputStream(ByteArrayInputStream(bytes)).use{input->
+            val output=ByteArrayOutputStream()
+            val buffer=ByteArray(64*1024)
+            var total=0L
+            while(true){
+                val count=input.read(buffer)
+                if(count<0)break
+                total+=count
+                require(total<=maxOutputBytes){"压缩笔记解压后超过 ${RemoteTransferLimits.MAX_FILE_MIB} MiB，已停止同步"}
+                output.write(buffer,0,count)
+            }
+            output.toString(StandardCharsets.UTF_8.name())
+        }
+}
+
+internal object RepositoryIdentityContract {
+    private val UUID_PATTERN=Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",RegexOption.IGNORE_CASE)
+    fun isValidNoteID(noteID:String)=UUID_PATTERN.matches(noteID)
+    fun requireNoteID(noteID:String):String {
+        require(isValidNoteID(noteID)){"远端索引包含非法笔记 ID，已停止同步"}
+        return noteID
+    }
+}
+
+internal object RemoteTransferLimits {
+    const val MAX_FILE_MIB=100L
+    const val MAX_REPOSITORY_MIB=512L
+    const val MAX_FILE_BYTES=MAX_FILE_MIB*1024*1024
+    const val MAX_REPOSITORY_BYTES=MAX_REPOSITORY_MIB*1024*1024
+
+    class Budget {
+        var consumedBytes=0L
+            private set
+        fun consume(fileBytes:Long,totalBytes:Long) {
+            require(fileBytes<=MAX_FILE_BYTES){"远端单个文件超过 $MAX_FILE_MIB MiB，已停止同步"}
+            require(consumedBytes+totalBytes<=MAX_REPOSITORY_BYTES){"本次远端读取超过 $MAX_REPOSITORY_MIB MiB，已停止同步"}
+            consumedBytes+=totalBytes
+        }
+    }
+
+    fun requireUploadSize(size:Long){
+        require(size<=MAX_FILE_BYTES){"单个上传文件超过 $MAX_FILE_MIB MiB，已停止同步"}
+    }
+}
+
+internal object RepositoryIndexContract {
+    private fun stableContent(index:JsonObject)=index.deepCopy().apply {
+        remove("generatedAt")
+        remove("deviceID")
+    }
+    fun hasSameContent(remote:JsonObject?,next:JsonObject)=remote!=null&&stableContent(remote)==stableContent(next)
+    fun snapshotHash(bytes:ByteArray?)=bytes?.let{MessageDigest.getInstance("SHA-256").digest(it).joinToString(""){byte->"%02x".format(byte)}}?:"missing"
+    fun hasSameSnapshot(expected:ByteArray?,current:ByteArray?)=snapshotHash(expected)==snapshotHash(current)
 }
 
 /** Keeps the shared macOS/Web note history intact when Android publishes an edit. */
@@ -115,6 +172,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private val appScope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
     private val saveMutex=Mutex()
     private val syncMutex=Mutex()
+    private var remoteReadBudget:RemoteTransferLimits.Budget?=null
+    private val privacyIterations=310_000
     private val pendingDrafts=ConcurrentHashMap<String,NoteEntity>()
     private val draftJobs=ConcurrentHashMap<String,Job>()
     private val trashedNoteIds=ConcurrentHashMap.newKeySet<String>()
@@ -282,34 +341,48 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         flushAll()
         if(syncBackend()==SyncBackend.API){apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());return@withContext}
         val s=settings(); require(s.host.isNotBlank()&&s.username.isNotBlank()){ "请先配置 SSH 服务器" }
-        val verifier=s.fingerprint.takeIf{it.isNotBlank()}?.let{FingerprintHostKeyRepository(s.host,it)}
-        val jsch=JSch().apply{verifier?.let{hostKeyRepository=it}}
+        val verifier=FingerprintHostKeyRepository(s.host,s.fingerprint)
+        val jsch=JSch().apply{hostKeyRepository=verifier}
         val session=jsch.getSession(s.username,s.host,s.port).apply{
             setPassword(s.password)
             // Android runtimes do not consistently expose an Ed25519 provider.
             // Prefer the broadly supported ECDSA host key, then fall back to the
             // remaining modern algorithms. The exact negotiated key is pinned.
-            setConfig("server_host_key","ecdsa-sha2-nistp256,ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ssh-rsa")
-            setConfig("StrictHostKeyChecking",if(verifier!=null)"yes" else "no")
+            setConfig("server_host_key","ecdsa-sha2-nistp256,ssh-ed25519,rsa-sha2-512,rsa-sha2-256")
+            setConfig("StrictHostKeyChecking","yes")
+            setServerAliveInterval(15_000)
+            setServerAliveCountMax(3)
+            setTimeout(30_000)
         }
-        try{session.connect(15_000)}catch(error:com.jcraft.jsch.JSchException){verifier?.presentedFingerprint?.takeIf{it!=s.fingerprint}?.let{throw HostKeyChangedException(s.fingerprint,it)};throw error}
-        if(s.fingerprint.isBlank())saveSettings(s.copy(fingerprint=sshSha256Fingerprint(java.util.Base64.getDecoder().decode(session.hostKey.key))))
+        try{session.connect(15_000)}catch(error:com.jcraft.jsch.JSchException){
+            verifier.presentedFingerprint?.takeIf{it!=s.fingerprint}?.let{
+                if(s.fingerprint.isBlank())throw HostKeyConfirmationRequiredException(it)
+                throw HostKeyChangedException(s.fingerprint,it)
+            }
+            throw error
+        }
         val ch=(session.openChannel("sftp") as ChannelSftp).apply{connect(15_000)}
         val resolved=s.copy(path=resolveRemoteRepositoryPath(s.path,ch.home))
+        remoteReadBudget=RemoteTransferLimits.Budget()
         try {
             mkdirs(ch,resolved.path);mkdirs(ch,"${resolved.path}/notes");mkdirs(ch,"${resolved.path}/attachments")
             withRemoteRepositoryWriteLock(ch,resolved){lock->
                 verifyPrivacyKeyCheck(ch,resolved)
-                pullLibrary(ch,resolved);pullNotes(ch,resolved);pullAssets(ch,resolved);syncReadingPositions(ch,resolved)
+                val indexPath="${resolved.path}/notes/index.json"
+                val initialIndexBytes=readRemoteBytesOrNull(ch,indexPath)
+                val initialIndex=initialIndexBytes?.let(::parseJsonObject)
+                pullLibrary(ch,resolved);pullNotes(ch,resolved,initialIndex);pullAssets(ch,resolved);syncReadingPositions(ch,resolved)
                 refreshRemoteRepositoryWriteLock(ch,lock)
                 // Assets and metadata must exist before note JSON and index.json publish references to them.
-                pushLibrary(ch,resolved);pushAssets(ch,resolved)
+                pushLibrary(ch,resolved);pushAssets(ch,resolved,initialIndex)
                 refreshRemoteRepositoryWriteLock(ch,lock)
                 ensurePrivacyKeyCheck(ch,resolved)
-                pushNotes(ch,resolved)
+                val currentIndexBytes=readRemoteBytesOrNull(ch,indexPath)
+                require(RepositoryIndexContract.hasSameSnapshot(initialIndexBytes,currentIndexBytes)){"远端索引在同步期间已变化，请重新同步"}
+                pushNotes(ch,resolved,currentIndexBytes?.let(::parseJsonObject))
                 Reminders.reconcile(appContext,dao.reminders())
             }
-        } finally { ch.disconnect();session.disconnect() }
+        } finally { remoteReadBudget=null;ch.disconnect();session.disconnect() }
     }}
 
     private suspend fun pullLibrary(c:ChannelSftp,s:SshSettings){
@@ -327,14 +400,18 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         root["deletedFolders"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{e->val x=e.asJsonObject;val id=x.str("id");val at=x.dateMs("deletedAt");if((dao.getFolder(id)?.updatedAt?:0)<=at){dao.deleteFolder(id);dao.putTombstone(TombstoneEntity("folder|$id",id,"folder",at,x.str("deletedByDeviceID")))}}
         root["deletedTags"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{e->val x=e.asJsonObject;val id=x.str("id");val at=x.dateMs("deletedAt");if((dao.getTag(id)?.updatedAt?:0)<=at){dao.deleteTag(id);dao.putTombstone(TombstoneEntity("tag|$id",id,"tag",at,x.str("deletedByDeviceID")))}}
     }
-    private suspend fun pullNotes(c:ChannelSftp,s:SshSettings){
-        val idx=readJson(c,"${s.path}/notes/index.json")?:return
-        idx["deletedEntries"]?.asJsonArray?.forEach { entry ->
-            val deletion=entry.asJsonObject; val id=deletion.str("noteID"); val deletedAt=deletion.flexibleDateMs("deletedAt")
+    private suspend fun pullNotes(c:ChannelSftp,s:SshSettings,idx:JsonObject?){
+        if(idx==null)return
+        val deletions=idx["deletedEntries"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{entry->
+            entry.asJsonObject.also{RepositoryIdentityContract.requireNoteID(it.str("noteID"))}
+        }.orEmpty()
+        val entries=normalizedIndexEntries(idx)
+        deletions.forEach { deletion ->
+            val id=deletion.str("noteID"); val deletedAt=deletion.flexibleDateMs("deletedAt")
             val local=loadEditable(id)
             if(local!=null && (!local.dirty || deletedAt>=local.updatedAt)){val deleted=local.copy(deletedAt=deletedAt,dirty=false);dao.put(deleted);indexReferences(deleted)}
         }
-        normalizedIndexEntries(idx).forEach { entry ->
+        entries.forEach { entry ->
             val e=entry;val id=e.str("noteID");val remoteVersion=e["version"].asLong;val local=loadEditable(id)
             if(local==null||(!local.dirty&&remoteVersion>local.version)) readNoteJson(c,s,id,idx)?.let{env->validateMarkdownEnvelope(env,e.str("contentHash"));val decoded=decodeEnvelope(env);dao.put(decoded);indexReferences(decoded);dao.putAssets(decodedAssets(env));decodedSteps(env).forEach{dao.putStep(it)}}
             else if(local.dirty&&remoteVersion>local.lastSyncedVersion) readNoteJson(c,s,id,idx)?.let{remote->
@@ -359,10 +436,10 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private suspend fun pullAssets(c:ChannelSftp,s:SshSettings){
         val manifest=readJson(c,"${s.path}/notes/assets_manifest.json")?:return
         val known=dao.allNoteIds().flatMap{dao.assets(it)}.associateBy{it.relativePath}
-        manifest["entries"]?.asJsonArray?.forEach{raw->val e=raw.asJsonObject;val relative=safeRelative(e.str("relativePath"));val expected=e.str("contentHash");val asset=known[relative]?:return@forEach;val target=java.io.File(appContext.filesDir,"attachments/$relative");if(!target.exists()||target.inputStream().use(::sha)!=expected){target.parentFile?.mkdirs();val tmp=java.io.File(target.parentFile,"${target.name}.download");val remotePath=if(relative.startsWith("objects/"))"${s.path}/$relative" else "${s.path}/attachments/$relative";tmp.outputStream().use{c.get(remotePath,it)};require(tmp.inputStream().use(::sha)==expected){"附件校验失败：$relative"};if(!tmp.renameTo(target)){tmp.copyTo(target,true);tmp.delete()};dao.putAssets(listOf(asset.copy(localPath=target.absolutePath,contentHash=expected,size=target.length(),dirty=false)))}}
+        manifest["entries"]?.asJsonArray?.forEach{raw->val e=raw.asJsonObject;val relative=safeRelative(e.str("relativePath"));val expected=e.str("contentHash");val asset=known[relative]?:return@forEach;val target=java.io.File(appContext.filesDir,"attachments/$relative");if(!target.exists()||target.inputStream().use(::sha)!=expected){target.parentFile?.mkdirs();val tmp=java.io.File(target.parentFile,"${target.name}.download");val remotePath=if(relative.startsWith("objects/"))"${s.path}/$relative" else "${s.path}/attachments/$relative";try{downloadRemoteFile(c,remotePath,tmp);require(tmp.inputStream().use(::sha)==expected){"附件校验失败：$relative"};if(!tmp.renameTo(target)){tmp.copyTo(target,true);tmp.delete()}}catch(error:Throwable){tmp.delete();throw error};dao.putAssets(listOf(asset.copy(localPath=target.absolutePath,contentHash=expected,size=target.length(),dirty=false)))}}
     }
-    private suspend fun pushAssets(c:ChannelSftp,s:SshSettings){
-        val remote=readJson(c,"${s.path}/notes/assets_manifest.json");val index=readJson(c,"${s.path}/notes/index.json");val contentAddressed=CompressedRepositoryContract.version(index)==3;val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("relativePath")]=it.asJsonObject.deepCopy()}
+    private suspend fun pushAssets(c:ChannelSftp,s:SshSettings,index:JsonObject?){
+        val remote=readJson(c,"${s.path}/notes/assets_manifest.json");val contentAddressed=CompressedRepositoryContract.version(index)==3;val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("relativePath")]=it.asJsonObject.deepCopy()}
         val confirmed=mutableListOf<AssetEntity>();dao.dirtyAssets().forEach{a->val file=a.localPath?.let{path->java.io.File(path)}?.takeIf{it.isFile}?:error("本地附件文件缺失，已取消远程发布");val hash=file.inputStream().use(::sha);val relative=if(contentAddressed)"objects/${hash.take(2)}/$hash" else safeRelative(a.relativePath);val target=if(contentAddressed)"${s.path}/$relative" else "${s.path}/attachments/$relative";mkdirs(c,target.substringBeforeLast('/'));atomicUpload(c,target,file,hash);entries[relative]=JsonObject().apply{addProperty("relativePath",relative);addProperty("contentHash",hash);addProperty("size",file.length())};confirmed+=a.copy(relativePath=relative,contentHash=hash,size=file.length(),dirty=false)}
         val manifest=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)})};atomicWrite(c,"${s.path}/notes/assets_manifest.json",gson.toJson(manifest))
         if(confirmed.isNotEmpty())dao.putAssets(confirmed)
@@ -444,20 +521,25 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         c.rmdir(lock.path)
     }
     private fun readRemoteLockOwner(c:ChannelSftp,lock:RemoteRepositoryWriteLock):String?=runCatching{
-        val output=ByteArrayOutputStream();c.get(lock.ownerPath,output);String(output.toByteArray(),StandardCharsets.UTF_8).trim()
+        val bytes=readRemoteBytesOrNull(c,lock.ownerPath)?:return@runCatching null
+        require(bytes.size<=4*1024){"远端同步锁文件异常"}
+        String(bytes,StandardCharsets.UTF_8).trim()
     }.getOrNull()
-    private suspend fun pushNotes(c:ChannelSftp,s:SshSettings){
-        val remote=readJson(c,"${s.path}/notes/index.json")
+    private suspend fun pushNotes(c:ChannelSftp,s:SshSettings,remote:JsonObject?){
         val compressed=CompressedRepositoryContract.enabled(remote)
         val entries=linkedMapOf<String,JsonObject>();normalizedIndexEntries(remote).forEach{entries[it.str("noteID")]=it.deepCopy()}
-        val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{deleted[it.asJsonObject.str("noteID")]=it.asJsonObject.deepCopy()}
-        dao.tombstones().filter{it.itemType=="note"}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
+        val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{val id=RepositoryIdentityContract.requireNoteID(it.asJsonObject.str("noteID"));deleted[id]=it.asJsonObject.deepCopy()}
+        dao.tombstones().filter{it.itemType=="note"}.forEach{t->RepositoryIdentityContract.requireNoteID(t.itemId);deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Triple<String,Long,String?>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=Triple(n.id,n.version,null)}
             else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);val stored=if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())encryptPrivacyEnvelope(env,s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
         }
         val idx=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)});add("deletedEntries",JsonArray().apply{deleted.values.forEach(::add)});remote?.get("repositoryFormat")?.takeIf{it.isJsonObject}?.let{add("repositoryFormat",it.deepCopy())}}
-        atomicWrite(c,"${s.path}/notes/index.json",gson.toJson(idx))
+        // A freshly configured device often has no local changes after pulling.
+        // Do not rewrite an otherwise identical index merely to change its
+        // timestamp/device ID: that creates avoidable optimistic-lock retries
+        // for Electron clients syncing at the same time.
+        if(!RepositoryIndexContract.hasSameContent(remote,idx))atomicWrite(c,"${s.path}/notes/index.json",gson.toJson(idx))
         confirmed.forEach{(id,version,snapshot)->dao.markSynced(id,version,snapshot)}
     }
     private suspend fun toMarkdownEnvelope(n:NoteEntity,previous:JsonObject?):JsonObject {
@@ -516,11 +598,65 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private fun fromEnvelope(o:JsonObject):NoteEntity{val s=o["currentSnapshot"].asJsonObject;val m=s["metadata"].asJsonObject;val body=BlockDocumentCodec.decodeMarkdown(s["document"].asJsonObject["blocks"].asJsonArray);val version=m["version"].asLong;val viewMode=m.str("viewMode","preview").takeIf{it in setOf("text","preview","split")}?:"preview";return NoteEntity(id=m.str("id"),title=m.str("title"),body=body,previewText=previewText(body),createdAt=m.dateMs("createdAt"),updatedAt=m.dateMs("updatedAt"),folderId=m.optStr("folderID"),folderName=m.str("folderName","未分类"),icon=m.optStr("icon"),reminderAt=m.optDateMs("reminderAt"),recurrence=m.str("recurrenceRule","none"),version=version,tagIds=m["tagIDs"]?.asJsonArray?.joinToString(","){it.asString}.orEmpty(),deletedAt=m.optDateMs("deletedAt"),itemType=m.str("itemType","note"),dueAt=m.optDateMs("todoDueAt"),completedAt=m.optDateMs("todoCompletedAt"),important=m["todoIsImportant"]?.asBoolean?:false,viewMode=viewMode,dirty=false,snapshotJson=gson.toJson(s),lastSyncedVersion=version)}
     private fun assetsFromEnvelope(o:JsonObject):List<AssetEntity>{val noteId=o.str("noteID");return o["currentSnapshot"].asJsonObject["assets"]?.asJsonArray?.mapNotNull{raw->val a=raw.asJsonObject;val ref=a["reference"]?.asJsonObject?:return@mapNotNull null;val relative=runCatching{safeRelative(a.str("relativeFilePath"))}.getOrNull()?:return@mapNotNull null;AssetEntity(ref.str("id"),noteId,ref.str("kind"),ref.str("filename"),ref.str("mimeType"),relative)}.orEmpty()}
     private fun stepsFromEnvelope(o:JsonObject):List<TodoStepEntity>{val s=o["currentSnapshot"].asJsonObject;return s["todoSteps"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{raw->val x=raw.asJsonObject;TodoStepEntity(x.str("id"),x.str("noteID"),x.str("text"),x["checked"]?.asBoolean?:false,x.int("order"),x.dateMs("createdAt"))}.orEmpty()}
-    private fun readJson(c:ChannelSftp,p:String)=try{val out=ByteArrayOutputStream();c.get(p,out);JsonParser.parseString(out.toString("UTF-8")).asJsonObject}catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
-    private fun readNoteJson(c:ChannelSftp,s:SshSettings,noteID:String,index:JsonObject?)=try{val out=ByteArrayOutputStream();c.get(CompressedRepositoryContract.notePath(s.path,noteID,index),out);val text=if(CompressedRepositoryContract.enabled(index))CompressedRepositoryContract.decode(out.toByteArray())else out.toString("UTF-8");decryptPrivacyEnvelope(JsonParser.parseString(text).asJsonObject,s.password)}catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
+    private fun parseJsonObject(bytes:ByteArray)=JsonParser.parseString(String(bytes,StandardCharsets.UTF_8)).asJsonObject
+    private fun readJson(c:ChannelSftp,p:String)=readRemoteBytesOrNull(c,p)?.let(::parseJsonObject)
+    private fun readNoteJson(c:ChannelSftp,s:SshSettings,noteID:String,index:JsonObject?)=readRemoteBytesOrNull(c,CompressedRepositoryContract.notePath(s.path,noteID,index))?.let{bytes->
+        val text=if(CompressedRepositoryContract.enabled(index))CompressedRepositoryContract.decode(bytes)else String(bytes,StandardCharsets.UTF_8)
+        decryptPrivacyEnvelope(JsonParser.parseString(text).asJsonObject,s.password).also{decoded->
+            RepositoryIdentityContract.requireNoteID(decoded.str("noteID"))
+            require(decoded.str("noteID")==noteID){"远端笔记内容与索引 ID 不一致，已停止同步"}
+            val metadataID=if(decoded["schemaVersion"]?.asInt==3)decoded["metadata"]?.asJsonObject?.str("id")
+                else decoded["currentSnapshot"]?.asJsonObject?.get("metadata")?.asJsonObject?.str("id")
+            require(metadataID==noteID){"远端笔记元数据与索引 ID 不一致，已停止同步"}
+        }
+    }
+    private fun readRemoteBytesOrNull(c:ChannelSftp,p:String):ByteArray?=try{
+        c.get(p).use{input->
+            val output=ByteArrayOutputStream()
+            val buffer=ByteArray(64*1024)
+            var fileBytes=0L
+            while(true){
+                val count=input.read(buffer)
+                if(count<0)break
+                fileBytes+=count
+                remoteReadBudget?.consume(fileBytes,count.toLong())
+                if(remoteReadBudget==null)require(fileBytes<=RemoteTransferLimits.MAX_FILE_BYTES){"远端单个文件超过 ${RemoteTransferLimits.MAX_FILE_MIB} MiB，已停止同步"}
+                output.write(buffer,0,count)
+            }
+            output.toByteArray()
+        }
+    }catch(error:SftpException){if(error.id==ChannelSftp.SSH_FX_NO_SUCH_FILE)null else throw error}
+    private fun downloadRemoteFile(c:ChannelSftp,p:String,target:java.io.File){
+        c.get(p).use{input->target.outputStream().use{output->
+            val buffer=ByteArray(1024*1024)
+            var fileBytes=0L
+            while(true){
+                val count=input.read(buffer)
+                if(count<0)break
+                fileBytes+=count
+                remoteReadBudget?.consume(fileBytes,count.toLong())
+                if(remoteReadBudget==null)require(fileBytes<=RemoteTransferLimits.MAX_FILE_BYTES){"远端单个文件超过 ${RemoteTransferLimits.MAX_FILE_MIB} MiB，已停止同步"}
+                output.write(buffer,0,count)
+            }
+        }}
+    }
     private fun atomicWrite(c:ChannelSftp,p:String,text:String)=atomicWrite(c,p,text.toByteArray(StandardCharsets.UTF_8))
-    private fun atomicWrite(c:ChannelSftp,p:String,bytes:ByteArray){val tmp="$p.tmp.android.${UUID.randomUUID()}";try{c.put(ByteArrayInputStream(bytes),tmp);val remote=ByteArrayOutputStream();c.get(tmp,remote);require(sha(remote.toByteArray())==sha(bytes)){"远端临时文件校验失败：$p"};c.rename(tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
-    private fun atomicUpload(c:ChannelSftp,p:String,file:java.io.File,expectedHash:String){val tmp="$p.tmp.android.${UUID.randomUUID()}";try{file.inputStream().use{c.put(it,tmp)};val remoteHash=c.get(tmp).use(::sha);require(remoteHash==expectedHash){"远端附件临时文件校验失败"};c.rename(tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
+    private fun atomicWrite(c:ChannelSftp,p:String,bytes:ByteArray){RemoteTransferLimits.requireUploadSize(bytes.size.toLong());val tmp="$p.tmp.android.${UUID.randomUUID()}";try{c.put(ByteArrayInputStream(bytes),tmp);val remote=readRemoteBytesOrNull(c,tmp)?:error("远端临时文件不存在：$p");require(sha(remote)==sha(bytes)){"远端临时文件校验失败：$p"};replaceRemoteFile(c,tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
+    private fun atomicUpload(c:ChannelSftp,p:String,file:java.io.File,expectedHash:String){RemoteTransferLimits.requireUploadSize(file.length());val tmp="$p.tmp.android.${UUID.randomUUID()}";try{file.inputStream().use{c.put(it,tmp)};val remoteHash=c.get(tmp).use(::sha);require(remoteHash==expectedHash){"远端附件临时文件校验失败"};replaceRemoteFile(c,tmp,p)}catch(error:Throwable){runCatching{c.rm(tmp)};throw error}}
+    private fun replaceRemoteFile(c:ChannelSftp,tmp:String,target:String){
+        try{c.rename(tmp,target);return}catch(first:Throwable){
+            val backup="$target.backup.android.${UUID.randomUUID()}"
+            val hadTarget=runCatching{c.rename(target,backup)}.isSuccess
+            try{
+                c.rename(tmp,target)
+                if(hadTarget)runCatching{c.rm(backup)}
+            }catch(second:Throwable){
+                if(hadTarget)runCatching{c.rename(backup,target)}
+                second.addSuppressed(first)
+                throw second
+            }
+        }
+    }
     private fun mkdirs(c:ChannelSftp,path:String){var cur="";path.split('/').filter{it.isNotBlank()}.forEach{cur+="/$it";try{c.mkdir(cur)}catch(_:Exception){}}}
     private fun deviceId()=prefs.getString("device",null)?:UUID.randomUUID().toString().also{prefs.edit().putString("device",it).apply()}
     private fun iso(ms:Long)=Instant.ofEpochMilli(ms).toString()
@@ -539,30 +675,30 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     private fun normalizedIndexEntries(index:JsonObject?):List<JsonObject>{
         val entries=linkedMapOf<String,JsonObject>()
-        index?.get("entries")?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val candidate=raw.asJsonObject;val id=candidate.str("noteID");if(id.isBlank())return@forEach;val current=entries[id];val version=candidate["version"]?.asLong?:0;val currentVersion=current?.get("version")?.asLong?:0;if(current==null||version>currentVersion||(version==currentVersion&&candidate.toString()>current.toString()))entries[id]=candidate}
+        index?.get("entries")?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val candidate=raw.asJsonObject;val id=RepositoryIdentityContract.requireNoteID(candidate.str("noteID"));val current=entries[id];val version=candidate["version"]?.asLong?:0;val currentVersion=current?.get("version")?.asLong?:0;if(current==null||version>currentVersion||(version==currentVersion&&candidate.toString()>current.toString()))entries[id]=candidate}
         return entries.values.sortedBy{it.str("noteID")}
     }
     private fun privacyKey(secret:String,salt:ByteArray,iterations:Int)=SecretKeySpec(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(PBEKeySpec(secret.toCharArray(),salt,iterations,256)).encoded,"AES")
     private val privacyCheckText="notebook-next-private-notes-v1"
     private fun verifyPrivacyKeyCheck(c:ChannelSftp,s:SshSettings){
         val check=readJson(c,"${s.path}/notes/privacy.json")?:return
-        try{val iterations=check["iterations"].asInt;require(check["schemaVersion"].asInt==1&&check.str("algorithm")=="AES-256-GCM"&&check.str("kdf")=="PBKDF2-SHA256"&&iterations==310_000);val salt=Base64.decode(check.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(check.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));require(String(cipher.doFinal(Base64.decode(check.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)==privacyCheckText)}catch(error:Throwable){throw IllegalStateException("隐私笔记密钥验证失败：SSH 密码与远端仓库不一致，已停止同步且未修改任何笔记",error)}
+        try{val iterations=check["iterations"].asInt;require(check["schemaVersion"].asInt==1&&check.str("algorithm")=="AES-256-GCM"&&check.str("kdf")=="PBKDF2-SHA256"&&iterations==privacyIterations);val salt=Base64.decode(check.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(check.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));require(String(cipher.doFinal(Base64.decode(check.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)==privacyCheckText)}catch(error:Throwable){throw IllegalStateException("隐私笔记密钥验证失败：SSH 密码与远端仓库不一致，已停止同步且未修改任何笔记",error)}
     }
     private fun ensurePrivacyKeyCheck(c:ChannelSftp,s:SshSettings){
         if(encryptedNoteIds().isEmpty()||readJson(c,"${s.path}/notes/privacy.json")!=null)return
-        val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=310_000;val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(privacyCheckText.toByteArray(StandardCharsets.UTF_8))
+        val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=privacyIterations;val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(privacyCheckText.toByteArray(StandardCharsets.UTF_8))
         val check=JsonObject().apply{addProperty("schemaVersion",1);addProperty("algorithm","AES-256-GCM");addProperty("kdf","PBKDF2-SHA256");addProperty("iterations",iterations);addProperty("salt",Base64.encodeToString(salt,Base64.NO_WRAP));addProperty("iv",Base64.encodeToString(iv,Base64.NO_WRAP));addProperty("ciphertext",Base64.encodeToString(encrypted,Base64.NO_WRAP))}
         atomicWrite(c,"${s.path}/notes/privacy.json",gson.toJson(check))
     }
     private fun encryptPrivacyEnvelope(note:JsonObject,secret:String):JsonObject{
-        val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=310_000
+        val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=privacyIterations
         val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(note.str("noteID").toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(gson.toJson(note).toByteArray(StandardCharsets.UTF_8))
         val redacted=note["metadata"].asJsonObject.deepCopy().apply{addProperty("title","隐私笔记");addProperty("preview","");addProperty("locked",true);remove("legacyMetadata")}
         return JsonObject().apply{addProperty("schemaVersion",3);addProperty("noteID",note.str("noteID"));add("metadata",redacted);addProperty("currentContentHash",note.str("currentContentHash"));add("contentObjects",JsonObject());add("history",JsonArray());add("assets",JsonArray());add("taskSteps",JsonArray());add("tagIDs",JsonArray());add("linkedPageIDs",JsonArray());add("privacyEncryption",JsonObject().apply{addProperty("version",1);addProperty("algorithm","AES-256-GCM");addProperty("kdf","PBKDF2-SHA256");addProperty("iterations",iterations);addProperty("salt",Base64.encodeToString(salt,Base64.NO_WRAP));addProperty("iv",Base64.encodeToString(iv,Base64.NO_WRAP));addProperty("ciphertext",Base64.encodeToString(encrypted,Base64.NO_WRAP))})}
     }
     private fun decryptPrivacyEnvelope(stored:JsonObject,secret:String):JsonObject{
         val encryption=stored["privacyEncryption"]?.takeIf{it.isJsonObject}?.asJsonObject?:return stored
-        try{val iterations=encryption["iterations"].asInt;require(encryption.str("algorithm")=="AES-256-GCM"&&encryption.str("kdf")=="PBKDF2-SHA256"&&iterations==310_000);val salt=Base64.decode(encryption.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(encryption.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(stored.str("noteID").toByteArray(StandardCharsets.UTF_8));val decoded=JsonParser.parseString(String(cipher.doFinal(Base64.decode(encryption.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)).asJsonObject;require(decoded.str("noteID")==stored.str("noteID"));return decoded}catch(error:Throwable){throw IllegalStateException("隐私笔记 ${stored.str("noteID")} 解密失败：SSH 密码不一致或远端数据已损坏",error)}
+        try{val iterations=encryption["iterations"].asInt;require(encryption.str("algorithm")=="AES-256-GCM"&&encryption.str("kdf")=="PBKDF2-SHA256"&&iterations==privacyIterations);val salt=Base64.decode(encryption.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(encryption.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(stored.str("noteID").toByteArray(StandardCharsets.UTF_8));val decoded=JsonParser.parseString(String(cipher.doFinal(Base64.decode(encryption.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)).asJsonObject;require(decoded.str("noteID")==stored.str("noteID"));return decoded}catch(error:Throwable){throw IllegalStateException("隐私笔记 ${stored.str("noteID")} 解密失败：SSH 密码不一致或远端数据已损坏",error)}
     }
     private fun safeRelative(path:String):String{val normalized=path.replace('\\','/');require(normalized.isNotBlank()&&!normalized.startsWith('/')&&!normalized.startsWith('~')&&normalized.none{it.isISOControl()}&&!normalized.split('/').any{it==".."||it=="."||it.isBlank()}){"非法附件路径"};return normalized}
     private fun decodeText(bytes:ByteArray):String{

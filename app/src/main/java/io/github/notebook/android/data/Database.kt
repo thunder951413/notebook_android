@@ -4,7 +4,15 @@ import android.content.Context
 import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
-@Entity(tableName = "notes")
+@Entity(
+    tableName = "notes",
+    indices=[
+        Index("folderId"),
+        Index("parentPageId"),
+        Index("deletedAt"),
+        Index("dirty")
+    ]
+)
 data class NoteEntity(
     @PrimaryKey val id: String,
     val title: String = "",
@@ -246,7 +254,7 @@ data class ApiSyncOutboxEntity(
     @Upsert suspend fun putApiCursor(cursor:ApiSyncCursorEntity)
 }
 
-@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=10, exportSchema=false)
+@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=11, exportSchema=true)
 abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
     companion object {
         private val MIGRATION_1_2=object:androidx.room.migration.Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
@@ -302,6 +310,12 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
             db.execSQL("CREATE INDEX IF NOT EXISTS index_page_links_sourceNoteId ON page_links(sourceNoteId)")
             db.execSQL("CREATE INDEX IF NOT EXISTS index_page_links_targetNoteId ON page_links(targetNoteId)")
         }}
-        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10).build()
+        private val MIGRATION_10_11=object:androidx.room.migration.Migration(10,11){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_folderId ON notes(folderId)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_parentPageId ON notes(parentPageId)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_deletedAt ON notes(deletedAt)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_dirty ON notes(dirty)")
+        }}
+        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10,MIGRATION_10_11).build()
     }
 }

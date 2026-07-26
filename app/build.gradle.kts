@@ -26,6 +26,10 @@ android {
     packaging { resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}","META-INF/versions/9/OSGI-INF/MANIFEST.MF") }
 }
 
+ksp {
+    arg("room.schemaLocation","$projectDir/schemas")
+}
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.activity:activity-compose:1.10.0")

@@ -9,10 +9,36 @@ class ProtocolTest {
     @Test fun `compressed repository contract round trips utf8 and selects gzip path`() {
         val index=JsonObject().apply{add("repositoryFormat",JsonObject().apply{addProperty("version",2);addProperty("noteEncoding","gzip")})}
         val text="{\"title\":\"压缩同步\"}"
+        val noteID="123e4567-e89b-42d3-a456-426614174000"
         assertTrue(CompressedRepositoryContract.enabled(index))
-        assertTrue(CompressedRepositoryContract.notePath("/repo","note-id",index).endsWith(".json.gz"))
+        assertTrue(CompressedRepositoryContract.notePath("/repo",noteID,index).endsWith(".json.gz"))
         assertEquals(text,CompressedRepositoryContract.decode(CompressedRepositoryContract.encode(text)))
-        assertEquals("/repo/notes/note-id.json",CompressedRepositoryContract.notePath("/repo","note-id",null))
+        assertEquals("/repo/notes/$noteID.json",CompressedRepositoryContract.notePath("/repo",noteID,null))
+    }
+
+    @Test fun `remote note IDs cannot escape repository paths`() {
+        val valid="123e4567-e89b-42d3-a456-426614174000"
+        assertTrue(RepositoryIdentityContract.isValidNoteID(valid))
+        assertFalse(RepositoryIdentityContract.isValidNoteID("../library"))
+        assertThrows(IllegalArgumentException::class.java){CompressedRepositoryContract.notePath("/repo","../library",null)}
+    }
+
+    @Test fun `compressed notes and repository reads enforce transfer limits`() {
+        val compressed=CompressedRepositoryContract.encode("x".repeat(1_024))
+        assertThrows(IllegalArgumentException::class.java){CompressedRepositoryContract.decode(compressed,100)}
+        val budget=RemoteTransferLimits.Budget()
+        budget.consume(RemoteTransferLimits.MAX_FILE_BYTES,RemoteTransferLimits.MAX_FILE_BYTES)
+        assertThrows(IllegalArgumentException::class.java){budget.consume(RemoteTransferLimits.MAX_FILE_BYTES+1,1)}
+        repeat(4){budget.consume(RemoteTransferLimits.MAX_FILE_BYTES,RemoteTransferLimits.MAX_FILE_BYTES)}
+        assertThrows(IllegalArgumentException::class.java){budget.consume(13L*1024*1024,13L*1024*1024)}
+    }
+
+    @Test fun `index snapshot detects concurrent remote publication`() {
+        val initial="""{"entries":[]}""".toByteArray()
+        assertTrue(RepositoryIndexContract.hasSameSnapshot(initial,initial.copyOf()))
+        assertFalse(RepositoryIndexContract.hasSameSnapshot(initial,"""{"entries":[1]}""".toByteArray()))
+        assertTrue(RepositoryIndexContract.hasSameSnapshot(null,null))
+        assertFalse(RepositoryIndexContract.hasSameSnapshot(null,initial))
     }
     @Test fun `swift date codec round trips milliseconds`() {
         val values=listOf(978307200000L,0L,1_725_000_123_456L)
