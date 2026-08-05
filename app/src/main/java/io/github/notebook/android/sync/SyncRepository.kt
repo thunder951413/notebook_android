@@ -431,7 +431,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
                     val unchangedBaseline=baselineHash==remoteHash||(local.conflict&&legacyVersion==local.lastSyncedVersion&&storedConflictHash==remoteHash)
                     when{
                         remoteHash==sha(local.body)->localWithNewestTree.copy(version=remoteVersion,dirty=false,conflict=false,conflictSnapshotJson=null,snapshotJson=gson.toJson(remote),lastSyncedVersion=remoteVersion).also{dao.put(it);indexReferences(it)}
-                        unchangedBaseline->localWithNewestTree.copy(version=maxOf(local.version,remoteVersion)+1,conflict=false,conflictSnapshotJson=null).also{dao.put(it);indexReferences(it)}
+                        unchangedBaseline->localWithNewestTree.copy(version=maxOf(local.version,remoteVersion)+1,conflict=false,conflictSnapshotJson=null,snapshotJson=gson.toJson(remote)).also{dao.put(it);indexReferences(it)}
                         else->dao.put(localWithNewestTree.copy(conflict=true,conflictSnapshotJson=gson.toJson(remote)))
                     }
                 }else dao.put(local.copy(conflict=true,conflictSnapshotJson=gson.toJson(remote["currentSnapshot"])))
