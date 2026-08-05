@@ -19,8 +19,31 @@ class ProtocolTest {
     @Test fun `remote note IDs cannot escape repository paths`() {
         val valid="123e4567-e89b-42d3-a456-426614174000"
         assertTrue(RepositoryIdentityContract.isValidNoteID(valid))
+        assertTrue(RepositoryIdentityContract.isValidNoteID("123e4567-e89b-82d3-a456-426614174000"))
         assertFalse(RepositoryIdentityContract.isValidNoteID("../library"))
         assertThrows(IllegalArgumentException::class.java){CompressedRepositoryContract.notePath("/repo","../library",null)}
+    }
+
+    @Test fun `legacy invalid index tombstones do not block valid notes and are removed`() {
+        val noteID="123e4567-e89b-42d3-a456-426614174000"
+        val remote=JsonObject().apply{
+            add("entries",com.google.gson.JsonArray().apply{
+                add(entry(noteID,2))
+                add(entry("../library",99))
+            })
+            add("deletedEntries",com.google.gson.JsonArray().apply{
+                add(JsonObject().apply{addProperty("noteID","migration");addProperty("deletedAt",99.0)})
+                add(JsonObject().apply{addProperty("noteID",noteID);addProperty("deletedAt",42.0)})
+                add(JsonObject().apply{addProperty("noteID",noteID);addProperty("deletedAt","2026-07-24T05:49:14.730Z")})
+            })
+        }
+        assertEquals(listOf("migration","../library").sorted(),RepositoryIndexSanitizer.invalidNoteIDs(remote))
+        assertEquals(listOf(noteID),RepositoryIndexSanitizer.entries(remote).map{it["noteID"].asString})
+        assertEquals(listOf(noteID),RepositoryIndexSanitizer.deletions(remote).map{it["noteID"].asString})
+        assertEquals("2026-07-24T05:49:14.730Z",RepositoryIndexSanitizer.deletions(remote).single()["deletedAt"].asString)
+        val cleaned=RemoteIndexMerger.merge(remote,emptyList(),emptyList())
+        assertEquals(listOf(noteID),cleaned["entries"].asJsonArray.map{it.asJsonObject["noteID"].asString})
+        assertEquals(listOf(noteID),cleaned["deletedEntries"].asJsonArray.map{it.asJsonObject["noteID"].asString})
     }
 
     @Test fun `compressed notes and repository reads enforce transfer limits`() {
@@ -48,16 +71,19 @@ class ProtocolTest {
     }
 
     @Test fun `index merge retains unrelated remote entries`() {
-        val remote=JsonObject().apply{add("entries",com.google.gson.JsonArray().apply{add(entry("remote",4))});add("deletedEntries",com.google.gson.JsonArray())}
-        val merged=RemoteIndexMerger.merge(remote,listOf(entry("local",2)),emptyList())
-        assertEquals(setOf("remote","local"),merged["entries"].asJsonArray.map{it.asJsonObject["noteID"].asString}.toSet())
+        val remoteID="123e4567-e89b-42d3-a456-426614174000"
+        val localID="223e4567-e89b-42d3-a456-426614174000"
+        val remote=JsonObject().apply{add("entries",com.google.gson.JsonArray().apply{add(entry(remoteID,4))});add("deletedEntries",com.google.gson.JsonArray())}
+        val merged=RemoteIndexMerger.merge(remote,listOf(entry(localID,2)),emptyList())
+        assertEquals(setOf(remoteID,localID),merged["entries"].asJsonArray.map{it.asJsonObject["noteID"].asString}.toSet())
     }
 
     @Test fun `new deletion wins over entry`() {
-        val remote=JsonObject().apply{add("entries",com.google.gson.JsonArray().apply{add(entry("same",4))});add("deletedEntries",com.google.gson.JsonArray())}
-        val deletion=JsonObject().apply{addProperty("noteID","same");addProperty("deletedAt",99.0);addProperty("deletedByDeviceID","phone")}
+        val noteID="123e4567-e89b-42d3-a456-426614174000"
+        val remote=JsonObject().apply{add("entries",com.google.gson.JsonArray().apply{add(entry(noteID,4))});add("deletedEntries",com.google.gson.JsonArray())}
+        val deletion=JsonObject().apply{addProperty("noteID",noteID);addProperty("deletedAt",99.0);addProperty("deletedByDeviceID","phone")}
         val merged=RemoteIndexMerger.merge(remote,emptyList(),listOf(deletion))
-        assertTrue(merged["entries"].asJsonArray.isEmpty);assertEquals("same",merged["deletedEntries"].asJsonArray[0].asJsonObject["noteID"].asString)
+        assertTrue(merged["entries"].asJsonArray.isEmpty);assertEquals(noteID,merged["deletedEntries"].asJsonArray[0].asJsonObject["noteID"].asString)
     }
 
     @Test fun `ssh fingerprint uses OpenSSH format`() {

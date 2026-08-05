@@ -13,6 +13,29 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class SftpSyncTest {
+    @Test fun existingRepositoryWithLegacyInvalidTombstonesSynchronizesTwice()=runBlocking {
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        val arguments=InstrumentationRegistry.getArguments()
+        val host=arguments.getString("existingSftpHost").orEmpty()
+        val fingerprint=arguments.getString("existingSftpFingerprint").orEmpty()
+        assumeTrue("Existing SFTP repository not configured",host.isNotBlank()&&fingerprint.startsWith("SHA256:"))
+        val app=instrumentation.targetContext.applicationContext as NotebookApp
+        val repo=app.repository
+        repo.saveSettings(SshSettings(
+            host=host,
+            port=arguments.getString("existingSftpPort")?.toIntOrNull()?:22,
+            username=arguments.getString("existingSftpUsername").orEmpty(),
+            password=arguments.getString("existingSftpPassword").orEmpty(),
+            path=arguments.getString("existingSftpPath").orEmpty(),
+            fingerprint=fingerprint,
+        ))
+
+        repo.sync()
+        assertTrue("Expected the real repository to contain notes",app.database.dao().allNoteIds().isNotEmpty())
+        repo.sync()
+        assertFalse(app.database.dao().allNoteIds().any{!io.github.notebook.android.sync.RepositoryIdentityContract.isValidNoteID(it)})
+    }
+
     @Test fun uploadCreatesRemoteEnvelopeAndCleansCommittedVersion()=runBlocking {
         val instrumentation=InstrumentationRegistry.getInstrumentation();val fingerprint=InstrumentationRegistry.getArguments().getString("sftpFingerprint").orEmpty();assumeTrue("SFTP fixture not configured",fingerprint.startsWith("SHA256:"))
         val app=instrumentation.targetContext.applicationContext as NotebookApp;val repo=app.repository

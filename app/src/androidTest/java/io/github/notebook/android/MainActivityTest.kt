@@ -138,6 +138,26 @@ class MainActivityTest {
         rule.onNodeWithTag("body-field").assertTextContains("[[page:$targetId]]")
     }
 
+    @Test fun renderedNotebookLinkNavigatesToTargetPage(){
+        val suffix=System.nanoTime().toString()
+        val targetId="123e4567-e89b-42d3-a456-426614174000"
+        val sourceId="223e4567-e89b-42d3-a456-426614174000"
+        val targetTitle="可点击双链目标-$suffix"
+        val sourceTitle="可点击双链来源-$suffix"
+        val targetBody="双链跳转后的正文-$suffix"
+        val app=rule.activity.application as NotebookApp
+        runBlocking{
+            app.database.dao().put(NoteEntity(targetId,title=targetTitle,body=targetBody))
+            app.database.dao().put(NoteEntity(sourceId,title=sourceTitle,body="[[page:$targetId]]"))
+        }
+        rule.activityRule.scenario.recreate()
+        rule.onNodeWithText(sourceTitle).performClick()
+        rule.waitUntil(5_000){rule.onAllNodesWithText(targetTitle,useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()}
+        rule.onNodeWithText(targetTitle,useUnmergedTree=true).performClick()
+        rule.waitUntil(5_000){rule.onAllNodesWithText(targetBody,useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()}
+        rule.onNodeWithText(targetBody,useUnmergedTree=true).assertIsDisplayed()
+    }
+
     @Test fun backlinksPanelShowsSourcePage(){
         val suffix=System.nanoTime().toString();val targetId="backlink-target-$suffix";val sourceId="backlink-source-$suffix";val targetTitle="被引用-$suffix";val sourceTitle="引用来源-$suffix"
         val app=rule.activity.application as NotebookApp

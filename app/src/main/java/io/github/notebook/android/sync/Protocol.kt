@@ -17,11 +17,66 @@ object SwiftDateCodec {
 object RemoteIndexMerger {
     fun merge(remote:JsonObject?,localEntries:Collection<JsonObject>,localDeletions:Collection<JsonObject>):JsonObject {
         val entries=linkedMapOf<String,JsonObject>();val deleted=linkedMapOf<String,JsonObject>()
-        remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject["noteID"].asString]=it.asJsonObject.deepCopy()}
-        remote?.get("deletedEntries")?.asJsonArray?.forEach{deleted[it.asJsonObject["noteID"].asString]=it.asJsonObject.deepCopy()}
-        localEntries.forEach{e->val id=e["noteID"].asString;val old=entries[id];if(old==null||e["version"].asLong>=old["version"].asLong){entries[id]=e.deepCopy();deleted.remove(id)}}
-        localDeletions.forEach{d->val id=d["noteID"].asString;val old=deleted[id];if(old==null||d["deletedAt"].asDouble>=old["deletedAt"].asDouble){deleted[id]=d.deepCopy();entries.remove(id)}}
+        RepositoryIndexSanitizer.entries(remote).forEach{entries[it["noteID"].asString]=it.deepCopy()}
+        RepositoryIndexSanitizer.deletions(remote).forEach{deleted[it["noteID"].asString]=it.deepCopy()}
+        localEntries.filter(RepositoryIndexSanitizer::hasValidNoteID).forEach{e->val id=e["noteID"].asString;val old=entries[id];if(old==null||e["version"].asLong>=old["version"].asLong){entries[id]=e.deepCopy();deleted.remove(id)}}
+        localDeletions.filter(RepositoryIndexSanitizer::hasValidNoteID).forEach{d->val id=d["noteID"].asString;val old=deleted[id];if(old==null||d["deletedAt"].asDouble>=old["deletedAt"].asDouble){deleted[id]=d.deepCopy();entries.remove(id)}}
         return JsonObject().apply{add("entries",JsonArray().apply{entries.values.forEach(::add)});add("deletedEntries",JsonArray().apply{deleted.values.forEach(::add)})}
+    }
+}
+
+/**
+ * Treat the remote index as untrusted input without allowing one stale record to
+ * block every valid note. Invalid IDs are never used to construct remote paths,
+ * and the next successful index publication naturally removes them.
+ */
+internal object RepositoryIndexSanitizer {
+    private fun deletionTime(value:JsonObject?):Long {
+        val raw=value?.get("deletedAt")?.takeIf{it.isJsonPrimitive}?:return 0
+        return runCatching{
+            if(raw.asJsonPrimitive.isString)Instant.parse(raw.asString).toEpochMilli()
+            else SwiftDateCodec.decode(raw.asDouble)
+        }.getOrDefault(0)
+    }
+
+    fun hasValidNoteID(value:JsonObject):Boolean {
+        val id=value["noteID"]?.takeIf{it.isJsonPrimitive}?.asString?:return false
+        return RepositoryIdentityContract.isValidNoteID(id)
+    }
+
+    fun invalidNoteIDs(index:JsonObject?):List<String> =
+        sequenceOf("entries","deletedEntries").flatMap{key->
+            index?.get(key)?.takeIf{it.isJsonArray}?.asJsonArray?.asSequence().orEmpty()
+        }.mapNotNull{raw->
+            val value=raw.takeIf{it.isJsonObject}?.asJsonObject
+            val id=value?.get("noteID")?.takeIf{it.isJsonPrimitive}?.asString
+            id?.takeUnless(RepositoryIdentityContract::isValidNoteID) ?: if(value==null||id==null)"<missing>" else null
+        }.distinct().sorted().toList()
+
+    fun entries(index:JsonObject?):List<JsonObject> {
+        val entries=linkedMapOf<String,JsonObject>()
+        index?.get("entries")?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->
+            val candidate=raw.takeIf{it.isJsonObject}?.asJsonObject?.takeIf(::hasValidNoteID)?:return@forEach
+            val id=candidate["noteID"].asString
+            val current=entries[id]
+            val version=candidate["version"]?.takeIf{it.isJsonPrimitive}?.asLong?:0
+            val currentVersion=current?.get("version")?.takeIf{it.isJsonPrimitive}?.asLong?:0
+            if(current==null||version>currentVersion||(version==currentVersion&&candidate.toString()>current.toString()))entries[id]=candidate
+        }
+        return entries.values.sortedBy{it["noteID"].asString}
+    }
+
+    fun deletions(index:JsonObject?):List<JsonObject> {
+        val deletions=linkedMapOf<String,JsonObject>()
+        index?.get("deletedEntries")?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->
+            val candidate=raw.takeIf{it.isJsonObject}?.asJsonObject?.takeIf(::hasValidNoteID)?:return@forEach
+            val id=candidate["noteID"].asString
+            val current=deletions[id]
+            val deletedAt=deletionTime(candidate)
+            val currentDeletedAt=deletionTime(current)
+            if(current==null||deletedAt>currentDeletedAt||(deletedAt==currentDeletedAt&&candidate.toString()>current.toString()))deletions[id]=candidate
+        }
+        return deletions.values.sortedBy{it["noteID"].asString}
     }
 }
 

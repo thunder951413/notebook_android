@@ -1,13 +1,90 @@
 #!/usr/bin/env python3
 """Isolated password-auth SFTP server used by Android connected tests."""
-import argparse, base64, hashlib, os, socket, threading, time, traceback
+import argparse, base64, hashlib, os, re, shlex, socket, subprocess, threading, time, traceback
 import paramiko
 
 class Auth(paramiko.ServerInterface):
+    def __init__(self, root):
+        self.root = os.path.realpath(root)
     def check_auth_password(self, username, password):
         return paramiko.AUTH_SUCCESSFUL if (username,password)==("notebook","test-password") else paramiko.AUTH_FAILED
     def get_allowed_auths(self, username): return "password"
     def check_channel_request(self, kind, chanid): return paramiko.OPEN_SUCCEEDED if kind=="session" else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+    def check_channel_exec_request(self, channel, command):
+        # This fixture deliberately exposes only the two commands used by the
+        # desktop repository helper.  In particular, never turn this into a
+        # general-purpose shell for connected Android tests.
+        try:
+            text = command.decode("utf-8")
+        except UnicodeDecodeError:
+            text = ""
+        thread = threading.Thread(target=self._exec, args=(channel, text), daemon=True)
+        thread.start()
+        return True
+    def _helper_args(self, command):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return None
+        if len(argv) != 3 or argv[:2] != ["python3", "-c"]:
+            return None
+        match = re.fullmatch(
+            r"import base64,sys;exec\(base64\.b64decode\('([A-Za-z0-9+/=]+)'\)\);main\(base64\.b64decode\('([A-Za-z0-9+/=]+)'\)\.decode\(\),base64\.b64decode\('([A-Za-z0-9+/=]+)'\)\.decode\(\)\)",
+            argv[2],
+        )
+        if not match:
+            return None
+        try:
+            helper = base64.b64decode(match.group(1), validate=True).decode("utf-8")
+            operation = base64.b64decode(match.group(2), validate=True).decode("utf-8")
+            repository = base64.b64decode(match.group(3), validate=True).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        target = os.path.realpath(repository)
+        if (operation not in {"export-tar", "import-tar", "verify", "gc"}
+                or (target != self.root and not target.startswith(self.root + os.sep))
+                or not helper.startswith("import gzip, hashlib, json")
+                or "def main(op, root):" not in helper):
+            return None
+        return argv
+    def _send_result(self, channel, stdout=b"", stderr=b"", status=0):
+        try:
+            if stdout:
+                channel.sendall(stdout)
+            if stderr:
+                channel.send_stderr(stderr)
+            channel.send_exit_status(status)
+        finally:
+            channel.close()
+    def _exec(self, channel, command):
+        # Paramiko sends the CHANNEL_SUCCESS reply after the request callback
+        # returns.  Let that reply leave the transport before a very short
+        # command closes its channel, otherwise ssh2 can report "Unable to
+        # exec" for the next sequential helper channel.
+        time.sleep(.01)
+        if command == "pwd":
+            self._send_result(channel, (self.root + "\n").encode("utf-8"))
+            return
+        argv = self._helper_args(command)
+        if argv is None:
+            self._send_result(channel, stderr=b"unsupported test fixture command\n", status=126)
+            return
+        try:
+            chunks = []
+            while True:
+                chunk = channel.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            result = subprocess.run(
+                argv, input=b"".join(chunks), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=self.root, timeout=60, check=False,
+            )
+            self._send_result(channel, result.stdout, result.stderr, result.returncode)
+        except subprocess.TimeoutExpired:
+            self._send_result(channel, stderr=b"repository helper test command timed out\n", status=124)
+        except Exception as error:
+            self._send_result(channel, stderr=("repository helper fixture failed: %s\n" % error).encode("utf-8"), status=1)
 
 class SFTP(paramiko.SFTPServerInterface):
     def __init__(self, server, *a, root, **kw): super().__init__(server,*a,**kw);self.root=os.path.realpath(root)
@@ -58,14 +135,21 @@ def main():
     ap=argparse.ArgumentParser();ap.add_argument("--port",type=int,default=2222);ap.add_argument("--root",required=True);args=ap.parse_args();os.makedirs(args.root,exist_ok=True)
     key=paramiko.RSAKey.generate(2048);fingerprint="SHA256:"+base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
     print(fingerprint,flush=True)
-    listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);listener.bind(("0.0.0.0",args.port));listener.listen(20)
+    listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);listener.bind(("127.0.0.1",args.port));listener.listen(20)
     while True:
         client,_=listener.accept()
         def serve(sock):
             t=paramiko.Transport(sock);t.add_server_key(key);t.set_subsystem_handler("sftp",paramiko.SFTPServer,SFTP,root=args.root)
             try:
-                t.start_server(server=Auth());channel=t.accept(20)
-                while channel is not None and t.is_active():time.sleep(.2)
+                t.start_server(server=Auth(args.root))
+                # The desktop helper opens sequential exec channels (pwd, then
+                # python3), while the existing tests use SFTP channels. Keep
+                # accepting channels until the client disconnects.
+                channels = []
+                while t.is_active():
+                    channel = t.accept(.2)
+                    if channel is not None:
+                        channels.append(channel)
             except Exception:traceback.print_exc()
             finally:t.close()
         threading.Thread(target=serve,args=(client,),daemon=True).start()

@@ -35,6 +35,7 @@ import java.io.InputStream
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import android.util.Base64
+import android.util.Log
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
@@ -86,7 +87,9 @@ internal object CompressedRepositoryContract {
 }
 
 internal object RepositoryIdentityContract {
-    private val UUID_PATTERN=Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",RegexOption.IGNORE_CASE)
+    // Keep this aligned with Electron. UUID versions 6–8 are valid identifiers
+    // too; the variant bits and exact length still prevent path injection.
+    private val UUID_PATTERN=Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",RegexOption.IGNORE_CASE)
     fun isValidNoteID(noteID:String)=UUID_PATTERN.matches(noteID)
     fun requireNoteID(noteID:String):String {
         require(isValidNoteID(noteID)){"远端索引包含非法笔记 ID，已停止同步"}
@@ -405,9 +408,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     private suspend fun pullNotes(c:ChannelSftp,s:SshSettings,idx:JsonObject?){
         if(idx==null)return
-        val deletions=idx["deletedEntries"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{entry->
-            entry.asJsonObject.also{RepositoryIdentityContract.requireNoteID(it.str("noteID"))}
-        }.orEmpty()
+        logInvalidRemoteIndexIDs(idx)
+        val deletions=RepositoryIndexSanitizer.deletions(idx)
         val entries=normalizedIndexEntries(idx)
         deletions.forEach { deletion ->
             val id=deletion.str("noteID"); val deletedAt=deletion.flexibleDateMs("deletedAt")
@@ -531,8 +533,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private suspend fun pushNotes(c:ChannelSftp,s:SshSettings,remote:JsonObject?){
         val compressed=CompressedRepositoryContract.enabled(remote)
         val entries=linkedMapOf<String,JsonObject>();normalizedIndexEntries(remote).forEach{entries[it.str("noteID")]=it.deepCopy()}
-        val deleted=linkedMapOf<String,JsonObject>();remote?.get("deletedEntries")?.asJsonArray?.forEach{val id=RepositoryIdentityContract.requireNoteID(it.asJsonObject.str("noteID"));deleted[id]=it.asJsonObject.deepCopy()}
-        dao.tombstones().filter{it.itemType=="note"}.forEach{t->RepositoryIdentityContract.requireNoteID(t.itemId);deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
+        val deleted=linkedMapOf<String,JsonObject>();RepositoryIndexSanitizer.deletions(remote).forEach{deleted[it.str("noteID")]=it.deepCopy()}
+        dao.tombstones().filter{it.itemType=="note"&&RepositoryIdentityContract.isValidNoteID(it.itemId)}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Triple<String,Long,String?>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=Triple(n.id,n.version,null)}
             else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);val stored=if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())encryptPrivacyEnvelope(env,s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
@@ -677,9 +679,11 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         o["history"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val entry=raw.asJsonObject;val hash=entry.str("contentHash");val text=objects[hash]?.takeUnless{it.isJsonNull}?.asString?:error("笔记 $id 的历史版本缺少正文对象");require(sha(text)==hash){"笔记 $id 的历史版本 SHA-256 校验失败"}}
     }
     private fun normalizedIndexEntries(index:JsonObject?):List<JsonObject>{
-        val entries=linkedMapOf<String,JsonObject>()
-        index?.get("entries")?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{raw->val candidate=raw.asJsonObject;val id=RepositoryIdentityContract.requireNoteID(candidate.str("noteID"));val current=entries[id];val version=candidate["version"]?.asLong?:0;val currentVersion=current?.get("version")?.asLong?:0;if(current==null||version>currentVersion||(version==currentVersion&&candidate.toString()>current.toString()))entries[id]=candidate}
-        return entries.values.sortedBy{it.str("noteID")}
+        return RepositoryIndexSanitizer.entries(index)
+    }
+    private fun logInvalidRemoteIndexIDs(index:JsonObject?){
+        val ids=RepositoryIndexSanitizer.invalidNoteIDs(index)
+        if(ids.isNotEmpty())Log.w("NotebookSync","Ignoring ${ids.size} invalid legacy remote index IDs: ${ids.take(10).joinToString()}")
     }
     private fun privacyKey(secret:String,salt:ByteArray,iterations:Int)=SecretKeySpec(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(PBEKeySpec(secret.toCharArray(),salt,iterations,256)).encoded,"AES")
     private val privacyCheckText="notebook-next-private-notes-v1"
