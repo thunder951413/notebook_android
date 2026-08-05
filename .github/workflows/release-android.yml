@@ -45,15 +45,6 @@ jobs:
           ./gradlew test lintRelease assembleRelease -PgithubRepository="$GITHUB_REPOSITORY"
           cp app/build/outputs/apk/release/app-release.apk notebook-android.apk
           shasum -a 256 notebook-android.apk > notebook-android.apk.sha256
-      - name: Upload signed test artifact
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: notebook-android-${{ inputs.version }}
-          path: |
-            notebook-android.apk
-            notebook-android.apk.sha256
-          retention-days: 3
       - name: Publish GitHub Release
         if: github.event_name == 'push' || inputs.publish_release
         uses: softprops/action-gh-release@v2
