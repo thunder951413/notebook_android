@@ -1,14 +1,43 @@
 #!/usr/bin/env python3
-"""Isolated password-auth SFTP server used by Android connected tests."""
+"""Isolated SFTP server used by Android connected tests.
+
+Password auth is always enabled for the fixed notebook/test-password pair.
+Pass --authorized-keys to also accept the given public keys, which lets
+desktop tests exercise private-key (publickey) authentication without any
+password.
+"""
 import argparse, base64, hashlib, os, re, shlex, socket, subprocess, threading, time, traceback
 import paramiko
 
+def load_authorized_keys(path):
+    keys = []
+    if not path:
+        return keys
+    with open(path) as source:
+        for line in source:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                keys.append(paramiko.PKey.from_type_string(parts[0], base64.b64decode(parts[1])))
+            except (ValueError, IndexError, UnicodeDecodeError, paramiko.ssh_exception.UnknownKeyType):
+                continue
+    return keys
+
 class Auth(paramiko.ServerInterface):
-    def __init__(self, root):
+    def __init__(self, root, authorized_keys):
         self.root = os.path.realpath(root)
+        self.authorized_keys = authorized_keys
+    def check_auth_publickey(self, username, key):
+        if username != "notebook":
+            return paramiko.AUTH_FAILED
+        return paramiko.AUTH_SUCCESSFUL if any(key.asbytes() == accepted.asbytes() for accepted in self.authorized_keys) else paramiko.AUTH_FAILED
     def check_auth_password(self, username, password):
         return paramiko.AUTH_SUCCESSFUL if (username,password)==("notebook","test-password") else paramiko.AUTH_FAILED
-    def get_allowed_auths(self, username): return "password"
+    def get_allowed_auths(self, username): return "publickey,password" if self.authorized_keys else "password"
     def check_channel_request(self, kind, chanid): return paramiko.OPEN_SUCCEEDED if kind=="session" else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
     def check_channel_exec_request(self, channel, command):
         # This fixture deliberately exposes only the two commands used by the
@@ -132,8 +161,9 @@ class SFTP(paramiko.SFTPServerInterface):
     def canonicalize(self,path): return "/"+os.path.relpath(self._p(path),self.root).replace(os.sep,"/") if self._p(path)!=self.root else "/"
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument("--port",type=int,default=2222);ap.add_argument("--root",required=True);args=ap.parse_args();os.makedirs(args.root,exist_ok=True)
+    ap=argparse.ArgumentParser();ap.add_argument("--port",type=int,default=2222);ap.add_argument("--root",required=True);ap.add_argument("--authorized-keys",default=None);args=ap.parse_args();os.makedirs(args.root,exist_ok=True)
     key=paramiko.RSAKey.generate(2048);fingerprint="SHA256:"+base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+    authorized_keys=load_authorized_keys(args.authorized_keys)
     print(fingerprint,flush=True)
     listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);listener.bind(("127.0.0.1",args.port));listener.listen(20)
     while True:
@@ -141,7 +171,7 @@ def main():
         def serve(sock):
             t=paramiko.Transport(sock);t.add_server_key(key);t.set_subsystem_handler("sftp",paramiko.SFTPServer,SFTP,root=args.root)
             try:
-                t.start_server(server=Auth(args.root))
+                t.start_server(server=Auth(args.root, authorized_keys))
                 # The desktop helper opens sequential exec channels (pwd, then
                 # python3), while the existing tests use SFTP channels. Keep
                 # accepting channels until the client disconnects.

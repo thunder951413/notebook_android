@@ -10,7 +10,7 @@ class QrConfigTest {
         assertEquals("192.168.1.8",settings.host);assertEquals(2222,settings.port);assertEquals("me",settings.username);assertEquals("pw",settings.password);assertEquals("/sync",settings.path);assertEquals("SHA256:abc",settings.fingerprint)
     }
     @Test fun allowsConfigWithoutFingerprintAndUsesDefaults(){
-        val settings=parseSyncQrConfig("""{"type":"notebook-sync","version":1,"host":"mac.local","user":"me"}""")
+        val settings=parseSyncQrConfig("""{"type":"notebook-sync","version":1,"host":"mac.local","user":"me","password":"pw"}""")
         assertEquals(22,settings.port);assertEquals("~/NotebookSync",settings.path);assertTrue(settings.fingerprint.isEmpty())
     }
     @Test(expected=IllegalArgumentException::class) fun rejectsWrongType(){parseSyncQrConfig("""{"type":"other","version":1,"host":"x","username":"me"}""")}

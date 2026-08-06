@@ -20,6 +20,15 @@ class DebugSyncActivity:Activity() {
     };scope.launch{
         val app=application as NotebookApp
         val result=runCatching{
+            val webdavBaseUrl=intent.getStringExtra("webdavBaseUrl").orEmpty()
+            if(webdavBaseUrl.isNotBlank()){
+                app.repository.saveWebdavSettings(io.github.notebook.android.sync.WebdavSettings(
+                    baseUrl=webdavBaseUrl,
+                    username=intent.getStringExtra("webdavUsername").orEmpty(),
+                    appPassword=intent.getStringExtra("webdavAppPassword").orEmpty(),
+                    remotePath=intent.getStringExtra("webdavRemotePath").orEmpty(),
+                ))
+            }else{
             val sshHost=intent.getStringExtra("sshHost").orEmpty()
             if(sshHost.isNotBlank()){
                 app.repository.saveSettings(SshSettings(
@@ -35,14 +44,16 @@ class DebugSyncActivity:Activity() {
                     }?:intent.getStringExtra("sshPassword").orEmpty(),
                     path=intent.getStringExtra("sshPath").orEmpty(),
                     fingerprint=intent.getStringExtra("sshFingerprint").orEmpty(),
+                    privateKeyPath=intent.getStringExtra("sshPrivateKeyPath").orEmpty(),
+                    privateKeyPassphrase=intent.getStringExtra("sshPrivateKeyPassphrase").orEmpty(),
                 ))
-            }else{
+            }else if(sshHost.isBlank()){
                 app.repository.saveApiSettings(ApiSyncSettings(
                     intent.getStringExtra("baseUrl").orEmpty(),
                     intent.getStringExtra("workspaceId").orEmpty(),
                     intent.getStringExtra("token").orEmpty()
                 ))
-            }
+            }}
             app.repository.sync()
             var note=app.database.dao().get(intent.getStringExtra("pageId").orEmpty())
             intent.getStringExtra("editTitle")?.let{title->

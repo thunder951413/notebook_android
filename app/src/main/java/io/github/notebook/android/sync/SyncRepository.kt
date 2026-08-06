@@ -43,8 +43,8 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
-data class SshSettings(val host:String,val port:Int,val username:String,val password:String,val path:String,val fingerprint:String="")
-enum class SyncBackend { API, SSH }
+data class SshSettings(val host:String,val port:Int,val username:String,val password:String,val path:String,val fingerprint:String="",val privateKeyPath:String="",val privateKeyPassphrase:String="")
+enum class SyncBackend { API, SSH, WEBDAV }
 class HostKeyChangedException(val expected:String,val actual:String):Exception("服务器身份已变化，请确认新的主机指纹")
 class HostKeyConfirmationRequiredException(val actual:String):Exception("首次连接需要确认服务器主机指纹")
 enum class NoteSaveState { Pending, Saving, Saved, Failed }
@@ -196,18 +196,28 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun clearSaveError(){_saveError.value=null}
     private val prefs=preferences?:encryptedPrefs(context)
     private val apiSync=ApiSyncClient(appContext,dao)
+    private val webdavSync=WebdavSyncClient(appContext,dao,prefs,apiSync)
     val notes=dao.observeNoteSummaries()
     val folders=dao.observeFolders()
     val tags=dao.observeTags()
     fun backlinks(noteId:String)=dao.observeBacklinks(noteId)
-    fun settings()=SshSettings(prefs.getString("host","")!!,prefs.getInt("port",22),prefs.getString("user","")!!,prefs.getString("password","")!!,prefs.getString("path","~/notebook_backup")!!,prefs.getString("fingerprint","")!!)
+    fun settings()=SshSettings(prefs.getString("host","")!!,prefs.getInt("port",22),prefs.getString("user","")!!,prefs.getString("password","")!!,prefs.getString("path","~/notebook_backup")!!,prefs.getString("fingerprint","")!!,prefs.getString("privateKeyPath","")!!,prefs.getString("privateKeyPassphrase","")!!)
     fun apiSettings()=ApiSyncSettings(prefs.getString("apiBaseUrl","")!!,prefs.getString("apiWorkspaceId","00000000-0000-4000-8000-000000000001")!!,prefs.getString("apiToken","")!!)
-    /** SSH/SFTP is the only supported cross-device repository protocol. */
-    fun syncBackend()=SyncBackend.SSH
-    fun saveSettings(s:SshSettings){prefs.edit().putString("syncBackend",SyncBackend.SSH.name).putString("host",s.host).putInt("port",s.port).putString("user",s.username).putString("password",s.password).putString("path",s.path).putString("fingerprint",s.fingerprint.trim()).apply()}
+    fun webdavSettings()=WebdavSettings(prefs.getString("webdavBaseUrl","https://dav.jianguoyun.com/dav/")!!,prefs.getString("webdavUser","")!!,prefs.getString("webdavAppPassword","")!!,prefs.getString("webdavPath","notebook_backup")!!,prefs.getString("webdavSyncPassword","")!!)
+    fun saveWebdavSettings(s:WebdavSettings){prefs.edit().putString("syncBackend",SyncBackend.WEBDAV.name).putString("webdavBaseUrl",s.baseUrl.trim()).putString("webdavUser",s.username.trim()).putString("webdavAppPassword",s.appPassword).putString("webdavPath",s.remotePath.trim()).putString("webdavSyncPassword",s.syncPassword).apply()}
+    suspend fun testWebdav():WebdavTestResult=webdavSync.test(webdavSettings())
+    fun syncBackend()=runCatching{SyncBackend.valueOf(prefs.getString("syncBackend",SyncBackend.WEBDAV.name)!!)}.getOrDefault(SyncBackend.WEBDAV)
+    /** Assign a fresh WebDAV device id and drop read cursors so the next sync replays every journal from scratch. */
+    fun rotateWebdavDeviceId(){
+        prefs.edit().remove("device").apply()
+        prefs.all.keys.filter { it.startsWith("webdav-seqs") }.forEach { prefs.edit().remove(it).apply() }
+    }
+    fun saveSettings(s:SshSettings){prefs.edit().putString("syncBackend",SyncBackend.SSH.name).putString("host",s.host).putInt("port",s.port).putString("user",s.username).putString("password",s.password).putString("path",s.path).putString("fingerprint",s.fingerprint.trim()).putString("privateKeyPath",s.privateKeyPath.trim()).putString("privateKeyPassphrase",s.privateKeyPassphrase).apply()}
     fun saveApiSettings(s:ApiSyncSettings){prefs.edit().putString("syncBackend",SyncBackend.API.name).putString("apiBaseUrl",s.baseUrl.trim()).putString("apiWorkspaceId",s.workspaceId.trim()).putString("apiToken",s.token.trim()).apply()}
     fun setSyncBackend(backend:SyncBackend){prefs.edit().putString("syncBackend",backend.name).apply()}
-    fun hasRemoteConfiguration()=settings().let{it.host.isNotBlank()&&it.username.isNotBlank()&&it.path.isNotBlank()}
+    /** Outbox workspace key for the current non-SSH backend. */
+    private fun syncWorkspaceId()=if(syncBackend()==SyncBackend.WEBDAV)WebdavJournalProtocol.DEFAULT_WORKSPACE_ID else apiSettings().workspaceId
+    fun hasRemoteConfiguration()=when(syncBackend()){SyncBackend.API->apiSettings().let{it.baseUrl.isNotBlank()&&it.token.isNotBlank()};SyncBackend.WEBDAV->webdavSettings().let{it.username.isNotBlank()&&it.appPassword.isNotBlank()&&it.baseUrl.isNotBlank()};SyncBackend.SSH->settings().let{it.host.isNotBlank()&&it.username.isNotBlank()&&it.path.isNotBlank()}}
     fun trustHostKey(fingerprint:String){saveSettings(settings().copy(fingerprint=fingerprint))}
     fun isEncrypted(note:NoteEntity)=encryptedNoteIds().contains(note.id)||encryptedFolderId(note)!=null
     fun encryptedFolderId(note:NoteEntity)=encryptedMappings()[note.id]?:note.folderId?.takeIf{encryptedNoteIds().contains(note.id)}
@@ -265,7 +275,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val anchor=anchorUtf16Offset.coerceAtLeast(0);val fraction=viewportOffsetFraction.coerceIn(-1.0,1.0);val current=dao.readingPosition(noteId)
         if(current?.anchorUtf16Offset==anchor&&kotlin.math.abs(current.viewportOffsetFraction-fraction)<0.001)return@launch
         if(!dao.putReadingPositionIfNoteExists(ReadingPositionEntity(noteId,anchor,fraction,System.currentTimeMillis(),deviceId())))return@launch
-        if(syncBackend()==SyncBackend.API)apiSync.queueReadingPosition(apiSettings().workspaceId,dao.readingPosition(noteId)!!)
+        if(syncBackend()!=SyncBackend.SSH)apiSync.queueReadingPosition(syncWorkspaceId(),dao.readingPosition(noteId)!!)
         requestSyncIfConfigured(2)
     }}
 
@@ -278,7 +288,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         }
         if(current!=null&&sameEditableContent(current,draft)){dao.deleteDraft(draft.id);return@withLock current}
         val base=current?:draft;val saved=base.copy(title=draft.title,body=draft.body,previewText=previewText(draft.body),folderId=draft.folderId,folderName=draft.folderName,icon=draft.icon,parentPageId=draft.parentPageId,sortOrder=draft.sortOrder,treeUpdatedAt=draft.treeUpdatedAt,reminderAt=draft.reminderAt,recurrence=draft.recurrence,tagIds=draft.tagIds,deletedAt=draft.deletedAt,itemType=draft.itemType,dueAt=draft.dueAt,completedAt=draft.completedAt,important=draft.important,viewMode=draft.viewMode,updatedAt=System.currentTimeMillis(),version=(current?.version?:draft.version)+1,dirty=true)
-        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);dao.deleteDraft(draft.id);if(syncBackend()==SyncBackend.API){val workspace=apiSettings().workspaceId;apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
+        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);dao.deleteDraft(draft.id);if(syncBackend()!=SyncBackend.SSH){val workspace=syncWorkspaceId();apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.icon==b.icon&&a.parentPageId==b.parentPageId&&a.sortOrder==b.sortOrder&&a.treeUpdatedAt==b.treeUpdatedAt&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important&&a.viewMode==b.viewMode
     private suspend fun subtree(id:String):List<NoteEntity>{
@@ -312,26 +322,26 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             treeUpdatedAt=System.currentTimeMillis()
         ))
     }
-    suspend fun deletePermanently(id:String){subtree(id).forEach{note->Reminders.cancel(appContext,note.id);dao.putTombstone(TombstoneEntity("note|${note.id}",note.id,"note",System.currentTimeMillis(),deviceId()));if(syncBackend()==SyncBackend.API){val w=apiSettings().workspaceId;apiSync.queueDelete(w,"document",note.id);apiSync.queueDelete(w,"page",note.id)};dao.deleteReadingPosition(note.id);dao.deleteNotePermanently(note.id)};requestSyncIfConfigured()}
-    suspend fun keepLocal(id:String){loadEditable(id)?.let{local->if(syncBackend()==SyncBackend.API){val kept=local.copy(updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null);dao.put(kept);apiSync.queueNote(apiSettings().workspaceId,kept);requestSyncIfConfigured()}else{val remoteVersion=loadConflictSnapshot(id)?.let{payload->runCatching{val remote=JsonParser.parseString(payload).asJsonObject;if(remote["schemaVersion"]?.asInt==3)remote["metadata"].asJsonObject["legacyVersion"]?.asLong?:remote["metadata"].asJsonObject.isoMs("updatedAt") else remote["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=loadSnapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}}
-    suspend fun acceptRemote(id:String){val local=loadEditable(id)?:return;val snapshot=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;if(syncBackend()==SyncBackend.API&&snapshot.has("apiConflicts")){snapshot["apiConflicts"].asJsonObject.entrySet().forEach{(type,payload)->apiSync.acceptConflict(apiSettings().workspaceId,type,id,payload.asJsonObject)}}else if(syncBackend()==SyncBackend.API&&snapshot.has("apiEntityType")){apiSync.acceptConflict(apiSettings().workspaceId,snapshot["apiEntityType"].asString,id,snapshot["payload"].asJsonObject)}else{val remote=if(snapshot["schemaVersion"]?.asInt==3)fromMarkdownEnvelope(snapshot)else fromEnvelope(JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)});val accepted=remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion);dao.put(accepted);indexReferences(accepted)}}
-    suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString()){val folder=FolderEntity(id,name,dao.allFolders().size,type);dao.putFolder(folder);if(syncBackend()==SyncBackend.API)apiSync.queueFolder(apiSettings().workspaceId,folder);requestSyncIfConfigured()}
-    suspend fun deleteFolder(id:String){if(syncBackend()==SyncBackend.API)apiSync.queueDelete(apiSettings().workspaceId,"section",id);dao.deleteFolder(id);dao.putTombstone(TombstoneEntity("folder|$id",id,"folder",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
-    suspend fun saveTag(name:String,color:String="gray",id:String=UUID.randomUUID().toString()){val tag=TagEntity(id,name,color);dao.putTag(tag);if(syncBackend()==SyncBackend.API)apiSync.queueTag(apiSettings().workspaceId,tag);requestSyncIfConfigured()}
-    suspend fun deleteTag(id:String){if(syncBackend()==SyncBackend.API)apiSync.queueDelete(apiSettings().workspaceId,"tag",id);dao.deleteTag(id);dao.putTombstone(TombstoneEntity("tag|$id",id,"tag",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
+    suspend fun deletePermanently(id:String){subtree(id).forEach{note->Reminders.cancel(appContext,note.id);dao.putTombstone(TombstoneEntity("note|${note.id}",note.id,"note",System.currentTimeMillis(),deviceId()));if(syncBackend()!=SyncBackend.SSH){val w=syncWorkspaceId();apiSync.queueDelete(w,"document",note.id);apiSync.queueDelete(w,"page",note.id)};dao.deleteReadingPosition(note.id);dao.deleteNotePermanently(note.id)};requestSyncIfConfigured()}
+    suspend fun keepLocal(id:String){loadEditable(id)?.let{local->if(syncBackend()!=SyncBackend.SSH){val kept=local.copy(updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null);dao.put(kept);apiSync.queueNote(syncWorkspaceId(),kept);requestSyncIfConfigured()}else{val remoteVersion=loadConflictSnapshot(id)?.let{payload->runCatching{val remote=JsonParser.parseString(payload).asJsonObject;if(remote["schemaVersion"]?.asInt==3)remote["metadata"].asJsonObject["legacyVersion"]?.asLong?:remote["metadata"].asJsonObject.isoMs("updatedAt") else remote["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=loadSnapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}}
+    suspend fun acceptRemote(id:String){val local=loadEditable(id)?:return;val snapshot=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;if(syncBackend()!=SyncBackend.SSH&&snapshot.has("apiConflicts")){snapshot["apiConflicts"].asJsonObject.entrySet().forEach{(type,payload)->apiSync.acceptConflict(syncWorkspaceId(),type,id,payload.asJsonObject)}}else if(syncBackend()!=SyncBackend.SSH&&snapshot.has("apiEntityType")){apiSync.acceptConflict(syncWorkspaceId(),snapshot["apiEntityType"].asString,id,snapshot["payload"].asJsonObject)}else{val remote=if(snapshot["schemaVersion"]?.asInt==3)fromMarkdownEnvelope(snapshot)else fromEnvelope(JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)});val accepted=remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion);dao.put(accepted);indexReferences(accepted)}}
+    suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString()){val folder=FolderEntity(id,name,dao.allFolders().size,type);dao.putFolder(folder);if(syncBackend()!=SyncBackend.SSH)apiSync.queueFolder(syncWorkspaceId(),folder);requestSyncIfConfigured()}
+    suspend fun deleteFolder(id:String){if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"section",id);dao.deleteFolder(id);dao.putTombstone(TombstoneEntity("folder|$id",id,"folder",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
+    suspend fun saveTag(name:String,color:String="gray",id:String=UUID.randomUUID().toString()){val tag=TagEntity(id,name,color);dao.putTag(tag);if(syncBackend()!=SyncBackend.SSH)apiSync.queueTag(syncWorkspaceId(),tag);requestSyncIfConfigured()}
+    suspend fun deleteTag(id:String){if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"tag",id);dao.deleteTag(id);dao.putTombstone(TombstoneEntity("tag|$id",id,"tag",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
     fun steps(noteId:String)=dao.observeSteps(noteId)
     fun assets(noteId:String)=dao.observeAssets(noteId)
     suspend fun assetList(noteId:String)=dao.assets(noteId)
-    suspend fun saveStep(step:TodoStepEntity){dao.putStep(step);if(syncBackend()==SyncBackend.API)apiSync.queueStep(apiSettings().workspaceId,step);loadEditable(step.noteId)?.let{save(it)};requestSyncIfConfigured()}
-    suspend fun deleteStep(id:String){val noteId=dao.getStep(id)?.noteId;if(syncBackend()==SyncBackend.API)apiSync.queueDelete(apiSettings().workspaceId,"task_step",id);dao.deleteStep(id);noteId?.let{loadEditable(it)?.let{n->save(n)}}}
+    suspend fun saveStep(step:TodoStepEntity){dao.putStep(step);if(syncBackend()!=SyncBackend.SSH)apiSync.queueStep(syncWorkspaceId(),step);loadEditable(step.noteId)?.let{save(it)};requestSyncIfConfigured()}
+    suspend fun deleteStep(id:String){val noteId=dao.getStep(id)?.noteId;if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"task_step",id);dao.deleteStep(id);noteId?.let{loadEditable(it)?.let{n->save(n)}}}
     suspend fun attach(noteId:String,uri:android.net.Uri):AssetEntity=withContext(Dispatchers.IO){
         val resolver=appContext.contentResolver;val id=UUID.randomUUID().toString();val mime=resolver.getType(uri)?:"application/octet-stream"
         var name="attachment";resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use{if(it.moveToFirst())name=it.getString(0)?:name}
         name=name.replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_");val relative="$noteId/$id-$name";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();resolver.openInputStream(uri).use{input->requireNotNull(input){"无法读取附件"}.copyTo(target.outputStream())}
-        val kind=when{mime.startsWith("image/")->"image";mime.startsWith("audio/")->"audio";else->"file"};AssetEntity(id,noteId,kind,name,mime,relative,target.absolutePath,target.inputStream().use(::sha),target.length(),true).also{dao.putAssets(listOf(it));if(syncBackend()==SyncBackend.API)apiSync.queueAsset(apiSettings().workspaceId,it);loadEditable(noteId)?.let{n->save(n)};requestSyncIfConfigured()}
+        val kind=when{mime.startsWith("image/")->"image";mime.startsWith("audio/")->"audio";else->"file"};AssetEntity(id,noteId,kind,name,mime,relative,target.absolutePath,target.inputStream().use(::sha),target.length(),true).also{dao.putAssets(listOf(it));if(syncBackend()!=SyncBackend.SSH)apiSync.queueAsset(syncWorkspaceId(),it);loadEditable(noteId)?.let{n->save(n)};requestSyncIfConfigured()}
     }
     fun recordingFile(noteId:String)=java.io.File(appContext.filesDir,"recordings/$noteId/${System.currentTimeMillis()}.m4a")
-    suspend fun addRecordedAudio(noteId:String,file:java.io.File):AssetEntity=withContext(Dispatchers.IO){require(file.isFile&&file.length()>0){"录音文件为空"};val id=UUID.randomUUID().toString();val relative="$noteId/$id-${file.name}";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();file.copyTo(target,true);file.delete();AssetEntity(id,noteId,"audio",target.name,"audio/mp4",relative,target.absolutePath,target.inputStream().use(::sha),target.length(),true).also{dao.putAssets(listOf(it));if(syncBackend()==SyncBackend.API)apiSync.queueAsset(apiSettings().workspaceId,it);loadEditable(noteId)?.let{n->save(n)};requestSyncIfConfigured()}}
+    suspend fun addRecordedAudio(noteId:String,file:java.io.File):AssetEntity=withContext(Dispatchers.IO){require(file.isFile&&file.length()>0){"录音文件为空"};val id=UUID.randomUUID().toString();val relative="$noteId/$id-${file.name}";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();file.copyTo(target,true);file.delete();AssetEntity(id,noteId,"audio",target.name,"audio/mp4",relative,target.absolutePath,target.inputStream().use(::sha),target.length(),true).also{dao.putAssets(listOf(it));if(syncBackend()!=SyncBackend.SSH)apiSync.queueAsset(syncWorkspaceId(),it);loadEditable(noteId)?.let{n->save(n)};requestSyncIfConfigured()}}
     suspend fun importText(uri:android.net.Uri,folder:FolderEntity?):NoteEntity=withContext(Dispatchers.IO){
         val resolver=appContext.contentResolver;var displayName="导入笔记";var declaredSize:Long?=null
         resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME,android.provider.OpenableColumns.SIZE),null,null,null)?.use{cursor->if(cursor.moveToFirst()){displayName=cursor.getString(0)?:displayName;if(!cursor.isNull(1))declaredSize=cursor.getLong(1)}}
@@ -343,14 +353,35 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         save(NoteEntity(id=id,title=displayName.substringBeforeLast('.').ifBlank{"导入笔记"},body=body,folderId=folder?.id,folderName=folder?.name?:"未分类",tagIds=""))
     }
 
+    /** Copy a user-selected private key into app-private storage and persist its path. */
+    suspend fun importPrivateKey(uri:android.net.Uri,passphrase:String=""):String=withContext(Dispatchers.IO){
+        val resolver=appContext.contentResolver
+        var declaredSize:Long?=null
+        resolver.query(uri,arrayOf(android.provider.OpenableColumns.SIZE),null,null,null)?.use{cursor->if(cursor.moveToFirst()&&!cursor.isNull(0))declaredSize=cursor.getLong(0)}
+        require((declaredSize?:0)<=1_048_576){"私钥文件超过 1 MB，已拒绝导入"}
+        val id=UUID.randomUUID().toString()
+        val target=java.io.File(appContext.filesDir,"ssh/id_$id");target.parentFile?.mkdirs()
+        resolver.openInputStream(uri).use{input->requireNotNull(input){"无法读取私钥文件"}.copyTo(target.outputStream())}
+        require(target.length()<=1_048_576){"私钥文件超过 1 MB，已拒绝导入"}
+        target.setReadable(false,false);target.setReadable(true,true)
+        saveSettings(settings().copy(privateKeyPath=target.absolutePath,privateKeyPassphrase=passphrase))
+        target.absolutePath
+    }
+    fun clearPrivateKey(){saveSettings(settings().copy(privateKeyPath="",privateKeyPassphrase=""))}
+
     suspend fun sync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
         flushAll()
-        if(syncBackend()==SyncBackend.API){apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());return@withContext}
+        when(syncBackend()){SyncBackend.API->{apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());return@withContext};SyncBackend.WEBDAV->{webdavSync.sync(webdavSettings());Reminders.reconcile(appContext,dao.reminders());return@withContext};SyncBackend.SSH->Unit}
         val s=settings(); require(s.host.isNotBlank()&&s.username.isNotBlank()){ "请先配置 SSH 服务器" }
+        require(s.password.isNotBlank()||s.privateKeyPath.isNotBlank()){ "请配置 SSH 私钥文件路径或密码" }
         val verifier=FingerprintHostKeyRepository(s.host,s.fingerprint)
         val jsch=JSch().apply{hostKeyRepository=verifier}
+        // Private key auth takes precedence when configured; password is only
+        // used when no key is provided (the server may have disabled password auth).
+        if(s.privateKeyPath.isNotBlank())jsch.addIdentity(s.privateKeyPath,s.privateKeyPassphrase)
         val session=jsch.getSession(s.username,s.host,s.port).apply{
-            setPassword(s.password)
+            if(s.privateKeyPath.isBlank())setPassword(s.password)
+            setConfig("PreferredAuthentications",if(s.privateKeyPath.isNotBlank())"publickey"else"password")
             // Android runtimes do not consistently expose an Ed25519 provider.
             // Prefer the broadly supported ECDSA host key, then fall back to the
             // remaining modern algorithms. The exact negotiated key is pinned.
@@ -537,7 +568,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         dao.tombstones().filter{it.itemType=="note"&&RepositoryIdentityContract.isValidNoteID(it.itemId)}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Triple<String,Long,String?>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=Triple(n.id,n.version,null)}
-            else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);val stored=if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())encryptPrivacyEnvelope(env,s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
+            else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())require(s.password.isNotBlank()){"隐私笔记 ${n.title} 无法安全同步：私钥认证未配置 SSH 密码"};val stored=if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())encryptPrivacyEnvelope(env,s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
         }
         val idx=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)});add("deletedEntries",JsonArray().apply{deleted.values.forEach(::add)});remote?.get("repositoryFormat")?.takeIf{it.isJsonObject}?.let{add("repositoryFormat",it.deepCopy())}}
         // A freshly configured device often has no local changes after pulling.
@@ -688,11 +719,17 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private fun privacyKey(secret:String,salt:ByteArray,iterations:Int)=SecretKeySpec(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(PBEKeySpec(secret.toCharArray(),salt,iterations,256)).encoded,"AES")
     private val privacyCheckText="notebook-next-private-notes-v1"
     private fun verifyPrivacyKeyCheck(c:ChannelSftp,s:SshSettings){
+        // Private-key auth may leave no SSH password configured. The remote
+        // privacy check is password-derived, so skip it without a password;
+        // encrypted notes still fail loudly in decryptPrivacyEnvelope.
+        if(s.password.isBlank())return
         val check=readJson(c,"${s.path}/notes/privacy.json")?:return
         try{val iterations=check["iterations"].asInt;require(check["schemaVersion"].asInt==1&&check.str("algorithm")=="AES-256-GCM"&&check.str("kdf")=="PBKDF2-SHA256"&&iterations==privacyIterations);val salt=Base64.decode(check.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(check.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));require(String(cipher.doFinal(Base64.decode(check.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)==privacyCheckText)}catch(error:Throwable){throw IllegalStateException("隐私笔记密钥验证失败：SSH 密码与远端仓库不一致，已停止同步且未修改任何笔记",error)}
     }
     private fun ensurePrivacyKeyCheck(c:ChannelSftp,s:SshSettings){
-        if(encryptedNoteIds().isEmpty()||readJson(c,"${s.path}/notes/privacy.json")!=null)return
+        // Never publish a privacy check derived from an empty password: the
+        // note bodies themselves fail loudly in encryptPrivacyEnvelope.
+        if(s.password.isBlank()||encryptedNoteIds().isEmpty()||readJson(c,"${s.path}/notes/privacy.json")!=null)return
         val salt=ByteArray(16).also(SecureRandom()::nextBytes);val iv=ByteArray(12).also(SecureRandom()::nextBytes);val iterations=privacyIterations;val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,privacyKey(s.password,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(privacyCheckText.toByteArray(StandardCharsets.UTF_8));val encrypted=cipher.doFinal(privacyCheckText.toByteArray(StandardCharsets.UTF_8))
         val check=JsonObject().apply{addProperty("schemaVersion",1);addProperty("algorithm","AES-256-GCM");addProperty("kdf","PBKDF2-SHA256");addProperty("iterations",iterations);addProperty("salt",Base64.encodeToString(salt,Base64.NO_WRAP));addProperty("iv",Base64.encodeToString(iv,Base64.NO_WRAP));addProperty("ciphertext",Base64.encodeToString(encrypted,Base64.NO_WRAP))}
         atomicWrite(c,"${s.path}/notes/privacy.json",gson.toJson(check))

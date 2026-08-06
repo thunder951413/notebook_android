@@ -58,8 +58,8 @@ class ApiSyncClient(
         require(!uri.host.isNullOrBlank()){"服务地址缺少主机名"}
     }
 
-    private fun versionKey(workspaceId:String,type:String,id:String)="$workspaceId:$type:$id"
-    private suspend fun enqueue(workspaceId:String,type:String,id:String,operation:String,payload:JsonObject) {
+    internal fun versionKey(workspaceId:String,type:String,id:String)="$workspaceId:$type:$id"
+    internal suspend fun enqueue(workspaceId:String,type:String,id:String,operation:String,payload:JsonObject) {
         val existing=dao.apiOutboxItem(type,id)
         val expected=existing?.expectedVersion?:dao.apiVersion(versionKey(workspaceId,type,id))?.version?:0L
         dao.deleteApiOutbox(type,id)
@@ -118,7 +118,7 @@ class ApiSyncClient(
         pageIdFor(entityType,entityId,payload)?.let{pageId->dao.get(pageId)?.let{dao.put(it.copy(dirty=false,conflict=false,conflictSnapshotJson=null))}}
     }
 
-    private suspend fun queueDirtyRecords(workspaceId:String) {
+    internal suspend fun queueDirtyRecords(workspaceId:String) {
         dao.dirtyNotes().filterNot{it.conflict}.forEach{queueNote(workspaceId,it)}
         dao.dirtyAssets().forEach{asset->if(dao.apiOutboxItem("asset",asset.id)==null)enqueue(workspaceId,"asset",asset.id,"upsert",assetPayload(asset))}
     }
@@ -177,19 +177,19 @@ class ApiSyncClient(
         dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),version))
     }
 
-    private suspend fun applyPage(id:String,p:JsonObject,serverVersion:Long) {
+    internal suspend fun applyPage(id:String,p:JsonObject,serverVersion:Long) {
         val local=dao.get(id);val folderId=p.optionalString("sectionId");val folderName=folderId?.let{dao.getFolder(it)?.name}?:"未分类"
         val note=NoteEntity(id=id,title=p.string("title"),body=local?.body.orEmpty(),previewText=p.string("preview"),createdAt=p.millis("createdAt"),updatedAt=p.millis("updatedAt"),folderId=folderId,folderName=folderName,icon=p.optionalString("icon"),parentPageId=p.optionalString("parentPageId"),sortOrder=p["sortOrder"]?.asDouble?:local?.sortOrder?:0.0,treeUpdatedAt=p.optionalMillis("treeUpdatedAt")?:local?.treeUpdatedAt?:p.millis("createdAt"),reminderAt=p.optionalMillis("reminderAt"),recurrence=p.string("recurrenceRule","none"),version=p["legacyVersion"]?.asLong?:local?.version?:1,tagIds=local?.tagIds.orEmpty(),deletedAt=p.optionalMillis("deletedAt"),itemType=if(p.string("kind","document")=="task")"todo" else "note",dueAt=p.optionalMillis("dueAt"),completedAt=p.optionalMillis("completedAt"),important=p.boolean("important"),viewMode=local?.viewMode?:"preview",dirty=false,conflict=false,snapshotJson=local?.snapshotJson,conflictSnapshotJson=null,lastSyncedVersion=serverVersion)
         dao.put(note);dao.putApiPage(ApiPageEntity(id,gson.toJson(p),note.updatedAt))
     }
 
-    private suspend fun applyDocument(id:String,p:JsonObject) {
+    internal suspend fun applyDocument(id:String,p:JsonObject) {
         val json=p["tiptapJson"]?:JsonObject().apply{addProperty("type","doc");add("content",JsonArray())}
         val updated=p.optionalMillis("updatedAt")?:System.currentTimeMillis();dao.putApiDocument(ApiDocumentEntity(id,gson.toJson(json),p.integer("schemaVersion",1),updated))
         dao.get(id)?.let{note->val markdown=TipTapCodec.decode(json);dao.put(note.copy(body=markdown,previewText=TipTapCodec.plainText(markdown).take(240),updatedAt=maxOf(note.updatedAt,updated),dirty=false))}
     }
 
-    private suspend fun applyPageTag(p:JsonObject,add:Boolean) {val pageId=p.string("pageId");val tagId=p.string("tagId");dao.get(pageId)?.let{note->val ids=note.tagIds.split(',').filter(String::isNotBlank).toMutableSet();if(add)ids+=tagId else ids-=tagId;dao.put(note.copy(tagIds=ids.joinToString(",")))}}
+    internal suspend fun applyPageTag(p:JsonObject,add:Boolean) {val pageId=p.string("pageId");val tagId=p.string("tagId");dao.get(pageId)?.let{note->val ids=note.tagIds.split(',').filter(String::isNotBlank).toMutableSet();if(add)ids+=tagId else ids-=tagId;dao.put(note.copy(tagIds=ids.joinToString(",")))}}
     private suspend fun applyAsset(s:ApiSyncSettings,id:String,p:JsonObject,downloadBudget:RemoteTransferLimits.Budget) {
         val filename=p.string("filename","attachment").replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_")
         val relative="next/$id/$filename"
@@ -226,16 +226,16 @@ class ApiSyncClient(
         }
     }
 
-    private suspend fun recordConflict(pageId:String,type:String,payload:JsonObject){dao.get(pageId)?.let{note->
+    internal suspend fun recordConflict(pageId:String,type:String,payload:JsonObject){dao.get(pageId)?.let{note->
         val wrapper=note.conflictSnapshotJson?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?.takeIf{it.has("apiConflicts")}?:JsonObject().apply{add("apiConflicts",JsonObject())}
         wrapper["apiConflicts"].asJsonObject.add(type,payload.deepCopy());dao.put(note.copy(conflict=true,conflictSnapshotJson=gson.toJson(wrapper)))
     }}
 
-    private suspend fun applyDelete(type:String,id:String,p:JsonObject){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);dao.deleteNotePermanently(id)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->dao.deleteAsset(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
+    internal suspend fun applyDelete(type:String,id:String,p:JsonObject){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);dao.deleteNotePermanently(id)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->dao.deleteAsset(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
 
-    private fun stepPayload(s:TodoStepEntity)=JsonObject().apply{addProperty("id",s.id);addProperty("pageId",s.noteId);addProperty("text",s.text);addProperty("checked",s.checked);addProperty("sortOrder",s.sortOrder);addProperty("createdAt",iso(s.createdAt))}
-    private fun assetPayload(a:AssetEntity)=JsonObject().apply{addProperty("id",a.id);addProperty("pageId",a.noteId);addProperty("kind",a.kind);addProperty("filename",a.filename);addProperty("mimeType",a.mimeType);addProperty("byteSize",a.size);addProperty("checksum",a.contentHash);addProperty("createdAt",iso(File(a.localPath?:"").takeIf(File::exists)?.lastModified()?:System.currentTimeMillis()))}
-    private fun pageIdFor(type:String,id:String,p:JsonObject?)=when(type){"page","document"->id;"task_step","asset","page_tag","reading_position"->p?.optionalString("pageId")?:id.substringBefore(':');else->null}
+    internal fun stepPayload(s:TodoStepEntity)=JsonObject().apply{addProperty("id",s.id);addProperty("pageId",s.noteId);addProperty("text",s.text);addProperty("checked",s.checked);addProperty("sortOrder",s.sortOrder);addProperty("createdAt",iso(s.createdAt))}
+    internal fun assetPayload(a:AssetEntity)=JsonObject().apply{addProperty("id",a.id);addProperty("pageId",a.noteId);addProperty("kind",a.kind);addProperty("filename",a.filename);addProperty("mimeType",a.mimeType);addProperty("byteSize",a.size);addProperty("checksum",a.contentHash);addProperty("createdAt",iso(File(a.localPath?:"").takeIf(File::exists)?.lastModified()?:System.currentTimeMillis()))}
+    internal fun pageIdFor(type:String,id:String,p:JsonObject?)=when(type){"page","document"->id;"task_step","asset","page_tag","reading_position"->p?.optionalString("pageId")?:id.substringBefore(':');else->null}
     private fun execute(s:ApiSyncSettings,request:Request)=http.newCall(request.newBuilder().apply{if(s.token.isNotBlank())header("Authorization","Bearer ${s.token}")}.build()).execute().also{if(!it.isSuccessful){val detail=it.body?.string().orEmpty().take(500);it.close();throw IllegalStateException("同步服务返回 ${it.code}${if(detail.isBlank())"" else "：$detail"}")}}
     private fun assetUrl(s:ApiSyncSettings,id:String)="${s.baseUrl}/v1/sync/assets/${encoded(id)}?workspace_id=${encoded(s.workspaceId)}"
     companion object {private val JSON="application/json; charset=utf-8".toMediaType();private fun encoded(v:String)=URLEncoder.encode(v,StandardCharsets.UTF_8.name());private fun iso(ms:Long)=Instant.ofEpochMilli(ms).toString();private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}}

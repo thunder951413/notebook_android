@@ -681,23 +681,52 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit){
+    var backend by remember{mutableStateOf(repo.syncBackend())}
+    var w by remember{mutableStateOf(repo.webdavSettings())}
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
     suspend fun syncNow(){syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null;runCatching{repo.sync()}.onSuccess{message="连接成功，同步已完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"};else->message="连接或同步失败：${error.localizedMessage?:error.javaClass.simpleName}"};isError=true};syncing=false}
+    fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
     val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{parseSyncQrConfig(payload)}.onSuccess{config->s=config;repo.saveSettings(config);scope.launch{syncNow()}}.onFailure{message=it.message?:"无法读取配置二维码";isError=true}}}
+    var privateKeyPassphrase by remember{mutableStateOf(s.privateKeyPassphrase)}
+    val keyPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{runCatching{repo.importPrivateKey(source,privateKeyPassphrase)}.onSuccess{s=repo.settings();message="私钥已导入"}.onFailure{message=it.message?:"无法导入私钥";isError=true}}}}
     newKey?.let{key->AlertDialog(onDismissRequest={newKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("确认服务器身份")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("首次连接不会自动信任服务器。请将下面的 SHA-256 指纹与桌面端或服务器管理员提供的值核对，确认一致后再继续。");Text(key.actual,style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(key.actual);s=repo.settings();newKey=null;scope.launch{syncNow()}}){Text("指纹一致，信任并继续")}},dismissButton={TextButton({newKey=null}){Text("取消")}})}
     changedKey?.let{change->AlertDialog(onDismissRequest={changedKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("服务器身份已变化")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("这可能是服务器重装、SSH 密钥更新，也可能存在安全风险。确认这是你的服务器后才能继续。");Text("原指纹\n${change.expected}",style=MaterialTheme.typography.bodySmall);Text("新指纹\n${change.actual}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(change.actual);s=repo.settings();changedKey=null;scope.launch{syncNow()}}){Text("信任并继续")}},dismissButton={TextButton({changedKey=null}){Text("取消")}})}
     Scaffold(topBar={TopAppBar(title={Text("设置与同步")},navigationIcon={IconButton(onBack){Icon(Icons.Default.ArrowBack,null)}})}){p->
         Column(Modifier.padding(p).padding(20.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()),verticalArrangement=Arrangement.spacedBy(10.dp)){
             ReminderPermissionCard()
-            Text("SSH/SFTP 同步",fontWeight=FontWeight.SemiBold)
+            Text("同步方式",fontWeight=FontWeight.SemiBold)
+            Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
+                FilterChip(selected=backend==SyncBackend.WEBDAV,onClick={backend=SyncBackend.WEBDAV},label={Text("坚果云 WebDAV")})
+                FilterChip(selected=backend==SyncBackend.SSH,onClick={backend=SyncBackend.SSH},label={Text("SSH 服务器（旧版）")})
+            }
             message?.let{Card(colors=CardDefaults.cardColors(containerColor=if(isError)MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer),modifier=Modifier.fillMaxWidth()){Row(Modifier.padding(12.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp);Icon(if(isError)Icons.Default.ErrorOutline else Icons.Default.CheckCircle,null);Text(it,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall)}}}
             HorizontalDivider()
-            Button({scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("扫描 Notebook SSH 配置二维码").setBeepEnabled(false).setOrientationLocked(false))},Modifier.fillMaxWidth()){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描 SSH 配置二维码")}
-            fun update(host:String=s.host,port:Int=s.port,user:String=s.username,password:String=s.password,path:String=s.path){s=SshSettings(host,port,user,password,path,s.fingerprint)}
-            OutlinedTextField(s.host,{update(host=it)},label={Text("服务器地址")});OutlinedTextField(s.port.toString(),{update(port=it.toIntOrNull()?:22)},label={Text("端口")});OutlinedTextField(s.username,{update(user=it)},label={Text("用户名")});OutlinedTextField(s.password,{update(password=it)},label={Text("密码")},visualTransformation=PasswordVisualTransformation());OutlinedTextField(s.path,{update(path=it)},label={Text("远程目录")})
-            if(s.fingerprint.isNotBlank())Text("已信任主机指纹：${s.fingerprint}",style=MaterialTheme.typography.bodySmall)
-            Text("与 Notebook 网页助手和 Electron 桌面版共用同一套 SSH JSON 仓库，可长期双向同步。",style=MaterialTheme.typography.bodySmall)
-            Button({repo.saveSettings(s);scope.launch{syncNow()}},Modifier.fillMaxWidth(),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
+            if(backend==SyncBackend.WEBDAV){
+                Text("坚果云 WebDAV",fontWeight=FontWeight.SemiBold)
+                OutlinedTextField(w.baseUrl,{w=w.copy(baseUrl=it)},label={Text("服务器地址")},placeholder={Text("https://dav.jianguoyun.com/dav/")})
+                OutlinedTextField(w.username,{w=w.copy(username=it)},label={Text("用户名")})
+                OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
+                OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},label={Text("远程目录")})
+                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("同步密码（可选，仅用于隐私笔记）")},visualTransformation=PasswordVisualTransformation())
+                Text("坚果云需先在网页版“安全选项”中生成应用密码。笔记以 v4 日志格式存储在远端 journal/ 与 objects/ 目录，与 Electron 桌面版和网页助手共用同一仓库，可长期双向同步。",style=MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
+                    OutlinedButton({testWebdavNow()},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在检测…" else "检测连接")}
+                    Button({repo.saveWebdavSettings(w);backend=SyncBackend.WEBDAV;scope.launch{syncNow()}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
+                }
+            }else{
+                Text("SSH/SFTP 同步",fontWeight=FontWeight.SemiBold)
+                Button({scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("扫描 Notebook SSH 配置二维码").setBeepEnabled(false).setOrientationLocked(false))},Modifier.fillMaxWidth()){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描 SSH 配置二维码")}
+                fun update(host:String=s.host,port:Int=s.port,user:String=s.username,password:String=s.password,path:String=s.path,privateKeyPath:String=s.privateKeyPath){s=SshSettings(host,port,user,password,path,s.fingerprint,privateKeyPath,privateKeyPassphrase)}
+                OutlinedTextField(s.host,{update(host=it)},label={Text("服务器地址")});OutlinedTextField(s.port.toString(),{update(port=it.toIntOrNull()?:22)},label={Text("端口")});OutlinedTextField(s.username,{update(user=it)},label={Text("用户名")});OutlinedTextField(s.password,{update(password=it)},label={Text("密码（可选）")},visualTransformation=PasswordVisualTransformation());OutlinedTextField(s.path,{update(path=it)},label={Text("远程目录")})
+                HorizontalDivider();Text("SSH 私钥",fontWeight=FontWeight.SemiBold)
+                if(s.privateKeyPath.isNotBlank())Text("已导入：${s.privateKeyPath}",style=MaterialTheme.typography.bodySmall)
+                OutlinedTextField(privateKeyPassphrase,{privateKeyPassphrase=it;update()},label={Text("私钥口令（可选）")},visualTransformation=PasswordVisualTransformation())
+                Button({keyPicker.launch(arrayOf("*/*"))},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.Key,null);Spacer(Modifier.width(8.dp));Text(if(s.privateKeyPath.isBlank())"导入私钥文件" else "重新导入私钥")}
+                if(s.privateKeyPath.isNotBlank())OutlinedButton({repo.clearPrivateKey();s=repo.settings()}){Text("清除私钥")}
+                if(s.fingerprint.isNotBlank())Text("已信任主机指纹：${s.fingerprint}",style=MaterialTheme.typography.bodySmall)
+                Text("与 Notebook 网页助手和 Electron 桌面版共用同一套 SSH JSON 仓库，可长期双向同步。",style=MaterialTheme.typography.bodySmall)
+                Button({repo.saveSettings(s);scope.launch{syncNow()}},Modifier.fillMaxWidth(),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
+            }
         }
     }
 }
