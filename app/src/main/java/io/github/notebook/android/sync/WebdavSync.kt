@@ -115,6 +115,7 @@ class WebdavSyncClient(
     private val dao: NotebookDao,
     private val prefs: SharedPreferences,
     private val api: ApiSyncClient,
+    private val allowInsecureHttp: Boolean = BuildConfig.DEBUG,
 ) {
     private val gson = GsonBuilder().disableHtmlEscaping().create()
     /** Entities that conflicted during the latest pull stay queued for the user. */
@@ -123,7 +124,7 @@ class WebdavSyncClient(
     fun fingerprint(settings: WebdavSettings) = "${settings.baseUrl.trim()}|${settings.username.trim()}|${settings.remotePath.trim()}"
 
     private fun client(settings: WebdavSettings) =
-        WebdavClient(settings.baseUrl, settings.username, settings.appPassword, settings.remotePath, allowInsecureHttp = BuildConfig.DEBUG)
+        WebdavClient(settings.baseUrl, settings.username, settings.appPassword, settings.remotePath, allowInsecureHttp = allowInsecureHttp)
 
     private fun validate(settings: WebdavSettings) {
         require(settings.baseUrl.isNotBlank()) { "请先配置坚果云 WebDAV 同步：服务器地址不能为空" }

@@ -113,7 +113,7 @@ class WebdavSyncTest {
         prefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences("webdav-test-${UUID.randomUUID()}", android.content.Context.MODE_PRIVATE)
         prefs.edit().putString("device", deviceId).apply()
         api = ApiSyncClient(ApplicationProvider.getApplicationContext(), database.dao(), allowInsecureHttp = true)
-        client = WebdavSyncClient(ApplicationProvider.getApplicationContext(), database.dao(), prefs, api)
+        client = WebdavSyncClient(ApplicationProvider.getApplicationContext(), database.dao(), prefs, api, allowInsecureHttp = true)
     }
 
     @After
