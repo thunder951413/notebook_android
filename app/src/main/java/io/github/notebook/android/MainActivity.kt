@@ -101,7 +101,8 @@ class MainActivity : ComponentActivity() {
         setContent { NotebookTheme { NotebookScreen(repository,notificationTarget.value){notificationTarget.value=null} } }
     }
     override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);notificationTarget.value=intent.getStringExtra("noteId")}
-    override fun onStop(){repository.flushAllAsync();super.onStop()}
+    override fun onStart(){super.onStart();repository.requestForegroundSync()}
+    override fun onStop(){repository.onAppBackgrounded();super.onStop()}
 }
 
 internal enum class Destination(val title:String,val newItemType:String?="note") { Today("今天","todo"), Important("重要","todo"), Todos("全部待办","todo"), Completed("已完成",null), All("全部笔记"), Unfiled("未分类"), Conflicts("同步冲突"), Trash("回收站",null) }
@@ -714,8 +715,8 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 OutlinedTextField(w.username,{w=w.copy(username=it)},label={Text("用户名")})
                 OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
                 OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},label={Text("远程目录")})
-                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("同步密码（可选，仅用于隐私笔记）")},visualTransformation=PasswordVisualTransformation())
-                Text("坚果云需先在网页版“安全选项”中生成应用密码。笔记以 v4 日志格式存储在远端 journal/ 与 objects/ 目录，与 Electron 桌面版和网页助手共用同一仓库，可长期双向同步。",style=MaterialTheme.typography.bodySmall)
+                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("同步密码（桌面端兼容）")},visualTransformation=PasswordVisualTransformation())
+                Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。隐私笔记及其关联数据当前严格保留在本机。",style=MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                     OutlinedButton({testWebdavNow()},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在检测…" else "检测连接")}
                     Button({repo.saveWebdavSettings(w);backend=SyncBackend.WEBDAV;scope.launch{syncNow()}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}

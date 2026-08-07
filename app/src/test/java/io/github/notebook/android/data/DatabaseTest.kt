@@ -158,4 +158,14 @@ class DatabaseTest {
         assertFalse(dao.putReadingPositionIfNoteExists(ReadingPositionEntity("gone",12,.2,99,"android")))
         assertNull(dao.readingPosition("gone"))
     }
+
+    @Test fun `reading position stays dirty until its exact snapshot is acknowledged`()=runBlocking {
+        dao.put(NoteEntity("n"))
+        dao.putReadingPosition(ReadingPositionEntity("n",12,.2,99,"android",dirty=true))
+        assertEquals(listOf("n"),dao.dirtyReadingPositions().map{it.noteId})
+        dao.markReadingPositionSynced("n",98)
+        assertTrue(dao.readingPosition("n")!!.dirty)
+        dao.markReadingPositionSynced("n",99)
+        assertFalse(dao.readingPosition("n")!!.dirty)
+    }
 }

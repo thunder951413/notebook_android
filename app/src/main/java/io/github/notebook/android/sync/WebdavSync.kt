@@ -44,14 +44,30 @@ internal data class WebdavJournalEntry(
     val payload: JsonObject,
 )
 
+/** Small commit marker written after a journal PUT. Old v4 clients ignore it. */
+internal data class WebdavJournalHead(
+    val version: Int,
+    val deviceId: String,
+    val lastSeq: Long,
+    val journalBytes: Int,
+    val journalSha256: String,
+    val updatedAt: String,
+    val stateEntries: Int,
+    val historyEntries: Int,
+)
+
 /** Wire format shared with Notebook Next Electron/desktop (v4 append-only journal). */
 internal object WebdavJournalProtocol {
     const val DEFAULT_WORKSPACE_ID = "00000000-0000-4000-8000-000000000001"
     const val EXTERNALIZE_BYTES = 2048
-    const val MAX_LOG_BYTES = 4 * 1024 * 1024
+    const val MAX_LOG_BYTES = 100 * 1024 * 1024
     const val MAX_ENTRIES = 100_000
     const val MAX_OBJECT_BYTES = 100 * 1024 * 1024
+    const val MAX_HEAD_BYTES = 64 * 1024
+    const val MAX_REVISION_ENTRIES = 256
+    const val MAX_REVISION_BYTES = 2 * 1024 * 1024
     const val OBJECT_MARKER = "${'$'}object"
+    const val PAYLOAD_OBJECT_MARKER = "${'$'}payloadObject"
     private val DEVICE_ID_PATTERN = Regex("^[0-9a-f-]{36}$", RegexOption.IGNORE_CASE)
     private val HASH_PATTERN = Regex("^[0-9a-f]{64}$", RegexOption.IGNORE_CASE)
 
@@ -76,6 +92,25 @@ internal object WebdavJournalProtocol {
             if (count > 0) digest.update(buffer, 0, count)
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    fun parseHead(text: String): WebdavJournalHead {
+        val root = JsonParser.parseString(text).asJsonObject
+        val version = root["version"]?.asInt ?: error("远端日志索引缺少版本")
+        require(version == 1) { "远端日志索引版本不支持" }
+        val deviceId = requireDeviceId(root["deviceId"]?.asString ?: error("远端日志索引缺少设备 ID"))
+        val lastSeq = root["lastSeq"]?.asLong ?: error("远端日志索引缺少序号")
+        val journalBytes = root["journalBytes"]?.asInt ?: error("远端日志索引缺少大小")
+        require(lastSeq >= 0 && journalBytes in 0..MAX_LOG_BYTES) { "远端日志索引不合法" }
+        val hash = requireHash(root["journalSha256"]?.asString ?: error("远端日志索引缺少校验值"))
+        val updatedAt = root["updatedAt"]?.takeIf { it.isJsonPrimitive }?.asString
+            ?: error("远端日志索引缺少更新时间")
+        val stateEntries = root["stateEntries"]?.asInt ?: error("远端日志索引缺少状态计数")
+        val historyEntries = root["historyEntries"]?.asInt ?: error("远端日志索引缺少历史计数")
+        require(stateEntries >= 0 && historyEntries >= 0) { "远端日志索引不合法" }
+        return WebdavJournalHead(
+            version, deviceId, lastSeq, journalBytes, hash, updatedAt, stateEntries, historyEntries,
+        )
     }
 
     /** Parse a journal file body into entries, tolerating a trailing newline. */
@@ -153,42 +188,85 @@ class WebdavSyncClient(
             // Pull first so a device joining an existing repository adopts the
             // shared state before publishing; an empty repository is seeded by
             // the full local library (equivalent to the desktop migration).
-            val deviceIds = pull(settings, budget)
-            if (deviceIds.isEmpty()) queueInitialSnapshot() else api.queueDirtyRecords(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID)
-            push(settings)
+            val client = client(settings)
+            val deviceIds = pull(settings, client, budget)
+            val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
+            if (deviceIds.isEmpty()) queueInitialSnapshot()
+            else if (dao.apiOutboxCount(workspace) == 0 && (dao.dirtyNoteCount() > 0 || dao.dirtyAssetCount() > 0)) api.queueDirtyRecords(workspace)
+            push(settings, client)
             // Second pull catches entries published by other devices while this
             // device was pushing (mirrors the API backend's pull/push/pull).
-            pull(settings, budget)
+            pull(settings, client, budget)
         }
     }
 
     // ---- Pull -----------------------------------------------------------------
 
-    private suspend fun pull(settings: WebdavSettings, budget: RemoteTransferLimits.Budget): List<String> {
-        val client = client(settings)
+    private suspend fun pull(settings: WebdavSettings, client: WebdavClient, budget: RemoteTransferLimits.Budget): List<String> {
         client.ensureDirectory("${settings.remotePath.trim()}/journal")
         val deviceIds = client.listJournalNames()
         val seqs = knownSeqs(settings)
         for (deviceId in deviceIds) {
-            val text = client.getText(client.journalPath(deviceId)) ?: continue
-            val entries = WebdavJournalProtocol.parseJournal(text)
             val known = seqs[deviceId] ?: 0L
-            for (entry in entries) {
-                if (entry.seq <= known) continue
-                applyJournalEntry(client, entry, budget)
+            val head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
+                ?.let { WebdavJournalProtocol.parseHead(it) }
+            if (head != null) {
+                require(head.deviceId == deviceId) { "远端日志索引设备 ID 不匹配" }
+                if (head.lastSeq <= known) continue
             }
-            seqs[deviceId] = max(known, entries.lastOrNull()?.seq ?: 0L)
+            // No head is a legacy v4 journal; retain its full-read compatibility.
+            val text = client.getText(client.journalPath(deviceId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES) ?: continue
+            val entries = WebdavJournalProtocol.parseJournal(text)
+            if (head != null) {
+                val bytes = text.toByteArray(Charsets.UTF_8)
+                val matchesHead = bytes.size == head.journalBytes &&
+                    WebdavJournalProtocol.sha256(bytes).equals(head.journalSha256, ignoreCase = true)
+                // A journal can have an uncommitted tail when a v1 writer put
+                // the journal but lost its final head PUT. That tail is hidden
+                // until a matching head arrives; any other mismatch is corrupt.
+                if (!matchesHead) {
+                    val committedPrefixMatches = bytes.size >= head.journalBytes &&
+                        WebdavJournalProtocol.sha256(bytes.copyOfRange(0, head.journalBytes)).equals(head.journalSha256, ignoreCase = true)
+                    require((entries.maxOfOrNull { it.seq } ?: 0L) > head.lastSeq && committedPrefixMatches) { "远端日志索引校验失败" }
+                }
+            }
+            var committed = known
+            for (entry in entries.asSequence().filter { it.seq <= (head?.lastSeq ?: Long.MAX_VALUE) }) {
+                if (entry.seq <= known) continue
+                if (!applyJournalEntry(client, entry, budget)) break
+                committed = max(committed, entry.seq)
+            }
+            seqs[deviceId] = committed
         }
         saveKnownSeqs(settings, seqs)
         return deviceIds
     }
 
-    private suspend fun applyJournalEntry(client: WebdavClient, entry: WebdavJournalEntry, budget: RemoteTransferLimits.Budget) {
+    /** Returns false for a conflict so the caller can keep the cursor at the committed prefix. */
+    private suspend fun applyJournalEntry(client: WebdavClient, entry: WebdavJournalEntry, budget: RemoteTransferLimits.Budget): Boolean {
         val type = entry.type
         val id = entry.id
         val version = entry.ver
         val operation = entry.op
         var payload = entry.payload
+        if (type == "document" && operation == "upsert") {
+            val payloadMarker = payload[WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER]
+                ?.takeIf { it.isJsonPrimitive }?.asString
+            if (payloadMarker != null) {
+                val hash = WebdavJournalProtocol.requireHash(payloadMarker)
+                val bytes = client.getBytes(client.objectPath(hash)) ?: error("远端对象 $hash 不存在")
+                require(WebdavJournalProtocol.sha256(bytes).equals(hash, ignoreCase = true)) { "远端对象 $hash 的 SHA-256 校验失败" }
+                payload = JsonParser.parseString(String(bytes, Charsets.UTF_8)).asJsonObject
+            }
+        }
+        val pending = dao.apiOutboxItem(type, id)
+        val affectedPage = api.pageIdFor(type, id, payload)
+        val locallyDirty = affectedPage?.let { dao.get(it)?.dirty } == true
+        if ((pending != null && version > pending.expectedVersion) || locallyDirty) {
+            conflictKeys.add("$type:$id")
+            affectedPage?.let { api.recordConflict(it, type, payload) }
+            return false
+        }
         // Restore externalized document bodies fetched from objects/.
         if (type == "document" && operation == "upsert") {
             val marker = payload["tiptapJson"]?.takeIf { it.isJsonObject }?.asJsonObject
@@ -196,6 +274,7 @@ class WebdavSyncClient(
             if (marker != null) {
                 val hash = WebdavJournalProtocol.requireHash(marker)
                 val bytes = client.getBytes(client.objectPath(hash)) ?: error("远端对象 $marker 不存在")
+                require(WebdavJournalProtocol.sha256(bytes).equals(hash, ignoreCase = true)) { "远端对象 $hash 的 SHA-256 校验失败" }
                 payload = payload.deepCopy()
                 payload.add("tiptapJson", JsonParser.parseString(String(bytes, Charsets.UTF_8)))
             }
@@ -204,15 +283,6 @@ class WebdavSyncClient(
             val hash = entry.hash ?: payload.optionalString("objectHash") ?: payload.optionalString("checksum")
             require(hash != null) { "附件 $id 缺少对象哈希，已停止同步" }
             downloadAsset(client, id, payload, WebdavJournalProtocol.requireHash(hash), budget)
-        }
-        val pending = dao.apiOutboxItem(type, id)
-        val affectedPage = api.pageIdFor(type, id, payload)
-        val locallyDirty = affectedPage?.let { dao.get(it)?.dirty } == true
-        if ((pending != null && version > pending.expectedVersion) || locallyDirty) {
-            conflictKeys.add("$type:$id")
-            affectedPage?.let { api.recordConflict(it, type, payload) }
-            dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), version))
-            return
         }
         if (operation == "delete") api.applyDelete(type, id, payload) else when (type) {
             "notebook" -> dao.putApiNotebook(io.github.notebook.android.data.ApiNotebookEntity(
@@ -238,6 +308,7 @@ class WebdavSyncClient(
             ))
         }
         dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), version))
+        return true
     }
 
     private suspend fun downloadAsset(client: WebdavClient, id: String, payload: JsonObject, hash: String, budget: RemoteTransferLimits.Budget) {
@@ -275,7 +346,7 @@ class WebdavSyncClient(
             api.queueNote(workspace, note)
             dao.assets(note.id).forEach { api.queueAsset(workspace, it) }
         }
-        dao.allReadingPositions().forEach { api.queueReadingPosition(workspace, it) }
+        dao.allReadingPositions().filter { it.noteId !in encryptedNotes }.forEach { api.queueReadingPosition(workspace, it) }
     }
 
     /** Notes inside encrypted folders must never leave this device in plaintext. */
@@ -286,18 +357,28 @@ class WebdavSyncClient(
         return ids + mappings.filterValues { it in encryptedFolderIds }.keys
     }
 
-    private suspend fun push(settings: WebdavSettings) {
+    private suspend fun push(settings: WebdavSettings, client: WebdavClient) {
         val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
         val outgoing = dao.apiOutbox(workspace, 200).filter { "${it.entityType}:${it.entityId}" !in conflictKeys }
         if (outgoing.isEmpty()) return
         val deviceId = WebdavJournalProtocol.requireDeviceId(webdavDeviceId(prefs))
-        val client = client(settings)
         val encryptedNotes = encryptedNoteIds()
+        val encryptedFolders = dao.allFolders().filter { it.type == "encryptedFolder" }.map { it.id }.toSet()
         val entries = mutableListOf<JsonObject>()
+        // Only acknowledge rows that were actually serialized into the journal.
+        // Malformed records stay queued for repair. Private records are removed
+        // from the network outbox because they are intentionally local-only.
+        val published = mutableListOf<io.github.notebook.android.data.ApiSyncOutboxEntity>()
+        val localOnly = mutableListOf<io.github.notebook.android.data.ApiSyncOutboxEntity>()
         for (item in outgoing) {
-            val payload = runCatching { JsonParser.parseString(item.payloadJson).asJsonObject }.getOrNull() ?: continue
-            // Encrypted notes never sync in plaintext through the v4 journal.
-            if (item.entityId in encryptedNotes && item.entityType in setOf("page", "document", "asset", "task_step", "page_tag")) continue
+            var payload = runCatching { JsonParser.parseString(item.payloadJson).asJsonObject }.getOrNull() ?: continue
+            // Assets, steps, page-tag relations and reading positions use ids
+            // different from their owning note, so resolve pageId from payload.
+            val affectedPage = api.pageIdFor(item.entityType, item.entityId, payload)
+            if (affectedPage in encryptedNotes || (item.entityType == "section" && item.entityId in encryptedFolders)) {
+                localOnly.add(item)
+                continue
+            }
             val entry = JsonObject()
             entry.addProperty("ts", Instant.now().toString())
             entry.addProperty("op", item.operation)
@@ -306,16 +387,12 @@ class WebdavSyncClient(
             entry.addProperty("ver", item.expectedVersion)
             when (item.entityType) {
                 "document" -> if (item.operation == "upsert") {
-                    val tiptap = payload["tiptapJson"]
-                    if (tiptap != null && tiptap.isJsonObject) {
-                        val json = gson.toJson(tiptap)
-                        if (json.length > WebdavJournalProtocol.EXTERNALIZE_BYTES) {
-                            val bytes = json.toByteArray(Charsets.UTF_8)
-                            val hash = WebdavJournalProtocol.sha256(bytes)
-                            client.putObject(hash, bytes)
-                            payload.add("tiptapJson", JsonObject().apply { addProperty(WebdavJournalProtocol.OBJECT_MARKER, hash) })
-                            entry.addProperty("hash", hash)
-                        }
+                    val bytes = gson.toJson(payload).toByteArray(Charsets.UTF_8)
+                    if (bytes.size > WebdavJournalProtocol.EXTERNALIZE_BYTES) {
+                        val hash = WebdavJournalProtocol.sha256(bytes)
+                        client.putObject(hash, bytes)
+                        payload = JsonObject().apply { addProperty(WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER, hash) }
+                        entry.addProperty("hash", hash)
                     }
                 }
                 "asset" -> if (item.operation == "upsert") {
@@ -331,15 +408,22 @@ class WebdavSyncClient(
             }
             entry.add("payload", payload)
             entries.add(entry)
+            published.add(item)
+        }
+        for (item in localOnly) {
+            dao.deleteApiOutboxById(item.id)
+            if (item.entityType == "page") dao.get(item.entityId)?.let { dao.put(it.copy(dirty = false)) }
+            if (item.entityType == "asset") dao.getAsset(item.entityId)?.let { dao.putAssets(listOf(it.copy(dirty = false))) }
         }
         if (entries.isEmpty()) return
         val pushed = appendJournal(client, deviceId, entries)
-        for (item in outgoing) {
+        for (item in published) {
             dao.deleteApiOutboxById(item.id)
             val version = item.expectedVersion + 1
             dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(workspace, item.entityType, item.entityId), version))
             if (item.entityType == "page") dao.get(item.entityId)?.let { dao.put(it.copy(dirty = false, lastSyncedVersion = version)) }
             if (item.entityType == "asset") dao.getAsset(item.entityId)?.let { dao.putAssets(listOf(it.copy(dirty = false))) }
+            if (item.entityType == "reading_position") markReadingPositionSynced(item.payloadJson)
         }
         val seqs = knownSeqs(settings)
         seqs[deviceId] = max(seqs[deviceId] ?: 0L, pushed.first + pushed.second - 1)
@@ -349,28 +433,77 @@ class WebdavSyncClient(
     /** WebDAV has no append primitive: fetch the journal, append locally, PUT the whole file. */
     private fun appendJournal(client: WebdavClient, deviceId: String, entries: List<JsonObject>): Pair<Long, Int> {
         val path = client.journalPath(deviceId)
-        val existing = client.getText(path)?.let { WebdavJournalProtocol.parseJournal(it) } ?: emptyList()
-        if (existing.size + entries.size > WebdavJournalProtocol.MAX_ENTRIES) error("设备日志条目数超过 10 万，请先压缩日志")
-        val firstSeq = (existing.lastOrNull()?.seq ?: 0L) + 1
+        // A device is the sole writer of its journal. It may have exceeded the
+        // 4 MB steady-state limit before this push gets a chance to compact it,
+        // so allow the larger object safety cap while reading our own log.
+        val existing = client.getText(path, maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES)
+            ?.let { WebdavJournalProtocol.parseJournal(it) } ?: emptyList()
+        // Keep the sequence numbers monotonic across compaction: other devices
+        // filter by per-device cursors, so seq values must never shrink.
+        val firstSeq = (existing.maxOfOrNull { it.seq } ?: 0L) + 1
         val lines = entries.mapIndexed { index, entry ->
             entry.deepCopy().apply { addProperty("seq", firstSeq + index) }
         }
-        val body = (existing.map { existingEntry ->
-            JsonObject().apply {
-                addProperty("seq", existingEntry.seq)
-                addProperty("ts", existingEntry.ts)
-                addProperty("op", existingEntry.op)
-                addProperty("type", existingEntry.type)
-                addProperty("id", existingEntry.id)
-                addProperty("ver", existingEntry.ver)
-                existingEntry.hash?.let { addProperty("hash", it) }
-                add("payload", existingEntry.payload)
+        val appended = existing + lines.map { it.toJournalEntry() }
+        // Compact every write. State is an LWW snapshot (including tombstones);
+        // revisions are bounded history, not an ever-growing event stream.
+        val state = appended.filterNot { it.type == "revision" }
+            .groupBy { it.type to it.id }.values.map { it.maxBy { entry -> entry.seq } }
+        val revisions = appended.filter { it.type == "revision" }
+            .groupBy { it.type to it.id }.values.map { it.maxBy { entry -> entry.seq } }
+            .sortedByDescending { it.seq }
+        var revisionBytes = 0
+        val retainedRevisions = mutableListOf<WebdavJournalEntry>()
+        for (revision in revisions) {
+            val size = utf8Size(gson.toJson(revision)) + 1
+            if (retainedRevisions.size >= WebdavJournalProtocol.MAX_REVISION_ENTRIES) break
+            if (retainedRevisions.isNotEmpty() && revisionBytes + size > WebdavJournalProtocol.MAX_REVISION_BYTES) break
+            run {
+                retainedRevisions.add(revision)
+                revisionBytes += size
             }
-        } + lines).joinToString("\n") { gson.toJson(it) } + "\n"
-        if (body.length > WebdavJournalProtocol.MAX_LOG_BYTES) error("设备日志超过 4 MB 上限")
+        }
+        val retained = (state + retainedRevisions).sortedBy { it.seq }
+        if (retained.size > WebdavJournalProtocol.MAX_ENTRIES) error("设备日志条目数超过 10 万，请先压缩日志")
+        val body = retained.joinToString("\n") { gson.toJson(it) } + "\n"
+        if (utf8Size(body) > WebdavJournalProtocol.MAX_LOG_BYTES) error("设备日志压缩后超过 100 MB 上限")
         client.putText(path, body)
+        // The head is the commit marker: readers trust it only after the journal
+        // exists with the exact advertised bytes and checksum.
+        val bodyBytes = body.toByteArray(Charsets.UTF_8)
+        val head = JsonObject().apply {
+            addProperty("version", 1)
+            addProperty("deviceId", deviceId)
+            addProperty("lastSeq", retained.maxOfOrNull { it.seq } ?: 0L)
+            addProperty("journalBytes", bodyBytes.size)
+            addProperty("journalSha256", WebdavJournalProtocol.sha256(bodyBytes))
+            addProperty("updatedAt", Instant.now().toString())
+            addProperty("stateEntries", state.size)
+            addProperty("historyEntries", retainedRevisions.size)
+        }
+        client.putText(client.journalHeadPath(deviceId), gson.toJson(head))
         return firstSeq to entries.size
     }
+
+    private fun utf8Size(text: String) = text.toByteArray(Charsets.UTF_8).size
+
+    private suspend fun markReadingPositionSynced(payloadJson: String) {
+        val payload = runCatching { JsonParser.parseString(payloadJson).asJsonObject }.getOrNull() ?: return
+        val noteId = payload.optionalString("pageId") ?: return
+        val updatedAt = payload.optionalMillis("updatedAt") ?: return
+        dao.markReadingPositionSynced(noteId, updatedAt)
+    }
+
+    private fun JsonObject.toJournalEntry() = WebdavJournalEntry(
+        seq = get("seq").asLong,
+        ts = get("ts").asString,
+        op = get("op").asString,
+        type = get("type").asString,
+        id = get("id").asString,
+        ver = get("ver").asLong,
+        hash = get("hash")?.takeUnless { it.isJsonNull }?.asString,
+        payload = getAsJsonObject("payload"),
+    )
 
     // ---- Per-repository read cursors -------------------------------------------
 

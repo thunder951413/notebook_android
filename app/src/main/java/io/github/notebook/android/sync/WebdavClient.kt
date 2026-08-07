@@ -43,11 +43,17 @@ class WebdavClient(
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(120, TimeUnit.SECONDS)
+        // Do not carry Basic credentials through redirects. The configured
+        // endpoint must already be the canonical WebDAV URL.
+        .followRedirects(false)
+        .followSslRedirects(false)
         // 坚果云 serves HTTP/2 but its h2 implementation stalls OkHttp streams
         // (responses never arrive, only the 60s read timeout fires). Force
         // HTTP/1.1 — the protocol the Electron/Python clients already use.
         .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
         .build()
+    private val ensuredDirectories = mutableSetOf<String>()
+    private val knownObjects = mutableSetOf<String>()
 
     companion object {
         /** Idempotent WebDAV verbs make retrying a dropped connection safe. */
@@ -63,6 +69,7 @@ class WebdavClient(
     }
 
     fun journalPath(deviceId: String) = "$root/journal/$deviceId.jsonl"
+    fun journalHeadPath(deviceId: String) = "$root/journal/$deviceId.head.json"
     fun objectPath(hash: String) = "$root/objects/${hash.take(2)}/$hash"
 
     private fun url(path: String) = "$base/$path"
@@ -88,17 +95,16 @@ class WebdavClient(
     }
 
     private fun fail(response: Response, context: String): IOException {
-        val detail = response.body?.string().orEmpty().take(300)
         val code = response.code
         return when {
             code == 401 || code == 403 -> IOException("$context（HTTP $code）：WebDAV 认证失败，请检查用户名与应用密码")
-            detail.isBlank() -> IOException("$context（HTTP $code）")
-            else -> IOException("$context（HTTP $code：$detail）")
+            code in 300..399 -> IOException("$context（HTTP $code）：WebDAV 地址发生重定向，请填写最终的 HTTPS 地址")
+            else -> IOException("$context（HTTP $code）")
         }
     }
 
     private fun Response.requireStatus(context: String) {
-        if (!isSuccessful && code !in setOf(405, 409, 301, 302)) throw fail(this, context)
+        if (!isSuccessful && code !in setOf(405, 409)) throw fail(this, context)
     }
 
     /** MKCOL every path segment; 坚果云 rejects nested MKCOL (409) when the parent is missing. */
@@ -106,7 +112,9 @@ class WebdavClient(
         var current = ""
         for (segment in path.split('/').filter(String::isNotBlank)) {
             current = if (current.isEmpty()) segment else "$current/$segment"
+            if (current in ensuredDirectories) continue
             request("MKCOL", current).use { it.requireStatus("创建远端目录 $current 失败") }
+            ensuredDirectories.add(current)
         }
     }
 
@@ -117,14 +125,30 @@ class WebdavClient(
 
     fun putObject(hash: String, bytes: ByteArray) {
         WebdavJournalProtocol.requireHash(hash)
+        if (hash in knownObjects) return
+        val existing = getBytes(objectPath(hash))
+        if (existing != null && WebdavJournalProtocol.sha256(existing).equals(hash, ignoreCase = true)) {
+            knownObjects.add(hash)
+            return
+        }
+        ensureDirectory("$root/objects/${hash.take(2)}")
         val body = bytes.toRequestBody("application/octet-stream".toMediaType())
         request("PUT", objectPath(hash), body).use { it.requireStatus("上传对象 $hash 失败") }
+        knownObjects.add(hash)
     }
 
     fun putObject(hash: String, file: File) {
         WebdavJournalProtocol.requireHash(hash)
+        if (hash in knownObjects) return
+        val existing = getBytes(objectPath(hash))
+        if (existing != null && existing.inputStream().use(WebdavJournalProtocol::sha256).equals(hash, ignoreCase = true)) {
+            knownObjects.add(hash)
+            return
+        }
+        ensureDirectory("$root/objects/${hash.take(2)}")
         val body = file.asRequestBody("application/octet-stream".toMediaType())
         request("PUT", objectPath(hash), body).use { it.requireStatus("上传对象 $hash 失败") }
+        knownObjects.add(hash)
     }
 
     /** GET as UTF-8 text, or null when the resource does not exist. */

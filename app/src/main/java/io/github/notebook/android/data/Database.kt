@@ -121,7 +121,9 @@ data class ReadingPositionEntity(
     val anchorUtf16Offset:Int,
     val viewportOffsetFraction:Double,
     val updatedAt:Long,
-    val deviceId:String
+    val deviceId:String,
+    /** Position writes are coalesced locally and published only at a sync boundary. */
+    val dirty:Boolean=false,
 )
 @Entity(
     tableName="page_links",
@@ -179,6 +181,7 @@ data class ApiSyncOutboxEntity(
     @Query("SELECT id FROM notes WHERE title LIKE '%' || :query || '%' OR body LIKE '%' || :query || '%'") suspend fun searchNoteIds(query:String):List<String>
     @Query("SELECT * FROM notes") suspend fun allNotes(): List<NoteEntity>
     @Query("SELECT * FROM notes WHERE dirty=1") suspend fun dirtyNotes(): List<NoteEntity>
+    @Query("SELECT COUNT(*) FROM notes WHERE dirty=1") suspend fun dirtyNoteCount():Int
     @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
     @Upsert suspend fun put(note:NoteEntity)
     @Upsert suspend fun putNotes(notes:List<NoteEntity>)
@@ -207,6 +210,7 @@ data class ApiSyncOutboxEntity(
     @Query("SELECT * FROM assets WHERE id=:id") suspend fun getAsset(id:String):AssetEntity?
     @Query("SELECT * FROM assets WHERE noteId=:noteId") fun observeAssets(noteId:String):Flow<List<AssetEntity>>
     @Query("SELECT * FROM assets WHERE dirty=1") suspend fun dirtyAssets():List<AssetEntity>
+    @Query("SELECT COUNT(*) FROM assets WHERE dirty=1") suspend fun dirtyAssetCount():Int
     @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putAssets(items:List<AssetEntity>)
     @Query("DELETE FROM assets WHERE id=:id") suspend fun deleteAsset(id:String)
     @Query("SELECT * FROM tombstones") suspend fun tombstones():List<TombstoneEntity>
@@ -220,12 +224,14 @@ data class ApiSyncOutboxEntity(
     @Query("DELETE FROM drafts WHERE noteId=:noteId") suspend fun deleteDraft(noteId:String)
     @Query("SELECT * FROM reading_positions WHERE noteId=:noteId") suspend fun readingPosition(noteId:String):ReadingPositionEntity?
     @Query("SELECT * FROM reading_positions") suspend fun allReadingPositions():List<ReadingPositionEntity>
+    @Query("SELECT * FROM reading_positions WHERE dirty=1") suspend fun dirtyReadingPositions():List<ReadingPositionEntity>
     @Upsert suspend fun putReadingPosition(position:ReadingPositionEntity)
     @Transaction suspend fun putReadingPositionIfNoteExists(position:ReadingPositionEntity):Boolean{
         if(get(position.noteId)==null)return false
         putReadingPosition(position)
         return true
     }
+    @Query("UPDATE reading_positions SET dirty=0 WHERE noteId=:noteId AND updatedAt=:updatedAt") suspend fun markReadingPositionSynced(noteId:String,updatedAt:Long)
     @Query("DELETE FROM reading_positions WHERE noteId=:noteId") suspend fun deleteReadingPosition(noteId:String)
     @Query("SELECT * FROM page_links WHERE sourceNoteId=:noteId ORDER BY sourceOffset") suspend fun pageLinks(noteId:String):List<PageLinkEntity>
     @Query("SELECT * FROM page_links WHERE targetNoteId=:noteId ORDER BY updatedAt DESC") fun observeBacklinks(noteId:String):Flow<List<PageLinkEntity>>
@@ -244,6 +250,7 @@ data class ApiSyncOutboxEntity(
     @Upsert suspend fun putApiNotebook(notebook:ApiNotebookEntity)
     @Query("DELETE FROM api_notebooks WHERE id=:id") suspend fun deleteApiNotebook(id:String)
     @Query("SELECT * FROM api_sync_outbox WHERE workspaceId=:workspaceId ORDER BY createdAt LIMIT :limit") suspend fun apiOutbox(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity>
+    @Query("SELECT COUNT(*) FROM api_sync_outbox WHERE workspaceId=:workspaceId") suspend fun apiOutboxCount(workspaceId:String):Int
     @Query("SELECT * FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId LIMIT 1") suspend fun apiOutboxItem(entityType:String,entityId:String):ApiSyncOutboxEntity?
     @Upsert suspend fun putApiOutbox(item:ApiSyncOutboxEntity)
     @Query("DELETE FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId") suspend fun deleteApiOutbox(entityType:String,entityId:String)
@@ -254,7 +261,7 @@ data class ApiSyncOutboxEntity(
     @Upsert suspend fun putApiCursor(cursor:ApiSyncCursorEntity)
 }
 
-@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=11, exportSchema=true)
+@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=12, exportSchema=true)
 abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
     companion object {
         private val MIGRATION_1_2=object:androidx.room.migration.Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
@@ -316,6 +323,9 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
             db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_deletedAt ON notes(deletedAt)")
             db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_dirty ON notes(dirty)")
         }}
-        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10,MIGRATION_10_11).build()
+        private val MIGRATION_11_12=object:androidx.room.migration.Migration(11,12){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
+            db.execSQL("ALTER TABLE reading_positions ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0")
+        }}
+        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10,MIGRATION_10_11,MIGRATION_11_12).build()
     }
 }

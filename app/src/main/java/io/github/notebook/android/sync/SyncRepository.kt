@@ -274,10 +274,40 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun recordReadingPosition(noteId:String,anchorUtf16Offset:Int,viewportOffsetFraction:Double){appScope.launch{
         val anchor=anchorUtf16Offset.coerceAtLeast(0);val fraction=viewportOffsetFraction.coerceIn(-1.0,1.0);val current=dao.readingPosition(noteId)
         if(current?.anchorUtf16Offset==anchor&&kotlin.math.abs(current.viewportOffsetFraction-fraction)<0.001)return@launch
-        if(!dao.putReadingPositionIfNoteExists(ReadingPositionEntity(noteId,anchor,fraction,System.currentTimeMillis(),deviceId())))return@launch
-        if(syncBackend()!=SyncBackend.SSH)apiSync.queueReadingPosition(syncWorkspaceId(),dao.readingPosition(noteId)!!)
-        requestSyncIfConfigured(2)
+        // Scrolling is a local high-frequency event. Persist only the newest
+        // location; a lifecycle/sync boundary later coalesces it into outbox.
+        dao.putReadingPositionIfNoteExists(ReadingPositionEntity(noteId,anchor,fraction,System.currentTimeMillis(),deviceId(),dirty=true))
     }}
+
+    /** Each real foreground transition is a pull-first normal sync boundary. */
+    fun requestForegroundSync(){
+        if(!hasRemoteConfiguration())return
+        cancelDelayedSyncRequest()
+        SyncWorker.enqueueNow(appContext)
+    }
+
+    /** There is no reliable Android exit callback, so queue a durable position
+     * snapshot before scheduling an immediate catch-up worker. */
+    fun onAppBackgrounded(){
+        cancelDelayedSyncRequest()
+        appScope.launch{
+            val flushError=runCatching{flushAll()}.exceptionOrNull()
+            // Position state was already committed by scrolling; queue it even
+            // if an unrelated draft could not be flushed in this lifecycle.
+            val positionError=runCatching{queueDirtyReadingPositions()}.exceptionOrNull()
+            (flushError?:positionError)?.let{_saveError.value="后台保存失败：${it.localizedMessage}"}
+            if(hasRemoteConfiguration())SyncWorker.enqueueNow(appContext)
+        }
+    }
+
+    private suspend fun queueDirtyReadingPositions(){
+        if(syncBackend()==SyncBackend.SSH)return
+        val workspace=syncWorkspaceId()
+        dao.dirtyReadingPositions().forEach{position->
+            val note=dao.get(position.noteId)?:return@forEach
+            if(!isEncrypted(note))apiSync.queueReadingPosition(workspace,position)
+        }
+    }
 
     private suspend fun persistDraft(draft:NoteEntity):NoteEntity=saveMutex.withLock{
         val current=loadEditable(draft.id)
@@ -371,7 +401,14 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
 
     suspend fun sync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
         flushAll()
-        when(syncBackend()){SyncBackend.API->{apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());return@withContext};SyncBackend.WEBDAV->{webdavSync.sync(webdavSettings());Reminders.reconcile(appContext,dao.reminders());return@withContext};SyncBackend.SSH->Unit}
+        queueDirtyReadingPositions()
+        val backend=syncBackend()
+        val workspace=if(backend==SyncBackend.SSH)null else syncWorkspaceId()
+        // Both API and WebDAV publish at most 200 outbox rows per pass. Capture
+        // the pre-sync size so malformed rows do not cause a busy retry loop,
+        // while a genuine backlog always receives its next durable worker.
+        val outboxBefore=workspace?.let{dao.apiOutboxCount(it)}?:0
+        when(backend){SyncBackend.API->{apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());workspace?.let{scheduleNextOutboxBatch(it,outboxBefore)};return@withContext};SyncBackend.WEBDAV->{webdavSync.sync(webdavSettings());Reminders.reconcile(appContext,dao.reminders());workspace?.let{scheduleNextOutboxBatch(it,outboxBefore)};return@withContext};SyncBackend.SSH->Unit}
         val s=settings(); require(s.host.isNotBlank()&&s.username.isNotBlank()){ "请先配置 SSH 服务器" }
         require(s.password.isNotBlank()||s.privateKeyPath.isNotBlank()){ "请配置 SSH 私钥文件路径或密码" }
         val verifier=FingerprintHostKeyRepository(s.host,s.fingerprint)
@@ -749,7 +786,13 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val candidates=when{bytes.size>=2&&bytes[0]==0xFF.toByte()&&bytes[1]==0xFE.toByte()->listOf(StandardCharsets.UTF_16LE);bytes.size>=2&&bytes[0]==0xFE.toByte()&&bytes[1]==0xFF.toByte()->listOf(StandardCharsets.UTF_16BE);else->listOf(StandardCharsets.UTF_8,StandardCharsets.UTF_16LE,StandardCharsets.UTF_16BE,StandardCharsets.ISO_8859_1)}
         return candidates.firstNotNullOfOrNull{charset->runCatching{charset.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()}.getOrNull()}?:error("无法识别文档编码")
     }
-    private fun requestSyncIfConfigured(delaySeconds:Long=1){if(!hasRemoteConfiguration())return;synchronized(syncRequestLock){syncRequestJob?.cancel();syncRequestJob=appScope.launch{delay(delaySeconds*1_000);SyncWorker.enqueueNow(appContext);synchronized(syncRequestLock){if(syncRequestJob===coroutineContext[Job])syncRequestJob=null}}}}
+    /** Local writes are durable immediately; remote publication is deliberately
+     * quiet so bursts of edits share one WorkManager run. */
+    private fun requestSyncIfConfigured(){if(!hasRemoteConfiguration())return;synchronized(syncRequestLock){syncRequestJob?.cancel();syncRequestJob=appScope.launch{delay(30_000);SyncWorker.enqueueNow(appContext);synchronized(syncRequestLock){if(syncRequestJob===coroutineContext[Job])syncRequestJob=null}}}}
+    private fun cancelDelayedSyncRequest(){synchronized(syncRequestLock){syncRequestJob?.cancel();syncRequestJob=null}}
+    private suspend fun scheduleNextOutboxBatch(workspace:String,outboxBefore:Int){
+        if(outboxBefore>=200&&dao.apiOutboxCount(workspace)>0)SyncWorker.enqueueNow(appContext)
+    }
     private suspend fun indexReferences(note:NoteEntity){
         val links=if(note.deletedAt!=null)emptyList() else NotebookReferenceSyntax.parse(note.body).mapIndexed{index,reference->
             PageLinkEntity(
@@ -770,10 +813,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private suspend fun loadSnapshot(id:String)=readLargeText(dao.snapshotLength(id)){start,length->dao.snapshotChunk(id,start,length)}
     private suspend fun loadConflictSnapshot(id:String)=readLargeText(dao.conflictSnapshotLength(id)){start,length->dao.conflictSnapshotChunk(id,start,length)}
     private suspend fun readLargeText(totalLength:Int?,read:suspend(Int,Int)->String?):String?{if(totalLength==null)return null;if(totalLength==0)return "";val result=StringBuilder(totalLength);var start=1;while(start<=totalLength){val chunk=read(start,minOf(64*1024,totalLength-start+1)).orEmpty();if(chunk.isEmpty())break;result.append(chunk);start+=chunk.length};return result.toString()}
-    private fun encryptedPrefs(context:Context)=runCatching{createEncryptedPrefs(context)}.getOrElse{
-        context.deleteSharedPreferences("ssh")
-        createEncryptedPrefs(context)
-    }
+    // Never delete encrypted settings automatically. A transient Keystore or
+    // device-unlock failure must not erase credentials, cursors or privacy maps.
+    private fun encryptedPrefs(context:Context)=createEncryptedPrefs(context)
     private fun createEncryptedPrefs(context:Context)=EncryptedSharedPreferences.create(context,"ssh",MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
 }
 
