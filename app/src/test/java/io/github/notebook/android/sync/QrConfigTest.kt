@@ -15,3 +15,21 @@ class QrConfigTest {
     }
     @Test(expected=IllegalArgumentException::class) fun rejectsWrongType(){parseSyncQrConfig("""{"type":"other","version":1,"host":"x","username":"me"}""")}
 }
+
+class WebdavQrConfigTest {
+    @Test fun parsesWebdavConfig(){
+        val settings=parseWebdavQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"https://dav.jianguoyun.com/dav/","username":"user@example.com","appPassword":"app-pw","remotePath":"notebook_backup","syncPassword":"sync-pw"}""")
+        assertEquals("https://dav.jianguoyun.com/dav/",settings.baseUrl)
+        assertEquals("user@example.com",settings.username)
+        assertEquals("app-pw",settings.appPassword)
+        assertEquals("notebook_backup",settings.remotePath)
+        assertEquals("sync-pw",settings.syncPassword)
+    }
+    @Test fun parsesWebdavConfigWithoutSyncPassword(){
+        val settings=parseWebdavQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"https://dav.jianguoyun.com/dav/","username":"me","appPassword":"pw","remotePath":"dir"}""")
+        assertEquals("dir",settings.remotePath);assertTrue(settings.syncPassword.isEmpty())
+    }
+    @Test(expected=IllegalArgumentException::class) fun rejectsWebdavConfigWithoutAppPassword(){parseWebdavQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"https://dav.jianguoyun.com/dav/","username":"me","remotePath":"dir"}""")}
+    @Test(expected=IllegalArgumentException::class) fun rejectsWebdavConfigWithBadUrl(){parseWebdavQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"ftp://x","username":"me","appPassword":"pw","remotePath":"dir"}""")}
+    @Test(expected=IllegalArgumentException::class) fun rejectsWebdavConfigWithWrongType(){parseWebdavQrConfig("""{"type":"notebook-sync","version":1,"host":"x","username":"me"}""")}
+}

@@ -62,6 +62,7 @@ import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.sync.NoteSaveState
 import io.github.notebook.android.sync.NoteRevisionSummary
 import io.github.notebook.android.sync.parseSyncQrConfig
+import io.github.notebook.android.sync.parseWebdavQrConfig
 import io.github.notebook.android.sync.HostKeyChangedException
 import io.github.notebook.android.sync.HostKeyConfirmationRequiredException
 import io.github.notebook.android.ui.NotebookTheme
@@ -686,7 +687,13 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
     suspend fun syncNow(){syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null;runCatching{repo.sync()}.onSuccess{message="连接成功，同步已完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"};else->message="连接或同步失败：${error.localizedMessage?:error.javaClass.simpleName}"};isError=true};syncing=false}
     fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
-    val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{parseSyncQrConfig(payload)}.onSuccess{config->s=config;repo.saveSettings(config);scope.launch{syncNow()}}.onFailure{message=it.message?:"无法读取配置二维码";isError=true}}}
+    val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{
+        val type=runCatching{com.google.gson.JsonParser.parseString(payload).asJsonObject.get("type")?.asString}.getOrNull()
+        when(type){
+            "notebook-webdav"->{val config=parseWebdavQrConfig(payload);repo.saveWebdavSettings(config);repo.setSyncBackend(SyncBackend.WEBDAV);backend=SyncBackend.WEBDAV;w=config;message="已从二维码导入坚果云配置，正在同步…"}
+            else->{val config=parseSyncQrConfig(payload);s=config;repo.saveSettings(config)}
+        }
+    }.onSuccess{scope.launch{syncNow()}}.onFailure{message=it.message?:"无法读取配置二维码";isError=true}}}
     var privateKeyPassphrase by remember{mutableStateOf(s.privateKeyPassphrase)}
     val keyPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{runCatching{repo.importPrivateKey(source,privateKeyPassphrase)}.onSuccess{s=repo.settings();message="私钥已导入"}.onFailure{message=it.message?:"无法导入私钥";isError=true}}}}
     newKey?.let{key->AlertDialog(onDismissRequest={newKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("确认服务器身份")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("首次连接不会自动信任服务器。请将下面的 SHA-256 指纹与桌面端或服务器管理员提供的值核对，确认一致后再继续。");Text(key.actual,style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(key.actual);s=repo.settings();newKey=null;scope.launch{syncNow()}}){Text("指纹一致，信任并继续")}},dismissButton={TextButton({newKey=null}){Text("取消")}})}
@@ -715,7 +722,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 }
             }else{
                 Text("SSH/SFTP 同步",fontWeight=FontWeight.SemiBold)
-                Button({scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("扫描 Notebook SSH 配置二维码").setBeepEnabled(false).setOrientationLocked(false))},Modifier.fillMaxWidth()){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描 SSH 配置二维码")}
+                Button({scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("扫描 Notebook 配置二维码").setBeepEnabled(false).setOrientationLocked(false))},Modifier.fillMaxWidth()){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描配置二维码")}
                 fun update(host:String=s.host,port:Int=s.port,user:String=s.username,password:String=s.password,path:String=s.path,privateKeyPath:String=s.privateKeyPath){s=SshSettings(host,port,user,password,path,s.fingerprint,privateKeyPath,privateKeyPassphrase)}
                 OutlinedTextField(s.host,{update(host=it)},label={Text("服务器地址")});OutlinedTextField(s.port.toString(),{update(port=it.toIntOrNull()?:22)},label={Text("端口")});OutlinedTextField(s.username,{update(user=it)},label={Text("用户名")});OutlinedTextField(s.password,{update(password=it)},label={Text("密码（可选）")},visualTransformation=PasswordVisualTransformation());OutlinedTextField(s.path,{update(path=it)},label={Text("远程目录")})
                 HorizontalDivider();Text("SSH 私钥",fontWeight=FontWeight.SemiBold)
