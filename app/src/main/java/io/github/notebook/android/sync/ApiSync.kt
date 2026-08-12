@@ -29,6 +29,119 @@ data class ApiSyncSettings(
     val token:String=""
 )
 
+/**
+ * IDs arrive from a remote, potentially untrusted journal/API.  They are not
+ * filesystem paths: keep the deliberately broad legacy identifier grammar,
+ * but reject every path separator, control character and malformed composite
+ * id before an entry can affect storage or advance a sync cursor.
+ */
+internal object SyncEntityIdentityContract {
+    private val atom = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+    private val safeOpaque = Regex("^[A-Za-z0-9][A-Za-z0-9._:-]{0,1023}$")
+    private val atomicTypes = setOf("notebook", "section", "tag", "page", "document", "task_step", "asset", "revision", "page_link")
+    private val compositeTypes = setOf("page_tag", "reading_position")
+
+    fun requireChange(type:String, id:String, payload:JsonObject): String {
+        require(type in atomicTypes || type in compositeTypes) { "远端同步包含不支持的实体类型：$type" }
+        when (type) {
+            "page_link" -> requireOpaque(id, "实体 ID")
+            in atomicTypes -> requireAtom(id, "实体 ID")
+            "page_tag" -> requireComposite(id, "实体 ID")
+            "reading_position" -> requireReadingPositionId(id)
+        }
+        requirePayloadReferences(type, id, payload)
+        return id
+    }
+
+    fun requireEntityId(type:String, id:String): String {
+        require(type in atomicTypes || type in compositeTypes) { "远端同步包含不支持的实体类型：$type" }
+        if (type == "page_link") requireOpaque(id)
+        else if (type in atomicTypes) requireAtom(id)
+        else if (type == "reading_position") requireReadingPositionId(id)
+        else requireComposite(id, "实体 ID")
+        return id
+    }
+
+    fun requireAtom(value:String, label:String="实体 ID"): String {
+        require(atom.matches(value)) { "$label 格式不正确" }
+        return value
+    }
+
+    private fun requireOpaque(value:String,label:String="实体 ID"):String {
+        require(safeOpaque.matches(value)&&!value.contains("..")) { "$label 格式不正确" }
+        return value
+    }
+
+    private fun requireComposite(value:String, label:String) {
+        val parts = value.split(':')
+        require(parts.size == 2) { "$label 格式不正确" }
+        parts.forEach { requireAtom(it, label) }
+    }
+
+    /** Desktop writes page-only IDs; older Android journals used page:device. */
+    private fun requireReadingPositionId(value:String) {
+        if (atom.matches(value)) return
+        requireComposite(value, "实体 ID")
+    }
+
+    private fun requirePayloadReferences(type:String, id:String, payload:JsonObject) {
+        fun optional(key:String):String? = payload[key]
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+            ?.asString
+        fun checkOptional(key:String) { optional(key)?.let { requireAtom(it, key) } }
+        when (type) {
+            "page" -> {
+                optional("id")?.let { require(it == id) { "页面 ID 与实体 ID 不一致" }; requireAtom(it, "页面 ID") }
+                checkOptional("sectionId"); checkOptional("parentPageId")
+            }
+            "document" -> optional("pageId")?.let { require(it == id) { "文档 pageId 与实体 ID 不一致" }; requireAtom(it, "pageId") }
+            "section" -> { checkOptional("notebookId"); checkOptional("parentSectionId") }
+            "task_step", "asset" -> checkOptional("pageId")
+            "page_link" -> { checkOptional("sourcePageId"); checkOptional("targetPageId") }
+            "revision" -> checkOptional("pageId")
+            "page_tag" -> {
+                val pageId = optional("pageId")?.also { requireAtom(it, "pageId") }
+                val tagId = optional("tagId")?.also { requireAtom(it, "tagId") }
+                require((pageId == null && tagId == null) || (pageId != null && tagId != null && id == "$pageId:$tagId")) { "page_tag ID 与内容不一致" }
+            }
+            "reading_position" -> {
+                val pageId = optional("pageId")?.also { requireAtom(it, "pageId") }
+                val deviceId = optional("deviceId")
+                if (deviceId != null) {
+                    requireAtom(deviceId, "deviceId")
+                    require(pageId != null && (id == pageId || id == "$pageId:$deviceId")) { "reading_position ID 与内容不一致" }
+                }
+            }
+        }
+    }
+}
+
+/** Centralized canonical containment check for every remote attachment write. */
+internal object AttachmentStorageContract {
+    fun file(context:Context, relative:String):File {
+        require(relative.isNotBlank() && !relative.startsWith('/') && !relative.startsWith('~')) { "非法附件路径" }
+        require(!relative.contains('\\') && relative.none { it.isISOControl() }) { "非法附件路径" }
+        require(relative.split('/').none { it.isBlank() || it == "." || it == ".." }) { "非法附件路径" }
+        val root = File(context.filesDir, "attachments").canonicalFile
+        val target = File(root, relative).canonicalFile
+        require(target.toPath().startsWith(root.toPath())) { "附件路径越界" }
+        return target
+    }
+
+    fun temporaryFile(target:File, context:Context):File {
+        val root = File(context.filesDir, "attachments").canonicalFile
+        val parent = target.parentFile?.canonicalFile ?: error("附件目录无效")
+        require(parent.toPath().startsWith(root.toPath())) { "附件临时文件路径越界" }
+        return File(parent, "${target.name}.download")
+    }
+
+    fun deleteIfContained(context:Context, candidate:File) {
+        val attachments = File(context.filesDir, "attachments").canonicalFile
+        val target = candidate.canonicalFile
+        if (target.toPath().startsWith(attachments.toPath()) && target.isFile) target.delete()
+    }
+}
+
 /** Versioned HTTP synchronizer shared with Notebook Next web/desktop. */
 class ApiSyncClient(
     private val context:Context,
@@ -105,8 +218,8 @@ class ApiSyncClient(
     suspend fun queueStep(workspaceId:String,step:TodoStepEntity)=enqueue(workspaceId,"task_step",step.id,"upsert",stepPayload(step))
     suspend fun queueAsset(workspaceId:String,asset:AssetEntity)=enqueue(workspaceId,"asset",asset.id,"upsert",assetPayload(asset))
     suspend fun queueDelete(workspaceId:String,type:String,id:String)=enqueue(workspaceId,type,id,"delete",JsonObject())
-    suspend fun queueReadingPosition(workspaceId:String,p:ReadingPositionEntity)=enqueue(workspaceId,"reading_position","${p.noteId}:${p.deviceId}","upsert",JsonObject().apply{
-        addProperty("id","${p.noteId}:${p.deviceId}");addProperty("pageId",p.noteId);addProperty("anchorUtf16Offset",p.anchorUtf16Offset);addProperty("viewportOffsetFraction",p.viewportOffsetFraction);addProperty("updatedAt",iso(p.updatedAt));addProperty("deviceId",p.deviceId)
+    suspend fun queueReadingPosition(workspaceId:String,p:ReadingPositionEntity)=enqueue(workspaceId,"reading_position",p.noteId,"upsert",JsonObject().apply{
+        addProperty("id",p.noteId);addProperty("pageId",p.noteId);addProperty("anchorUtf16Offset",p.anchorUtf16Offset);addProperty("viewportOffsetFraction",p.viewportOffsetFraction);addProperty("updatedAt",iso(p.updatedAt));addProperty("deviceId",p.deviceId)
     })
 
     suspend fun acceptConflict(workspaceId:String,entityType:String,entityId:String,payload:JsonObject) {
@@ -142,8 +255,8 @@ class ApiSyncClient(
         val response=execute(s,Request.Builder().url("${s.baseUrl}/v1/sync/push").post(gson.toJson(requestJson).toRequestBody(JSON)).build())
         val root=response.use{JsonParser.parseString(it.body?.string().orEmpty()).asJsonObject}
         val sentById=outgoing.associateBy{it.id}
-        root["applied"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val operationId=item.string("operation_id");val type=item.string("entity_type");val id=item.string("entity_id");val version=item["version"].asLong;dao.deleteApiOutboxById(operationId);dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),version));if(type=="page")dao.get(id)?.let{dao.put(it.copy(dirty=false,lastSyncedVersion=version))};if(type=="asset")dao.getAsset(id)?.let{dao.putAssets(listOf(it.copy(dirty=false)))};if(type=="reading_position"){val payload=sentById[operationId]?.payloadJson?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()};val noteId=payload?.optionalString("pageId");val updatedAt=payload?.optionalMillis("updatedAt");if(noteId!=null&&updatedAt!=null)dao.markReadingPositionSynced(noteId,updatedAt)}}
-        root["conflicts"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val type=item.string("entity_type");val id=item.string("entity_id");val currentVersion=item["current_version"].asLong;dao.deleteApiOutboxById(item.string("operation_id"));dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),currentVersion));pageIdFor(type,id,item["current_payload"]?.asJsonObject)?.let{pageId->recordConflict(pageId,type,item["current_payload"]?.asJsonObject?:JsonObject())}}
+        root["applied"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val operationId=item.string("operation_id");val type=item.string("entity_type");val id=SyncEntityIdentityContract.requireEntityId(type,item.string("entity_id"));val version=item["version"].asLong;dao.deleteApiOutboxById(operationId);dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),version));if(type=="page")dao.get(id)?.let{dao.put(it.copy(dirty=false,lastSyncedVersion=version))};if(type=="asset")dao.getAsset(id)?.let{dao.putAssets(listOf(it.copy(dirty=false)))};if(type=="reading_position"){val payload=sentById[operationId]?.payloadJson?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()};val noteId=payload?.optionalString("pageId");val updatedAt=payload?.optionalMillis("updatedAt");if(noteId!=null&&updatedAt!=null)dao.markReadingPositionSynced(noteId,updatedAt)}}
+        root["conflicts"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val type=item.string("entity_type");val id=SyncEntityIdentityContract.requireEntityId(type,item.string("entity_id"));val currentVersion=item["current_version"].asLong;dao.deleteApiOutboxById(item.string("operation_id"));dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),currentVersion));pageIdFor(type,id,item["current_payload"]?.asJsonObject)?.let{pageId->recordConflict(pageId,type,item["current_payload"]?.asJsonObject?:JsonObject())}}
     }
 
     private suspend fun pullAll(s:ApiSyncSettings,downloadBudget:RemoteTransferLimits.Budget) {
@@ -159,6 +272,10 @@ class ApiSyncClient(
 
     private suspend fun applyChange(s:ApiSyncSettings,change:JsonObject,downloadBudget:RemoteTransferLimits.Budget) {
         val type=change.string("entity_type");val id=change.string("entity_id");val version=change["version"].asLong;val operation=change.string("operation");val payload=change["payload"].asJsonObject
+        require(operation=="upsert"||operation=="delete"){"远端同步包含非法操作"}
+        // Delete rows from older peers may have no payload at all. Their ID is
+        // still validated, while upserts validate relation fields as well.
+        if(operation=="delete")SyncEntityIdentityContract.requireEntityId(type,id) else SyncEntityIdentityContract.requireChange(type,id,payload)
         val pending=dao.apiOutboxItem(type,id);val affectedPage=pageIdFor(type,id,payload);val locallyDirty=affectedPage?.let{dao.get(it)?.dirty}==true
         if((pending!=null&&version>pending.expectedVersion)||locallyDirty){
             affectedPage?.let{recordConflict(it,type,payload)}
@@ -174,6 +291,8 @@ class ApiSyncClient(
             "task_step"->dao.putStep(TodoStepEntity(id,payload.string("pageId"),payload.string("text"),payload.boolean("checked"),payload.integer("sortOrder"),payload.millis("createdAt")))
             "asset"->applyAsset(s,id,payload,downloadBudget)
             "reading_position"->dao.putReadingPosition(ReadingPositionEntity(payload.string("pageId"),payload.integer("anchorUtf16Offset"),payload.double("viewportOffsetFraction"),payload.millis("updatedAt"),payload.string("deviceId")))
+            "page_link"->applyPageLink(id,payload)
+            "revision"->applyRevision(id,payload)
         }
         dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),version))
     }
@@ -191,12 +310,22 @@ class ApiSyncClient(
     }
 
     internal suspend fun applyPageTag(p:JsonObject,add:Boolean) {val pageId=p.string("pageId");val tagId=p.string("tagId");dao.get(pageId)?.let{note->val ids=note.tagIds.split(',').filter(String::isNotBlank).toMutableSet();if(add)ids+=tagId else ids-=tagId;dao.put(note.copy(tagIds=ids.joinToString(",")))}}
+    internal suspend fun applyPageLink(id:String,p:JsonObject){
+        if(dao.get(p.string("sourcePageId"))==null)return
+        val kind=p.string("kind","link")
+        dao.putPageLinks(listOf(PageLinkEntity(id,p.string("sourcePageId"),p.string("targetPageId"),kind,null,p.optionalString("excerpt"),kind=="embed",0,p.millis("createdAt"))))
+    }
+    internal suspend fun applyRevision(id:String,p:JsonObject){
+        val document=p["document"]?.takeIf{it.isJsonObject}?.asJsonObject?:return
+        val markdown=document.optionalString("markdown")?:document["tiptapJson"]?.let(TipTapCodec::decode)?:return
+        dao.putRemoteRevision(RemoteRevisionEntity(id,p.string("pageId"),p.millis("createdAt"),p.string("reason","autosave"),markdown,p.optionalString("pageIcon")))
+    }
     private suspend fun applyAsset(s:ApiSyncSettings,id:String,p:JsonObject,downloadBudget:RemoteTransferLimits.Budget) {
         val filename=p.string("filename","attachment").replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_")
         val relative="next/$id/$filename"
-        val target=File(context.filesDir,"attachments/$relative")
+        val target=AttachmentStorageContract.file(context,relative)
         target.parentFile?.mkdirs()
-        val temp=File(target.parentFile,"${target.name}.download")
+        val temp=AttachmentStorageContract.temporaryFile(target,context)
         val digest=MessageDigest.getInstance("SHA-256")
         var fileBytes=0L
         try {
@@ -232,11 +361,13 @@ class ApiSyncClient(
         wrapper["apiConflicts"].asJsonObject.add(type,payload.deepCopy());dao.put(note.copy(conflict=true,conflictSnapshotJson=gson.toJson(wrapper)))
     }}
 
-    internal suspend fun applyDelete(type:String,id:String,p:JsonObject){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);dao.deleteNotePermanently(id)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->dao.deleteAsset(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
+    internal suspend fun applyDelete(type:String,id:String,p:JsonObject){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);deleteNoteAndAssets(id)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->deleteAssetAndFile(id);"page_link"->dao.deletePageLink(id);"revision"->dao.deleteRemoteRevision(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
+    internal suspend fun deleteAssetAndFile(id:String){dao.getAsset(id)?.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)};dao.deleteAsset(id)}
+    internal suspend fun deleteNoteAndAssets(noteId:String){dao.assets(noteId).forEach{asset->asset.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)}};dao.deleteRemoteRevisionsForNote(noteId);dao.deleteNotePermanently(noteId)}
 
     internal fun stepPayload(s:TodoStepEntity)=JsonObject().apply{addProperty("id",s.id);addProperty("pageId",s.noteId);addProperty("text",s.text);addProperty("checked",s.checked);addProperty("sortOrder",s.sortOrder);addProperty("createdAt",iso(s.createdAt))}
     internal fun assetPayload(a:AssetEntity)=JsonObject().apply{addProperty("id",a.id);addProperty("pageId",a.noteId);addProperty("kind",a.kind);addProperty("filename",a.filename);addProperty("mimeType",a.mimeType);addProperty("byteSize",a.size);addProperty("checksum",a.contentHash);addProperty("createdAt",iso(File(a.localPath?:"").takeIf(File::exists)?.lastModified()?:System.currentTimeMillis()))}
-    internal fun pageIdFor(type:String,id:String,p:JsonObject?)=when(type){"page","document"->id;"task_step","asset","page_tag","reading_position"->p?.optionalString("pageId")?:id.substringBefore(':');else->null}
+    internal fun pageIdFor(type:String,id:String,p:JsonObject?)=when(type){"page","document"->id;"task_step","asset","page_tag","reading_position","revision"->p?.optionalString("pageId")?:id.substringBefore(':');"page_link"->p?.optionalString("sourcePageId");else->null}
     private fun execute(s:ApiSyncSettings,request:Request)=http.newCall(request.newBuilder().apply{if(s.token.isNotBlank())header("Authorization","Bearer ${s.token}")}.build()).execute().also{if(!it.isSuccessful){val detail=it.body?.string().orEmpty().take(500);it.close();throw IllegalStateException("同步服务返回 ${it.code}${if(detail.isBlank())"" else "：$detail"}")}}
     private fun assetUrl(s:ApiSyncSettings,id:String)="${s.baseUrl}/v1/sync/assets/${encoded(id)}?workspace_id=${encoded(s.workspaceId)}"
     companion object {private val JSON="application/json; charset=utf-8".toMediaType();private fun encoded(v:String)=URLEncoder.encode(v,StandardCharsets.UTF_8.name());private fun iso(ms:Long)=Instant.ofEpochMilli(ms).toString();private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}}

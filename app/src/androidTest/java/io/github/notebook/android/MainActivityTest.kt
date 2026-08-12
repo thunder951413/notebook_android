@@ -61,6 +61,8 @@ class MainActivityTest {
         runBlocking{repeat(30){index->app.database.dao().putFolder(FolderEntity("scroll-test-$index","滚动文件夹 $index",index))}}
         rule.activityRule.scenario.recreate()
         if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isNotEmpty())rule.onNodeWithContentDescription("导航").performClick()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("查看全部文件夹",substring=true))
+        rule.onAllNodes(hasText("查看全部文件夹",substring=true),useUnmergedTree=true).onFirst().performClick()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("滚动文件夹 29"))
         rule.onNodeWithText("滚动文件夹 29").assertIsDisplayed()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("设置与同步"))
@@ -79,6 +81,8 @@ class MainActivityTest {
         }
         rule.activityRule.scenario.recreate()
         rule.onNodeWithContentDescription("导航").performClick()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("查看全部文件夹",substring=true))
+        rule.onAllNodes(hasText("查看全部文件夹",substring=true),useUnmergedTree=true).onFirst().performClick()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText(selectedName))
         rule.onNodeWithText(selectedName).performClick()
         rule.onNodeWithContentDescription("导航").performClick()
@@ -121,11 +125,11 @@ class MainActivityTest {
         rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("编辑计划").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
     }
 
-    @Test fun encryptedFoldersAreShownLockedAndNotesStayOutOfAllNotes(){
+    @Test fun privateFoldersAreShownLockedAndNotesStayOutOfAllNotes(){
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("encrypted-test","私人资料",0,"encryptedFolder"));app.database.dao().put(NoteEntity("encrypted-note-test",title="不能公开显示",folderId="encrypted-test",folderName="私人资料"))};app.repository.markEncrypted("encrypted-note-test","encrypted-test");rule.activityRule.scenario.recreate()
         rule.onAllNodesWithText("不能公开显示").assertCountEquals(0)
         if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isNotEmpty())rule.onNodeWithContentDescription("导航").performClick()
-        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("加密文件夹"));rule.onNodeWithText("加密文件夹").assertIsDisplayed();rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("点击解锁"));rule.onNodeWithText("点击解锁").assertIsDisplayed();rule.onAllNodesWithText("私人资料").assertCountEquals(0)
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("私密文件夹"));rule.onNodeWithText("私密文件夹").assertIsDisplayed();rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("点击解锁私密内容"));rule.onNodeWithText("点击解锁私密内容").assertIsDisplayed();rule.onAllNodesWithText("私人资料").assertCountEquals(0)
     }
 
     @Test fun referencePickerInsertsCanonicalPageLink(){
@@ -152,10 +156,10 @@ class MainActivityTest {
         }
         rule.activityRule.scenario.recreate()
         rule.onNodeWithText(sourceTitle).performClick()
-        rule.waitUntil(5_000){rule.onAllNodesWithText(targetTitle,useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()}
-        rule.onNodeWithText(targetTitle,useUnmergedTree=true).performClick()
-        rule.waitUntil(5_000){rule.onAllNodesWithText(targetBody,useUnmergedTree=true).fetchSemanticsNodes().isNotEmpty()}
-        rule.onNodeWithText(targetBody,useUnmergedTree=true).assertIsDisplayed()
+        val openReference=rule.onNodeWithTag("open-reference-$targetId")
+        openReference.assertTextContains(targetTitle,substring=true).performClick()
+        rule.waitUntil(5_000){rule.onAllNodesWithTag("reader-note-$targetId").fetchSemanticsNodes().isNotEmpty()}
+        rule.onNodeWithTag("reader-note-$targetId").assertTextEquals(targetTitle).assertIsDisplayed()
     }
 
     @Test fun backlinksPanelShowsSourcePage(){

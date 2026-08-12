@@ -164,6 +164,8 @@ data class ApiSyncOutboxEntity(
     val payloadJson:String,
     val createdAt:Long=System.currentTimeMillis()
 )
+@Entity(tableName="remote_revisions",indices=[Index("noteId")])
+data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val createdAt:Long,val reason:String,val markdown:String,val pageIcon:String?=null)
 
 @Dao interface NotebookDao {
     @Query("SELECT * FROM notes ORDER BY updatedAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
@@ -236,6 +238,7 @@ data class ApiSyncOutboxEntity(
     @Query("SELECT * FROM page_links WHERE sourceNoteId=:noteId ORDER BY sourceOffset") suspend fun pageLinks(noteId:String):List<PageLinkEntity>
     @Query("SELECT * FROM page_links WHERE targetNoteId=:noteId ORDER BY updatedAt DESC") fun observeBacklinks(noteId:String):Flow<List<PageLinkEntity>>
     @Query("DELETE FROM page_links WHERE sourceNoteId=:noteId") suspend fun deletePageLinks(noteId:String)
+    @Query("DELETE FROM page_links WHERE id=:id") suspend fun deletePageLink(id:String)
     @Upsert suspend fun putPageLinks(items:List<PageLinkEntity>)
     @Transaction suspend fun replacePageLinks(noteId:String,items:List<PageLinkEntity>){deletePageLinks(noteId);if(items.isNotEmpty())putPageLinks(items)}
     @Query("SELECT id FROM notes WHERE deletedAt IS NULL") suspend fun nonDeletedNoteIds():List<String>
@@ -255,13 +258,17 @@ data class ApiSyncOutboxEntity(
     @Upsert suspend fun putApiOutbox(item:ApiSyncOutboxEntity)
     @Query("DELETE FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId") suspend fun deleteApiOutbox(entityType:String,entityId:String)
     @Query("DELETE FROM api_sync_outbox WHERE id=:id") suspend fun deleteApiOutboxById(id:String)
+    @Query("SELECT * FROM remote_revisions WHERE noteId=:noteId ORDER BY createdAt DESC") suspend fun remoteRevisions(noteId:String):List<RemoteRevisionEntity>
+    @Upsert suspend fun putRemoteRevision(revision:RemoteRevisionEntity)
+    @Query("DELETE FROM remote_revisions WHERE id=:id") suspend fun deleteRemoteRevision(id:String)
+    @Query("DELETE FROM remote_revisions WHERE noteId=:noteId") suspend fun deleteRemoteRevisionsForNote(noteId:String)
     @Query("SELECT * FROM api_sync_versions WHERE id=:id") suspend fun apiVersion(id:String):ApiSyncVersionEntity?
     @Upsert suspend fun putApiVersion(version:ApiSyncVersionEntity)
     @Query("SELECT cursor FROM api_sync_cursors WHERE workspaceId=:workspaceId") suspend fun apiCursor(workspaceId:String):Long?
     @Upsert suspend fun putApiCursor(cursor:ApiSyncCursorEntity)
 }
 
-@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class], version=12, exportSchema=true)
+@Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class,RemoteRevisionEntity::class], version=13, exportSchema=true)
 abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
     companion object {
         private val MIGRATION_1_2=object:androidx.room.migration.Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
@@ -326,6 +333,10 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
         private val MIGRATION_11_12=object:androidx.room.migration.Migration(11,12){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
             db.execSQL("ALTER TABLE reading_positions ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0")
         }}
-        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10,MIGRATION_10_11,MIGRATION_11_12).build()
+        private val MIGRATION_12_13=object:androidx.room.migration.Migration(12,13){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){
+            db.execSQL("CREATE TABLE IF NOT EXISTS remote_revisions (id TEXT NOT NULL, noteId TEXT NOT NULL, createdAt INTEGER NOT NULL, reason TEXT NOT NULL, markdown TEXT NOT NULL, pageIcon TEXT, PRIMARY KEY(id))")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_remote_revisions_noteId ON remote_revisions(noteId)")
+        }}
+        fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10,MIGRATION_10_11,MIGRATION_11_12,MIGRATION_12_13).build()
     }
 }

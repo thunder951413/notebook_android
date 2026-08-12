@@ -14,6 +14,7 @@ import java.io.StringReader
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.XMLConstants
 import org.w3c.dom.Element
 
 /**
@@ -224,7 +225,15 @@ class WebdavClient(
     private fun parseHrefs(text: String): List<String> {
             if (text.isBlank()) return emptyList()
             return runCatching {
-                val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+                val factory = DocumentBuilderFactory.newInstance().apply {
+                    isNamespaceAware = true
+                    setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+                    setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+                    setFeature("http://xml.org/sax/features/external-general-entities", false)
+                    setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                    isXIncludeAware = false
+                    isExpandEntityReferences = false
+                }
                 val document = factory.newDocumentBuilder().parse(org.xml.sax.InputSource(StringReader(text)))
                 val hrefs = document.getElementsByTagNameNS("*", "href")
                 (0 until hrefs.length).map { (hrefs.item(it) as Element).textContent.trim() }.filter(String::isNotBlank)

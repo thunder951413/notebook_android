@@ -2,9 +2,9 @@
 
 项目迁移、架构约束、自动保存/提醒说明、完整使用场景审计和 AI 接手步骤见 [`AI_HANDOFF.md`](AI_HANDOFF.md)。后续开发应先阅读该文档。
 
-这是 Notebook 的 Android 移动端子项目。应用离线优先，本地使用 Room 保存数据。当前推荐与 Electron 桌面版共用 SSH/SFTP Markdown v3 仓库；Notebook Next HTTP API 保留为可选的多用户或公网服务方案。
+这是 Notebook 的 Android 移动端子项目。应用离线优先，本地使用 Room 保存数据。**坚果云 WebDAV 是唯一推荐的正式同步方式**；SSH/SFTP Markdown v3 和 Notebook Next HTTP API 仅为已有部署的数据迁移兼容，不用于新的长期同步配置。
 
-SSH/SFTP Markdown v3 的交换文件包括：
+旧 SSH/SFTP Markdown v3 仓库的交换文件包括：
 
 - `library.json`：文件夹和标签
 - `notes/index.json`：笔记版本索引与删除记录
@@ -20,9 +20,9 @@ SSH/SFTP Markdown v3 的交换文件包括：
 - 文件夹、标签和 macOS 数据模型的本地存储
 - 一次性、每日、每周、每月本地通知，权限状态提示、重启恢复及点击直达项目
 - 无保存按钮的自动保存、后台/返回强制刷新与崩溃草稿恢复
-- SSH 设置的加密保存
+- 坚果云 WebDAV 正式同步，以及 SSH 旧配置的加密保存与迁移兼容
 - macOS Swift `JSONEncoder` 日期（2001 reference date）兼容
-- `library.json`、gzip 笔记、内容寻址资源和哈希历史的双向 SFTP 同步
+- `library.json`、gzip 笔记、内容寻址资源和哈希历史的旧 SFTP 仓库读取/迁移兼容
 - 本地脏数据、远端版本检测及冲突标记
 - 图片、音频、文件附件的上传、下载、预览和系统打开
 - 原生语音录制和 Todo 步骤
@@ -46,13 +46,15 @@ SSH/SFTP Markdown v3 的交换文件包括：
 
 ## 同步设置
 
-与 Electron 新版同步时，在 Android 设置中选择“旧版 SSH”（后续界面会改名为“SSH/SFTP”），填写与桌面端“设置 → 同步与连接”相同的主机、端口、用户名、密码和远程目录。Android 使用密码认证，并强制校验 SSH SHA-256 主机指纹；首次连接会先显示指纹并要求用户核对确认，不会自动信任未知服务器。服务器目录必须允许该用户创建目录、上传临时文件和原子重命名。可在可信电脑上查询指纹并与服务器管理员提供的值核对：
+在 Android “设置与同步”中配置坚果云 WebDAV：填写坚果云 WebDAV 地址、用户名、应用密码和远程目录。坚果云应用密码需要在网页版“安全选项”生成；“同步密码”是后续加密协议的可选预留项，当前无需填写。新设备和日常同步均应使用这一方式。
+
+如果已有 SSH/SFTP Markdown v3 仓库，可在“旧同步方式与迁移”中临时打开 SSH 配置，完成旧数据核对、导入和迁移后立即切回坚果云 WebDAV。旧配置不会被自动删除，但不再推荐持续同步。Android 仍会校验 SSH SHA-256 主机指纹；如需核对旧服务器，可在可信电脑上执行：
 
 ```bash
 ssh-keyscan -p 22 your-server.example | ssh-keygen -lf - -E sha256
 ```
 
-Notebook Next HTTP API 是可选同步方式。使用时填写相同的服务地址、工作区 ID 和访问 Token；正式 Android 构建要求 HTTPS，通过 ADB 验证的 debug 构建才允许 `http://127.0.0.1`。
+Notebook Next HTTP API 同样只保留给已有服务部署的迁移兼容。正式 Android 构建要求 HTTPS，通过 ADB 验证的 debug 构建才允许 `http://127.0.0.1`。
 
 ## 界面设计
 
@@ -110,8 +112,8 @@ base64 < release.jks | tr -d '\n'
 推送版本标签即可构建并发布签名 APK 和校验文件：
 
 ```bash
-git tag android-v0.2.0
-git push origin android-v0.2.0
+git tag android-v0.3.0
+git push origin android-v0.3.0
 ```
 
 正式签名证书必须永久保管；丢失或更换证书后，已安装用户无法直接覆盖升级。更新源可在构建时通过 `-PgithubRepository=owner/repository` 覆盖。
@@ -119,7 +121,8 @@ git push origin android-v0.2.0
 ## 后续增强
 
 - 表格块在 Android 会无损保留并同步，但暂时没有专用表格编辑器。
-- 页面/块/连续块组双链、动态内容嵌入、反向链接、本地引用索引与 v3 历史预览/恢复已经具备 Android 界面，并与 Electron 共用规范 Markdown 语法。加密文件夹、离线导入导出和 AI 配置仍需增加 Android 界面。
-- 发布前应在真实 SSH 测试目录中完成 macOS → Android → macOS 的附件和冲突演练，并配置正式签名。
+- 页面/块/连续块组双链、动态内容嵌入、反向链接、本地引用索引与 v3 历史预览/恢复已经具备 Android 界面，并与 Electron 共用规范 Markdown 语法。私密文件夹、离线导入导出和 AI 配置仍需继续完善 Android 界面。
+- 私密文件夹是受设备锁保护的访问控制：笔记和附件存储在 Android 应用私有目录，依赖 Android 系统存储加密；当前没有额外的应用层静态文件加密。私密笔记及其附件不会上传到坚果云 WebDAV，因此卸载应用、清除数据或设备丢失后，无法从云端恢复。请仅在理解这一取舍后存放不可替代内容。
+- 发布前应在隔离的坚果云 WebDAV 目录完成桌面 → Android → 桌面的附件、冲突、取消/重试和私密笔记本地保留演练，并配置正式签名。若仍需兼容旧 SSH 仓库，另行执行一次迁移回归，但不把它作为正式同步验收。
 
 建议先用一个测试用远程目录联调，确认 macOS 往返不会改变原始笔记后，再连接正式数据目录。

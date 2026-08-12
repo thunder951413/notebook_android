@@ -314,6 +314,44 @@ class WebdavSyncTest {
     }
 
     @Test
+    fun `concurrent journal parent version records conflict without advancing cursor`() = runBlocking {
+        database.dao().put(note().copy(dirty = false))
+        database.dao().putApiVersion(io.github.notebook.android.data.ApiSyncVersionEntity(
+            api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "page", noteId), 2,
+        ))
+        val remoteDevice = "30000000-0000-4000-8000-000000000009"
+        webdav.putJournal(remoteDevice, listOf(
+            """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"page","id":"$noteId","ver":1,"payload":{"id":"$noteId","workspaceId":"00000000-0000-4000-8000-000000000001","kind":"document","title":"远端分支","preview":"不同内容","favorite":false,"syncStatus":"synced","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:00:00Z"}}""",
+        ))
+
+        client.sync(settings())
+
+        assertTrue(database.dao().get(noteId)!!.conflict)
+        assertNull(database.dao().apiCursor(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID))
+        assertEquals(2, database.dao().apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "page", noteId))!!.version)
+    }
+
+    @Test
+    fun `second v0 journal sibling conflicts while identical replay is consumed`() = runBlocking {
+        val remoteDevice = "30000000-0000-4000-8000-000000000008"
+        val first = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"page","id":"$noteId","ver":0,"payload":{"id":"$noteId","workspaceId":"00000000-0000-4000-8000-000000000001","kind":"document","title":"共同初始","preview":"相同","favorite":false,"syncStatus":"synced","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:00:00Z"}}"""
+        webdav.putJournal(remoteDevice, listOf(first))
+        client.sync(settings())
+        assertEquals(1, database.dao().apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",noteId))!!.version)
+
+        // A second identical v0 copy is a retry and can advance the device cursor.
+        webdav.putJournal(remoteDevice, listOf(first.replace("\"seq\":1","\"seq\":2")))
+        client.sync(settings())
+        assertFalse(database.dao().get(noteId)!!.conflict)
+
+        webdav.putJournal(remoteDevice, listOf(
+            """{"seq":3,"ts":"2026-08-04T00:00:03Z","op":"upsert","type":"page","id":"$noteId","ver":0,"payload":{"id":"$noteId","workspaceId":"00000000-0000-4000-8000-000000000001","kind":"document","title":"并发分支","preview":"不同","favorite":false,"syncStatus":"synced","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:00:03Z"}}""",
+        ))
+        client.sync(settings())
+        assertTrue(database.dao().get(noteId)!!.conflict)
+    }
+
+    @Test
     fun `oversized journal is compacted on push without changing seq semantics`() {
         runBlocking {
         database.dao().put(note())

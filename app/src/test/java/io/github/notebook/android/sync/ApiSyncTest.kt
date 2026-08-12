@@ -92,6 +92,70 @@ class ApiSyncTest {
         assertFalse(partial.exists())
     }
 
+    @Test fun `api rejects traversal asset before download and cursor advancement`()=runBlocking {
+        server.enqueue(json("""{"cursor":1,"has_more":false,"changes":[
+          {"cursor":1,"entity_type":"asset","entity_id":"../escape","version":1,"operation":"upsert","payload":{"id":"../escape","pageId":"page","filename":"asset.bin"}}
+        ]}"""))
+        val error=runCatching{ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())}.exceptionOrNull()
+        assertNotNull(error)
+        assertNull(database.dao().getAsset("../escape"))
+        assertNull(database.dao().apiCursor(workspace))
+        assertEquals(1,server.requestCount)
+        assertFalse(java.io.File(ApplicationProvider.getApplicationContext<Context>().filesDir,"attachments/escape").exists())
+    }
+
+    @Test fun `api applies remote revision and page link instead of consuming them`()=runBlocking {
+        database.dao().put(NoteEntity(id="page",dirty=false))
+        server.enqueue(json("""{"cursor":2,"has_more":false,"changes":[
+          {"cursor":1,"entity_type":"revision","entity_id":"revision-1","version":0,"operation":"upsert","payload":{"id":"revision-1","pageId":"page","createdAt":"2026-01-01T00:00:00Z","reason":"manual","document":{"pageId":"page","schemaVersion":1,"updatedAt":"2026-01-01T00:00:00Z","tiptapJson":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"历史正文"}]}]}}}},
+          {"cursor":2,"entity_type":"page_link","entity_id":"link-1","version":0,"operation":"upsert","payload":{"id":"link-1","workspaceId":"workspace-a","sourcePageId":"page","targetPageId":"target","kind":"link","createdAt":"2026-01-01T00:00:00Z"}}
+        ]}"""))
+        server.enqueue(json("""{"cursor":2,"has_more":false,"changes":[]}"""))
+        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())
+        assertEquals("历史正文",database.dao().remoteRevisions("page").single().markdown)
+        assertEquals("target",database.dao().pageLinks("page").single().targetNoteId)
+    }
+
+    @Test fun `revision markdown wins over stale tiptap projection`()=runBlocking {
+        database.dao().put(NoteEntity(id="page",dirty=false))
+        server.enqueue(json("""{"cursor":1,"has_more":false,"changes":[
+          {"cursor":1,"entity_type":"revision","entity_id":"revision-markdown","version":0,"operation":"upsert","payload":{"id":"revision-markdown","pageId":"page","createdAt":"2026-01-01T00:00:00Z","reason":"manual","document":{"pageId":"page","schemaVersion":1,"markdown":"Markdown 优先","updatedAt":"2026-01-01T00:00:00Z","tiptapJson":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"旧 TipTap"}]}]}}}}
+        ]}"""))
+        server.enqueue(json("""{"cursor":1,"has_more":false,"changes":[]}"""))
+        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())
+        assertEquals("Markdown 优先",database.dao().remoteRevisions("page").single().markdown)
+    }
+
+    @Test fun `invalid remote page link id does not advance cursor`()=runBlocking {
+        server.enqueue(json("""{"cursor":1,"has_more":false,"changes":[
+          {"cursor":1,"entity_type":"page_link","entity_id":"../escape","version":0,"operation":"upsert","payload":{"id":"../escape","workspaceId":"workspace-a","sourcePageId":"page","targetPageId":"target","kind":"link","createdAt":"2026-01-01T00:00:00Z"}}
+        ]}"""))
+        val error=runCatching{ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true).sync(settings())}.exceptionOrNull()
+        assertNotNull(error);assertNull(database.dao().apiCursor(workspace));assertEquals(1,server.requestCount)
+    }
+
+    @Test fun `remote asset delete removes only files under attachments root`()=runBlocking {
+        val context=ApplicationProvider.getApplicationContext<Context>()
+        val owned=java.io.File(context.filesDir,"attachments/next/asset-a/owned.bin").apply{parentFile?.mkdirs();writeText("owned")}
+        val outside=java.io.File(context.filesDir,"outside.bin").apply{writeText("outside")}
+        database.dao().put(NoteEntity(id="page",dirty=false))
+        database.dao().putAssets(listOf(io.github.notebook.android.data.AssetEntity("asset-a","page","file","owned.bin","application/octet-stream","next/asset-a/owned.bin",owned.absolutePath)))
+        database.dao().putAssets(listOf(io.github.notebook.android.data.AssetEntity("asset-b","page","file","outside.bin","application/octet-stream","outside.bin",outside.absolutePath)))
+        val client=ApiSyncClient(context,database.dao(),allowInsecureHttp=true)
+        client.applyDelete("asset","asset-a",com.google.gson.JsonObject())
+        client.applyDelete("asset","asset-b",com.google.gson.JsonObject())
+        assertFalse(owned.exists())
+        assertTrue(outside.exists())
+    }
+
+    @Test fun `remote page delete clears synchronized revision history`()=runBlocking {
+        database.dao().put(NoteEntity(id="page",dirty=false))
+        database.dao().putRemoteRevision(io.github.notebook.android.data.RemoteRevisionEntity("revision-a","page",1,"manual","history"))
+        ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true)
+            .applyDelete("page","page",com.google.gson.JsonObject())
+        assertTrue(database.dao().remoteRevisions("page").isEmpty())
+    }
+
     private fun settings()=ApiSyncSettings(server.url("/").toString().trimEnd('/'),workspace,"")
     private fun json(body:String)=MockResponse().setResponseCode(200).setHeader("Content-Type","application/json").setBody(body)
 }

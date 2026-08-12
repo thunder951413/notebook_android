@@ -20,7 +20,7 @@ object Reminders {
     @Synchronized fun schedule(context:Context,id:String,title:String,at:Long?,recurrence:String){
         cancelAlarm(context,id);if(at==null){cancel(context,id);return};val now=System.currentTimeMillis();val triggerAt=if(at>now)at else if(recurrence=="none"){cancel(context,id);return}else nextOccurrence(at,recurrence,now)
         val token=UUID.randomUUID().toString();preferences(context).edit().putString(tokenKey(id),token).commit()
-        val intent=Intent(context,ReminderReceiver::class.java).putExtra("id",id).putExtra("title",title).putExtra("recurrence",recurrence).putExtra("scheduledAt",triggerAt).putExtra("token",token)
+        val intent=Intent(context,ReminderReceiver::class.java).putExtra("id",id).putExtra("recurrence",recurrence).putExtra("scheduledAt",triggerAt).putExtra("token",token)
         val pi=PendingIntent.getBroadcast(context,id.hashCode(),intent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE);val alarm=context.getSystemService(Context.ALARM_SERVICE) as AlarmManager;val exactAllowed=android.os.Build.VERSION.SDK_INT<31||alarm.canScheduleExactAlarms();if(exactAllowed)alarm.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,triggerAt,pi)else alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,triggerAt,pi);updateRegistry(context,id,true)
     }
     @Synchronized fun cancel(context:Context,id:String){cancelAlarm(context,id);NotificationManagerCompat.from(context).cancel(id.hashCode());preferences(context).edit().remove(tokenKey(id)).commit();updateRegistry(context,id,false)}
@@ -38,13 +38,15 @@ object Reminders {
     private fun registry(context:Context)=preferences(context).getStringSet(REGISTRY,emptySet())?.toSet().orEmpty()
     @Synchronized private fun updateRegistry(context:Context,id:String,add:Boolean){val values=registry(context).toMutableSet();if(add)values.add(id)else values.remove(id);preferences(context).edit().putStringSet(REGISTRY,values).commit()}
 }
+internal fun reminderNotificationTitle(noteTitle:String,isPrivate:Boolean):String=
+    if(isPrivate)"Notebook 私密提醒" else noteTitle.ifBlank{"Notebook 提醒"}
 class ReminderReceiver:BroadcastReceiver(){override fun onReceive(c:Context,i:Intent){
     val id=i.getStringExtra("id")?:return;val token=i.getStringExtra("token");val pending=goAsync()
     CoroutineScope(SupervisorJob()+Dispatchers.IO).launch{try{
         val app=c.applicationContext as? NotebookApp;val note=app?.database?.dao()?.getNoteHeader(id)
         if(!Reminders.isCurrentToken(c,id,token))return@launch
         if(note==null||note.deletedAt!=null||note.completedAt!=null||note.reminderAt==null){Reminders.cancel(c,id);return@launch}
-        Reminders.createChannel(c);val title=note.title.ifBlank{"Notebook 提醒"};val openIntent=Intent(c,MainActivity::class.java).putExtra("noteId",id).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP);val open=PendingIntent.getActivity(c,id.hashCode(),openIntent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE);val canNotify=android.os.Build.VERSION.SDK_INT<33||c.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED
+        Reminders.createChannel(c);val title=reminderNotificationTitle(note.title,app.repository.isEncrypted(note));val openIntent=Intent(c,MainActivity::class.java).putExtra("noteId",id).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP);val open=PendingIntent.getActivity(c,id.hashCode(),openIntent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE);val canNotify=android.os.Build.VERSION.SDK_INT<33||c.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED
         if(canNotify)NotificationManagerCompat.from(c).notify(id.hashCode(),NotificationCompat.Builder(c,Reminders.CHANNEL).setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle(title).setContentText("点击查看详情").setAutoCancel(true).setContentIntent(open).build())
         val latest=app.database.dao().getNoteHeader(id);if(latest?.deletedAt==null&&latest?.completedAt==null&&latest?.reminderAt!=null&&latest.recurrence!="none"&&Reminders.isCurrentToken(c,id,token))Reminders.schedule(c,id,latest.title,Reminders.nextOccurrence(i.getLongExtra("scheduledAt",System.currentTimeMillis()),latest.recurrence),latest.recurrence)
         else if(latest?.recurrence=="none")Reminders.finishDelivery(c,id)

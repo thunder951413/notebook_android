@@ -1,6 +1,7 @@
 package io.github.notebook.android.sync
 
 import com.google.gson.JsonObject
+import io.github.notebook.android.data.AssetEntity
 import io.github.notebook.android.data.ReadingPositionEntity
 import org.junit.Assert.*
 import org.junit.Test
@@ -22,6 +23,72 @@ class ProtocolTest {
         assertTrue(RepositoryIdentityContract.isValidNoteID("123e4567-e89b-82d3-a456-426614174000"))
         assertFalse(RepositoryIdentityContract.isValidNoteID("../library"))
         assertThrows(IllegalArgumentException::class.java){CompressedRepositoryContract.notePath("/repo","../library",null)}
+    }
+
+    @Test fun `remote sync entity ids reject paths and permit normal composite ids`() {
+        val payload = JsonObject().apply { addProperty("pageId", "page-1"); addProperty("tagId", "tag_2") }
+        assertEquals("page-1:tag_2", SyncEntityIdentityContract.requireChange("page_tag", "page-1:tag_2", payload))
+        listOf("../outside", "/absolute", "a\\b", "a\u0000b", "a/b", "a:too:many").forEach { id ->
+            assertThrows(IllegalArgumentException::class.java) {
+                SyncEntityIdentityContract.requireChange("asset", id, JsonObject().apply { addProperty("pageId", "page-1") })
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            SyncEntityIdentityContract.requireChange("page_tag", "page-1:tag-1", JsonObject().apply {
+                addProperty("pageId", "../page"); addProperty("tagId", "tag-1")
+            })
+        }
+    }
+
+    @Test fun `cross platform page links and reading position id variants remain valid`() {
+        val pageLink=JsonObject().apply { addProperty("sourcePageId","page-1");addProperty("targetPageId","page-2") }
+        assertEquals("page-1:mention:page-2",SyncEntityIdentityContract.requireChange("page_link","page-1:mention:page-2",pageLink))
+        val desktop=JsonObject().apply { addProperty("pageId","page-1");addProperty("deviceId","device-1") }
+        assertEquals("page-1",SyncEntityIdentityContract.requireChange("reading_position","page-1",desktop))
+        assertEquals("page-1:device-1",SyncEntityIdentityContract.requireChange("reading_position","page-1:device-1",desktop))
+        listOf("../escape","/absolute","a\\b","a\u0000b").forEach { invalid ->
+            assertThrows(IllegalArgumentException::class.java) { SyncEntityIdentityContract.requireEntityId("page_link",invalid) }
+            assertThrows(IllegalArgumentException::class.java) { SyncEntityIdentityContract.requireEntityId("reading_position",invalid) }
+        }
+    }
+
+    @Test fun `webdav journal rejects a traversal asset before it can be applied`() {
+        val line = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"asset","id":"../escape","ver":0,"payload":{"pageId":"page-1","filename":"x.bin"}}"""
+        assertThrows(IllegalArgumentException::class.java) { WebdavJournalProtocol.parseJournal(line) }
+    }
+
+    @Test fun `legacy ssh private assets stay dirty and their known manifest entries are removed`() {
+        val privateImage = AssetEntity("image-1", "private-note", "image", "photo.png", "image/png", "private-note/photo.png", dirty = true)
+        val privateAudio = AssetEntity("audio-1", "private-note", "audio", "voice.m4a", "audio/mp4", "private-note/voice.m4a", dirty = true)
+        val privateFile = AssetEntity("file-1", "private-note", "file", "secret.pdf", "application/pdf", "private-note/secret.pdf", dirty = true)
+        val ordinary = AssetEntity("file-2", "public-note", "file", "public.pdf", "application/pdf", "public-note/public.pdf", dirty = true)
+        val uploadable = SshAssetManifestContract.uploadableAssets(listOf(privateImage, privateAudio, privateFile, ordinary), setOf("private-note"))
+        assertEquals(listOf(ordinary.id), uploadable.map { it.id })
+
+        val entries = linkedMapOf<String, JsonObject>(
+            privateImage.relativePath to JsonObject(), privateAudio.relativePath to JsonObject(), privateFile.relativePath to JsonObject(), ordinary.relativePath to JsonObject(),
+            "objects/aa/${"a".repeat(64)}" to JsonObject(),
+        )
+        SshAssetManifestContract.removeIdentifiablePrivateEntries(entries, listOf(privateImage, privateAudio, privateFile))
+        assertEquals(setOf(ordinary.relativePath, "objects/aa/${"a".repeat(64)}"), entries.keys)
+    }
+
+    @Test fun `private SSH envelope publishes no attachment metadata or filenames`() {
+        val envelope=JsonObject().apply{
+            add("metadata",JsonObject().apply{addProperty("title","私密标题");addProperty("assetCount",2)})
+            add("assets",com.google.gson.JsonArray().apply{add(JsonObject().apply{addProperty("filename","private-photo.png");addProperty("objectHash","a".repeat(64))})})
+        }
+        val stripped=SshAssetManifestContract.stripPrivateEnvelopeAttachments(envelope)
+        assertTrue(stripped["assets"].asJsonArray.isEmpty)
+        assertEquals(0,stripped["metadata"].asJsonObject["assetCount"].asInt)
+        assertFalse(stripped.toString().contains("private-photo.png"))
+        assertFalse(stripped.toString().contains("a".repeat(64)))
+    }
+
+    @Test fun `private SSH publishing is limited to encrypted v3 repositories`() {
+        assertTrue(SshPrivacyCompatibilityContract.canPublishPrivateNote(3))
+        assertFalse(SshPrivacyCompatibilityContract.canPublishPrivateNote(1))
+        assertFalse(SshPrivacyCompatibilityContract.canPublishPrivateNote(2))
     }
 
     @Test fun `legacy invalid index tombstones do not block valid notes and are removed`() {

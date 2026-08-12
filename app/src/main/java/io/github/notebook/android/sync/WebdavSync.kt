@@ -122,15 +122,21 @@ internal object WebdavJournalProtocol {
             val root = runCatching { JsonParser.parseString(trimmed).asJsonObject }.getOrElse { error("远端日志包含无法解析的条目") }
             val op = root["op"]?.takeIf { it.isJsonPrimitive }?.asString
             require(op == "upsert" || op == "delete") { "远端日志包含非法操作" }
+            val type = root["type"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+                .also { require(it.isNotBlank()) { "远端日志缺少实体类型" } }
+            val id = root["id"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+                .also { require(it.isNotBlank()) { "远端日志缺少实体 ID" } }
+            val payload = root["payload"]?.takeIf { it.isJsonObject }?.asJsonObject ?: error("远端日志缺少内容")
+            SyncEntityIdentityContract.requireChange(type, id, payload)
             WebdavJournalEntry(
                 seq = root["seq"].takeIf { it.isJsonPrimitive }?.asLong ?: error("远端日志缺少序号"),
                 ts = root["ts"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty(),
                 op = op,
-                type = root["type"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty().also { require(it.isNotBlank()) { "远端日志缺少实体类型" } },
-                id = root["id"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty().also { require(it.isNotBlank()) { "远端日志缺少实体 ID" } },
+                type = type,
+                id = id,
                 ver = root["ver"]?.takeIf { it.isJsonPrimitive }?.asLong ?: 0L,
                 hash = root["hash"]?.takeIf { it.isJsonPrimitive }?.asString,
-                payload = root["payload"]?.takeIf { it.isJsonObject }?.asJsonObject ?: error("远端日志缺少内容"),
+                payload = payload,
             )
         }
     }
@@ -254,18 +260,39 @@ class WebdavSyncClient(
                 ?.takeIf { it.isJsonPrimitive }?.asString
             if (payloadMarker != null) {
                 val hash = WebdavJournalProtocol.requireHash(payloadMarker)
-                val bytes = client.getBytes(client.objectPath(hash)) ?: error("远端对象 $hash 不存在")
+                val bytes = downloadObjectBytes(client, hash, budget)
                 require(WebdavJournalProtocol.sha256(bytes).equals(hash, ignoreCase = true)) { "远端对象 $hash 的 SHA-256 校验失败" }
                 payload = JsonParser.parseString(String(bytes, Charsets.UTF_8)).asJsonObject
             }
         }
+        if (operation == "upsert") SyncEntityIdentityContract.requireChange(type, id, payload)
         val pending = dao.apiOutboxItem(type, id)
         val affectedPage = api.pageIdFor(type, id, payload)
         val locallyDirty = affectedPage?.let { dao.get(it)?.dirty } == true
-        if ((pending != null && version > pending.expectedVersion) || locallyDirty) {
+        val localVersion = dao.apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id))?.version ?: 0L
+        // `ver` is a parent version. A second v0 record is a sibling of the
+        // initial state, not an automatic overwrite: after accepting the first
+        // v0 our local version is 1, so only an identical replay is safe. A few
+        // early peers emitted v1 before a local baseline existed; accept that
+        // historical 0 -> 1 progression once for compatibility.
+        val parentMismatch = when {
+            version == 0L -> localVersion != 0L
+            localVersion == 0L && version == 1L -> false
+            else -> version != localVersion
+        }
+        val localStateExists = hasLocalState(type, id, payload)
+        if ((pending != null && version > pending.expectedVersion) || locallyDirty || (parentMismatch && localStateExists && !sameRemoteState(type, id, payload, entry.hash))) {
             conflictKeys.add("$type:$id")
+            affectedPage?.let { pageId -> conflictKeys.add("page:$pageId"); conflictKeys.add("document:$pageId") }
             affectedPage?.let { api.recordConflict(it, type, payload) }
             return false
+        }
+        // A retry/replay with identical content is safe to acknowledge without
+        // rewriting local state. This is what prevents an old journal copy from
+        // turning a matching snapshot into a false conflict.
+        if (parentMismatch && localStateExists) {
+            dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), maxOf(localVersion, version + 1)))
+            return true
         }
         // Restore externalized document bodies fetched from objects/.
         if (type == "document" && operation == "upsert") {
@@ -273,7 +300,7 @@ class WebdavSyncClient(
                 ?.get(WebdavJournalProtocol.OBJECT_MARKER)?.takeIf { it.isJsonPrimitive }?.asString
             if (marker != null) {
                 val hash = WebdavJournalProtocol.requireHash(marker)
-                val bytes = client.getBytes(client.objectPath(hash)) ?: error("远端对象 $marker 不存在")
+                val bytes = downloadObjectBytes(client, hash, budget)
                 require(WebdavJournalProtocol.sha256(bytes).equals(hash, ignoreCase = true)) { "远端对象 $hash 的 SHA-256 校验失败" }
                 payload = payload.deepCopy()
                 payload.add("tiptapJson", JsonParser.parseString(String(bytes, Charsets.UTF_8)))
@@ -306,17 +333,50 @@ class WebdavSyncClient(
                 payload.string("pageId"), payload.integer("anchorUtf16Offset"), payload.double("viewportOffsetFraction"),
                 payload.millis("updatedAt"), payload.string("deviceId"),
             ))
+            "page_link" -> api.applyPageLink(id, payload)
+            "revision" -> api.applyRevision(id, payload)
         }
-        dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), version))
+        dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), version + 1))
         return true
+    }
+
+    private fun downloadObjectBytes(client: WebdavClient, hash:String, budget:RemoteTransferLimits.Budget):ByteArray {
+        val bytes = client.getBytes(client.objectPath(hash)) ?: error("远端对象 $hash 不存在")
+        budget.consume(bytes.size.toLong(), bytes.size.toLong())
+        return bytes
+    }
+
+    private suspend fun sameRemoteState(type:String,id:String,payload:JsonObject,hash:String?):Boolean {
+        return when(type) {
+            "page" -> dao.get(id)?.let { it.title == payload.string("title") && it.previewText == payload.string("preview") } == true
+            "document" -> {
+                val tiptap = payload["tiptapJson"] ?: return false
+                dao.get(id)?.let { TipTapCodec.decode(tiptap) == it.body } == true
+            }
+            "asset" -> dao.getAsset(id)?.let { asset ->
+                val remoteHash = hash ?: payload.optionalString("objectHash") ?: payload.optionalString("checksum")
+                remoteHash != null && asset.contentHash.equals(remoteHash, ignoreCase = true)
+            } == true
+            "page_link" -> payload.optionalString("sourcePageId")?.let { source -> dao.pageLinks(source).any { it.id == id } } == true
+            "revision" -> payload.optionalString("pageId")?.let { noteId -> dao.remoteRevisions(noteId).any { it.id == id } } == true
+            else -> false
+        }
+    }
+
+    private suspend fun hasLocalState(type:String,id:String,payload:JsonObject):Boolean = when(type) {
+        "page", "document" -> dao.get(id) != null
+        "asset" -> dao.getAsset(id) != null
+        "page_link" -> payload.optionalString("sourcePageId")?.let { dao.pageLinks(it).any { link -> link.id == id } } == true
+        "revision" -> payload.optionalString("pageId")?.let { dao.remoteRevisions(it).any { revision -> revision.id == id } } == true
+        else -> false
     }
 
     private suspend fun downloadAsset(client: WebdavClient, id: String, payload: JsonObject, hash: String, budget: RemoteTransferLimits.Budget) {
         val filename = payload.string("filename", "attachment").replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"), "_")
         val relative = "next/$id/$filename"
-        val target = File(context.filesDir, "attachments/$relative")
+        val target = AttachmentStorageContract.file(context, relative)
         target.parentFile?.mkdirs()
-        val temp = File(target.parentFile, "${target.name}.download")
+        val temp = AttachmentStorageContract.temporaryFile(target, context)
         try {
             client.downloadObjectToFile(hash, temp, budget)
             payload.optionalString("checksum")?.takeIf { it.isNotBlank() }?.let { expected ->

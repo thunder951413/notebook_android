@@ -97,6 +97,45 @@ internal object RepositoryIdentityContract {
     }
 }
 
+/** Privacy cleanup rules for the legacy SSH assets manifest. */
+internal object SshAssetManifestContract {
+    /**
+     * Old manifests use the source relative path, so an owned private asset can
+     * be identified and removed. Hash-addressed v3 entries intentionally stay:
+     * their path has no owner and may be shared with a non-private asset.
+     */
+    fun removeIdentifiablePrivateEntries(entries: MutableMap<String, JsonObject>, privateAssets: List<AssetEntity>) {
+        privateAssets.mapNotNull { asset ->
+            runCatching { legacyRelativePath(asset.relativePath) }.getOrNull()
+        }.forEach(entries::remove)
+    }
+
+    fun isPrivateAsset(asset:AssetEntity, encryptedNoteIds:Set<String>) = asset.noteId in encryptedNoteIds
+
+    fun uploadableAssets(dirtyAssets:List<AssetEntity>, encryptedNoteIds:Set<String>) =
+        dirtyAssets.filterNot { isPrivateAsset(it, encryptedNoteIds) }
+
+    fun stripPrivateEnvelopeAttachments(envelope:JsonObject):JsonObject{
+        val copy=envelope.deepCopy()
+        copy.add("assets",JsonArray())
+        copy["metadata"]?.takeIf{it.isJsonObject}?.asJsonObject?.apply{addProperty("assetCount",0)}
+        return copy
+    }
+
+    private fun legacyRelativePath(path:String):String {
+        val normalized=path.replace('\\','/')
+        require(normalized.isNotBlank()&&!normalized.startsWith('/')&&!normalized.startsWith('~')&&normalized.none{it.isISOControl()}&&!normalized.split('/').any{it==".."||it=="."||it.isBlank()}){"非法附件路径"}
+        return normalized
+    }
+}
+
+/** SSH is compatibility-only. Old repository formats cannot protect private
+ * note payloads, so they must remain entirely local rather than being partly
+ * serialized in plaintext. */
+internal object SshPrivacyCompatibilityContract {
+    fun canPublishPrivateNote(repositoryVersion:Int) = repositoryVersion == CompressedRepositoryContract.VERSION
+}
+
 internal object RemoteTransferLimits {
     const val MAX_FILE_MIB=100L
     const val MAX_REPOSITORY_MIB=512L
@@ -226,7 +265,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     suspend fun loadNote(id:String)=withContext(Dispatchers.IO){loadEditable(id)}
     internal suspend fun resolveReference(reference:NotebookReference):NoteEntity?=withContext(Dispatchers.IO){loadEditable(reference.pageId)}
     suspend fun revisions(noteId:String):List<NoteRevisionSummary> = withContext(Dispatchers.IO){
-        val raw=loadSnapshot(noteId)?:return@withContext emptyList()
+        val remote=dao.remoteRevisions(noteId).map{NoteRevisionSummary(it.id,it.createdAt,it.reason,it.markdown,it.pageIcon)}
+        val raw=loadSnapshot(noteId)?:return@withContext remote
         val envelope=runCatching{JsonParser.parseString(raw).asJsonObject}.getOrNull()?:return@withContext emptyList()
         if(envelope["schemaVersion"]?.asInt==3){
             val objects=envelope["contentObjects"]?.takeIf{it.isJsonObject}?.asJsonObject?:return@withContext emptyList()
@@ -241,14 +281,14 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
                     markdown=markdown,
                     pageIcon=entry.optStr("pageIcon")
                 )
-            }.orEmpty().sortedByDescending{it.createdAt}
+            }.orEmpty().plus(remote).distinctBy{it.id}.sortedByDescending{it.createdAt}
         }else{
             envelope["history"]?.takeIf{it.isJsonArray}?.asJsonArray?.mapNotNull{item->
                 val entry=item.asJsonObject
                 val snapshot=entry["snapshot"]?.takeIf{it.isJsonObject}?.asJsonObject?:return@mapNotNull null
                 val blocks=snapshot["document"]?.asJsonObject?.get("blocks")?.takeIf{it.isJsonArray}?.asJsonArray?:return@mapNotNull null
                 NoteRevisionSummary(entry["id"]?.asString?:UUID.randomUUID().toString(),entry.optDateMs("updatedAt")?:0,"import",BlockDocumentCodec.decodeMarkdown(blocks),snapshot["metadata"]?.asJsonObject?.optStr("icon"))
-            }.orEmpty().sortedByDescending{it.createdAt}
+            }.orEmpty().plus(remote).distinctBy{it.id}.sortedByDescending{it.createdAt}
         }
     }
     suspend fun restoreRevision(noteId:String,revisionId:String):NoteEntity{
@@ -352,7 +392,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             treeUpdatedAt=System.currentTimeMillis()
         ))
     }
-    suspend fun deletePermanently(id:String){subtree(id).forEach{note->Reminders.cancel(appContext,note.id);dao.putTombstone(TombstoneEntity("note|${note.id}",note.id,"note",System.currentTimeMillis(),deviceId()));if(syncBackend()!=SyncBackend.SSH){val w=syncWorkspaceId();apiSync.queueDelete(w,"document",note.id);apiSync.queueDelete(w,"page",note.id)};dao.deleteReadingPosition(note.id);dao.deleteNotePermanently(note.id)};requestSyncIfConfigured()}
+    suspend fun deletePermanently(id:String){subtree(id).forEach{note->Reminders.cancel(appContext,note.id);dao.putTombstone(TombstoneEntity("note|${note.id}",note.id,"note",System.currentTimeMillis(),deviceId()));if(syncBackend()!=SyncBackend.SSH){val w=syncWorkspaceId();apiSync.queueDelete(w,"document",note.id);apiSync.queueDelete(w,"page",note.id)};dao.assets(note.id).forEach{asset->asset.localPath?.let{path->java.io.File(path)}?.let{file->AttachmentStorageContract.deleteIfContained(appContext,file)}};dao.deleteReadingPosition(note.id);dao.deleteRemoteRevisionsForNote(note.id);dao.deleteNotePermanently(note.id)};requestSyncIfConfigured()}
     suspend fun keepLocal(id:String){loadEditable(id)?.let{local->if(syncBackend()!=SyncBackend.SSH){val kept=local.copy(updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null);dao.put(kept);apiSync.queueNote(syncWorkspaceId(),kept);requestSyncIfConfigured()}else{val remoteVersion=loadConflictSnapshot(id)?.let{payload->runCatching{val remote=JsonParser.parseString(payload).asJsonObject;if(remote["schemaVersion"]?.asInt==3)remote["metadata"].asJsonObject["legacyVersion"]?.asLong?:remote["metadata"].asJsonObject.isoMs("updatedAt") else remote["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=loadSnapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}}
     suspend fun acceptRemote(id:String){val local=loadEditable(id)?:return;val snapshot=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;if(syncBackend()!=SyncBackend.SSH&&snapshot.has("apiConflicts")){snapshot["apiConflicts"].asJsonObject.entrySet().forEach{(type,payload)->apiSync.acceptConflict(syncWorkspaceId(),type,id,payload.asJsonObject)}}else if(syncBackend()!=SyncBackend.SSH&&snapshot.has("apiEntityType")){apiSync.acceptConflict(syncWorkspaceId(),snapshot["apiEntityType"].asString,id,snapshot["payload"].asJsonObject)}else{val remote=if(snapshot["schemaVersion"]?.asInt==3)fromMarkdownEnvelope(snapshot)else fromEnvelope(JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)});val accepted=remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion);dao.put(accepted);indexReferences(accepted)}}
     suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString()){val folder=FolderEntity(id,name,dao.allFolders().size,type);dao.putFolder(folder);if(syncBackend()!=SyncBackend.SSH)apiSync.queueFolder(syncWorkspaceId(),folder);requestSyncIfConfigured()}
@@ -513,7 +553,18 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     private suspend fun pushAssets(c:ChannelSftp,s:SshSettings,index:JsonObject?){
         val remote=readJson(c,"${s.path}/notes/assets_manifest.json");val contentAddressed=CompressedRepositoryContract.version(index)==3;val entries=linkedMapOf<String,JsonObject>();remote?.get("entries")?.asJsonArray?.forEach{entries[it.asJsonObject.str("relativePath")]=it.asJsonObject.deepCopy()}
-        val confirmed=mutableListOf<AssetEntity>();dao.dirtyAssets().forEach{a->val file=a.localPath?.let{path->java.io.File(path)}?.takeIf{it.isFile}?:error("本地附件文件缺失，已取消远程发布");val hash=file.inputStream().use(::sha);val relative=if(contentAddressed)"objects/${hash.take(2)}/$hash" else safeRelative(a.relativePath);val target=if(contentAddressed)"${s.path}/$relative" else "${s.path}/attachments/$relative";mkdirs(c,target.substringBeforeLast('/'));atomicUpload(c,target,file,hash);entries[relative]=JsonObject().apply{addProperty("relativePath",relative);addProperty("contentHash",hash);addProperty("size",file.length())};confirmed+=a.copy(relativePath=relative,contentHash=hash,size=file.length(),dirty=false)}
+        // SSH predates the WebDAV/API privacy boundary.  Its privacy envelope
+        // never encrypted attachment bytes, so a private asset must stay local
+        // (and dirty) until a future encrypted attachment protocol exists.
+        // Legacy manifests encode their original relative path, which lets us
+        // remove a previously leaked private reference safely. Content-addressed
+        // object names carry no owner information and are deliberately retained:
+        // pruning by hash could hide an ordinary asset with identical bytes.
+        val encryptedNotes=encryptedNoteIds()
+        val privateAssets=encryptedNotes.flatMap{dao.assets(it)}
+        SshAssetManifestContract.removeIdentifiablePrivateEntries(entries,privateAssets)
+        val confirmed=mutableListOf<AssetEntity>();SshAssetManifestContract.uploadableAssets(dao.dirtyAssets(),encryptedNotes).forEach{a->
+            val file=a.localPath?.let{path->java.io.File(path)}?.takeIf{it.isFile}?:error("本地附件文件缺失，已取消远程发布");val hash=file.inputStream().use(::sha);val relative=if(contentAddressed)"objects/${hash.take(2)}/$hash" else safeRelative(a.relativePath);val target=if(contentAddressed)"${s.path}/$relative" else "${s.path}/attachments/$relative";mkdirs(c,target.substringBeforeLast('/'));atomicUpload(c,target,file,hash);entries[relative]=JsonObject().apply{addProperty("relativePath",relative);addProperty("contentHash",hash);addProperty("size",file.length())};confirmed+=a.copy(relativePath=relative,contentHash=hash,size=file.length(),dirty=false)}
         val manifest=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)})};atomicWrite(c,"${s.path}/notes/assets_manifest.json",gson.toJson(manifest))
         if(confirmed.isNotEmpty())dao.putAssets(confirmed)
     }
@@ -605,7 +656,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         dao.tombstones().filter{it.itemType=="note"&&RepositoryIdentityContract.isValidNoteID(it.itemId)}.forEach{t->deleted[t.itemId]=JsonObject().apply{addProperty("noteID",t.itemId);addProperty("deletedAt",swiftDate(t.deletedAt));addProperty("deletedByDeviceID",t.deviceId)};entries.remove(t.itemId)}
         val confirmed=mutableListOf<Triple<String,Long,String?>>();dao.dirtyNoteIds().mapNotNull{loadEditable(it)?.copy(snapshotJson=loadSnapshot(it))}.filter{!it.conflict}.forEach{n->
             if(n.deletedAt!=null){deleted[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("deletedAt",swiftDate(n.deletedAt));addProperty("deletedByDeviceID",deviceId())};entries.remove(n.id);confirmed+=Triple(n.id,n.version,null)}
-            else {val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(CompressedRepositoryContract.version(remote)==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())require(s.password.isNotBlank()){"隐私笔记 ${n.title} 无法安全同步：私钥认证未配置 SSH 密码"};val stored=if(env["schemaVersion"]?.asInt==3&&n.id in encryptedNoteIds())encryptPrivacyEnvelope(env,s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
+            else {val repositoryVersion=CompressedRepositoryContract.version(remote);val privateNote=n.id in encryptedNoteIds();if(privateNote&&!SshPrivacyCompatibilityContract.canPublishPrivateNote(repositoryVersion))return@forEach;val previousEnvelope=readNoteJson(c,s,n.id,remote);val env=if(repositoryVersion==3)toMarkdownEnvelope(n,previousEnvelope)else toEnvelope(n,previousEnvelope);if(privateNote)require(s.password.isNotBlank()){"隐私笔记 ${n.title} 无法安全同步：私钥认证未配置 SSH 密码"};val stored=if(privateNote)encryptPrivacyEnvelope(stripPrivateAttachments(env),s.password)else env;val text=gson.toJson(stored);val path=CompressedRepositoryContract.notePath(s.path,n.id,remote);if(compressed)atomicWrite(c,path,CompressedRepositoryContract.encode(text))else atomicWrite(c,path,text);val contentHash=env["currentContentHash"]?.asString?:sha(gson.toJson(env["currentSnapshot"]));entries[n.id]=JsonObject().apply{addProperty("noteID",n.id);addProperty("version",n.version);addProperty("contentHash",contentHash);addProperty("historyCount",env["history"]?.asJsonArray?.size()?:0)};deleted.remove(n.id);val snapshot=if(env["schemaVersion"]?.asInt==3)gson.toJson(env) else gson.toJson(env["currentSnapshot"]);confirmed+=Triple(n.id,n.version,snapshot)}
         }
         val idx=JsonObject().apply{addProperty("generatedAt",swiftDate(System.currentTimeMillis()));addProperty("deviceID",deviceId());add("entries",JsonArray().apply{entries.values.forEach(::add)});add("deletedEntries",JsonArray().apply{deleted.values.forEach(::add)});remote?.get("repositoryFormat")?.takeIf{it.isJsonObject}?.let{add("repositoryFormat",it.deepCopy())}}
         // A freshly configured device often has no local changes after pulling.
@@ -777,6 +828,10 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val redacted=note["metadata"].asJsonObject.deepCopy().apply{addProperty("title","隐私笔记");addProperty("preview","");addProperty("locked",true);remove("legacyMetadata")}
         return JsonObject().apply{addProperty("schemaVersion",3);addProperty("noteID",note.str("noteID"));add("metadata",redacted);addProperty("currentContentHash",note.str("currentContentHash"));add("contentObjects",JsonObject());add("history",JsonArray());add("assets",JsonArray());add("taskSteps",JsonArray());add("tagIDs",JsonArray());add("linkedPageIDs",JsonArray());add("privacyEncryption",JsonObject().apply{addProperty("version",1);addProperty("algorithm","AES-256-GCM");addProperty("kdf","PBKDF2-SHA256");addProperty("iterations",iterations);addProperty("salt",Base64.encodeToString(salt,Base64.NO_WRAP));addProperty("iv",Base64.encodeToString(iv,Base64.NO_WRAP));addProperty("ciphertext",Base64.encodeToString(encrypted,Base64.NO_WRAP))})}
     }
+    /** Private SSH note bodies are encrypted, but legacy asset objects are not.
+     *  Remove every attachment reference before encryption so another device
+     *  never tries to fetch an intentionally local-only object. */
+    private fun stripPrivateAttachments(envelope:JsonObject)=SshAssetManifestContract.stripPrivateEnvelopeAttachments(envelope)
     private fun decryptPrivacyEnvelope(stored:JsonObject,secret:String):JsonObject{
         val encryption=stored["privacyEncryption"]?.takeIf{it.isJsonObject}?.asJsonObject?:return stored
         try{val iterations=encryption["iterations"].asInt;require(encryption.str("algorithm")=="AES-256-GCM"&&encryption.str("kdf")=="PBKDF2-SHA256"&&iterations==privacyIterations);val salt=Base64.decode(encryption.str("salt"),Base64.NO_WRAP);val iv=Base64.decode(encryption.str("iv"),Base64.NO_WRAP);val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,privacyKey(secret,salt,iterations),GCMParameterSpec(128,iv));cipher.updateAAD(stored.str("noteID").toByteArray(StandardCharsets.UTF_8));val decoded=JsonParser.parseString(String(cipher.doFinal(Base64.decode(encryption.str("ciphertext"),Base64.NO_WRAP)),StandardCharsets.UTF_8)).asJsonObject;require(decoded.str("noteID")==stored.str("noteID"));return decoded}catch(error:Throwable){throw IllegalStateException("隐私笔记 ${stored.str("noteID")} 解密失败：SSH 密码不一致或远端数据已损坏",error)}

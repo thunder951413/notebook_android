@@ -11,7 +11,7 @@ android {
     defaultConfig {
         applicationId = "io.github.notebook.android"; minSdk = 26; targetSdk = 35
         versionCode = System.getenv("VERSION_CODE")?.toIntOrNull() ?: 1
-        versionName = System.getenv("VERSION_NAME") ?: "0.1.0"
+        versionName = System.getenv("VERSION_NAME") ?: "0.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String","GITHUB_REPOSITORY","\"${providers.gradleProperty("githubRepository").orNull ?: "thunder951413/notebook_android"}\"")
     }

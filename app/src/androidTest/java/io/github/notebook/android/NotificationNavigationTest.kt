@@ -16,6 +16,6 @@ class NotificationNavigationTest {
     @Test fun notificationIntentOpensTargetNote(){
         val context=InstrumentationRegistry.getInstrumentation().targetContext;val app=context.applicationContext as NotebookApp;val id=UUID.randomUUID().toString();val title="通知直达-${System.nanoTime()}";runBlocking{app.repository.save(NoteEntity(id,title=title,body="提醒正文"))}
         val scenario=ActivityScenario.launch<MainActivity>(Intent(context,MainActivity::class.java).putExtra("noteId",id))
-        try{compose.waitUntil(5_000){compose.onAllNodesWithTag("markdown-view").fetchSemanticsNodes().isNotEmpty()};compose.onNodeWithText(title).assertIsDisplayed();compose.onNodeWithTag("edit-mode").assertIsDisplayed()}finally{scenario.close()}
+        try{compose.waitUntil(5_000){compose.onAllNodesWithTag("reader-note-$id").fetchSemanticsNodes().isNotEmpty()};compose.onNodeWithTag("reader-note-$id").assertTextEquals(title).assertIsDisplayed();compose.onNodeWithTag("edit-mode").assertIsDisplayed()}finally{scenario.close()}
     }
 }

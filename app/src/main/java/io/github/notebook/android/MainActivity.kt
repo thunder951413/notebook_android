@@ -97,13 +97,32 @@ class MainActivity : ComponentActivity() {
         super.onCreate(state)
         Reminders.createChannel(this)
         repository = (application as NotebookApp).repository
-        notificationTarget.value=intent.getStringExtra("noteId")
+        notificationTarget.value=noteIdFromIntent(intent)
         setContent { NotebookTheme { NotebookScreen(repository,notificationTarget.value){notificationTarget.value=null} } }
     }
-    override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);notificationTarget.value=intent.getStringExtra("noteId")}
+    override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);notificationTarget.value=noteIdFromIntent(intent)}
     override fun onStart(){super.onStart();repository.requestForegroundSync()}
     override fun onStop(){repository.onAppBackgrounded();super.onStop()}
 }
+
+/** Only app-local page links are accepted; every resulting id is still authorized in NotebookScreen. */
+internal fun noteIdFromIntent(intent:Intent?):String?{
+    intent?.getStringExtra("noteId")?.takeIf(String::isNotBlank)?.let{return it}
+    return noteIdFromAppLink(intent?.dataString)
+}
+
+internal fun noteIdFromAppLink(rawUri:String?):String?{
+    val uri=runCatching{rawUri?.let { java.net.URI(it) }}.getOrNull()?:return null
+    val path=uri.path?.removePrefix("/")?.takeIf(String::isNotBlank)?:return null
+    return path.takeIf{uri.scheme=="notebook"&&uri.host=="page"&&!it.contains('/')}
+}
+
+/** A single policy used by lists, notifications, references and deep links. */
+internal fun canExposeNote(note:NoteSummary?,encryptedUnlocked:Boolean,isEncrypted:(NoteSummary)->Boolean):Boolean=
+    note!=null&&(!isEncrypted(note)||encryptedUnlocked)
+
+internal fun visibleReferenceNotes(notes:List<NoteSummary>,currentId:String,encryptedUnlocked:Boolean,isEncrypted:(NoteSummary)->Boolean):List<NoteSummary> =
+    notes.filter{it.id!=currentId&&it.deletedAt==null&&it.itemType=="note"&&canExposeNote(it,encryptedUnlocked,isEncrypted)}
 
 internal enum class Destination(val title:String,val newItemType:String?="note") { Today("今天","todo"), Important("重要","todo"), Todos("全部待办","todo"), Completed("已完成",null), All("全部笔记"), Unfiled("未分类"), Conflicts("同步冲突"), Trash("回收站",null) }
 
@@ -133,8 +152,9 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     var query by remember{mutableStateOf("")};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by remember{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
     var showSettings by remember{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
     var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)}
-    var encryptedUnlocked by remember{mutableStateOf(false)};var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)}
-    val encryptedUnlocker=rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()){result->if(result.resultCode==android.app.Activity.RESULT_OK){encryptedUnlocked=true;pendingEncryptedFolder?.let{folderId=it;tagId=null;destination=Destination.All};pendingEncryptedFolder=null;scope.launch{drawer.close()}}}
+    var showAllFolders by remember{mutableStateOf(false)};var showAllTags by remember{mutableStateOf(false)}
+    var encryptedUnlocked by remember{mutableStateOf(false)};var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)};var pendingPrivateNoteId by remember{mutableStateOf<String?>(null)};var pendingPrivateStartInEditMode by remember{mutableStateOf(false)};var deviceCredentialInProgress by remember{mutableStateOf(false)}
+    val encryptedUnlocker=rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()){result->deviceCredentialInProgress=false;if(result.resultCode==android.app.Activity.RESULT_OK){encryptedUnlocked=true;pendingEncryptedFolder?.let{folderId=it;tagId=null;destination=Destination.All};pendingEncryptedFolder=null;scope.launch{drawer.close()}}else{pendingEncryptedFolder=null;pendingPrivateNoteId=null;pendingPrivateStartInEditMode=false;status="需要验证设备凭据才能查看私密内容"}}
     val isTablet=LocalConfiguration.current.screenWidthDp>=840
     val drawerScroll=androidx.compose.foundation.rememberScrollState()
     val appUpdate:AppUpdateViewModel=viewModel()
@@ -142,20 +162,79 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     DisposableEffect(updateLifecycleOwner,appUpdate){val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)appUpdate.checkForUpdate()};updateLifecycleOwner.lifecycle.addObserver(observer);if(updateLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))appUpdate.checkForUpdate();onDispose{updateLifecycleOwner.lifecycle.removeObserver(observer)}}
     UpdatePrompt(appUpdate)
     val textImporter=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{val target=folders.firstOrNull{it.id==folderId};runCatching{repo.importText(source,target)}.onSuccess{note->startInEditMode=false;editing=note;status="已导入 ${note.title}"}.onFailure{status="导入失败：${it.localizedMessage}"}}}}
-    fun openNote(id:String,startEditing:Boolean=false){if(loadingNoteId!=null)return;loadingNoteId=id;scope.launch{runCatching{repo.loadNote(id)}.onSuccess{note->if(note!=null){startInEditMode=startEditing;editing=note}else status="笔记不存在或已被删除"}.onFailure{status="无法加载笔记：${it.localizedMessage}"};loadingNoteId=null}}
+    fun lockPrivateContent(){
+        encryptedUnlocked=false
+        pendingEncryptedFolder=null
+        pendingPrivateNoteId=null
+        pendingPrivateStartInEditMode=false
+        deviceCredentialInProgress=false
+        if(editing?.let(repo::isEncrypted)==true){editing=null;startInEditMode=false}
+        if(folders.firstOrNull{it.id==folderId}?.type=="encryptedFolder"){folderId=null;tagId=null;destination=Destination.All}
+    }
+    fun requestPrivateUnlock(folder:String?=null,noteId:String?=null,startEditing:Boolean=false){
+        val manager=context.getSystemService(android.content.Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+        if(!manager.isDeviceSecure){status="请先在手机系统设置中设置锁屏密码或指纹";return}
+        pendingEncryptedFolder=folder
+        pendingPrivateNoteId=noteId
+        pendingPrivateStartInEditMode=startEditing
+        deviceCredentialInProgress=true
+        encryptedUnlocker.launch(manager.createConfirmDeviceCredentialIntent("解锁私密笔记","验证手机锁屏密码或指纹后查看锁定内容"))
+    }
+    fun openNote(id:String,startEditing:Boolean=false){
+        if(loadingNoteId!=null)return
+        val summary=all.firstOrNull{it.id==id}
+        if(summary==null){status="笔记不存在或已被删除";return}
+        if(!canExposeNote(summary,encryptedUnlocked,repo::isEncrypted)){
+            requestPrivateUnlock(repo.encryptedFolderId(summary),id,startEditing)
+            return
+        }
+        loadingNoteId=id
+        scope.launch{runCatching{repo.loadNote(id)}.onSuccess{note->
+            if(note!=null&&(!repo.isEncrypted(note)||encryptedUnlocked)){startInEditMode=startEditing;editing=note}
+            else if(note!=null)requestPrivateUnlock(repo.encryptedFolderId(note),id,startEditing)
+            else status="笔记不存在或已被删除"
+        }.onFailure{status="无法加载笔记：${it.localizedMessage}"};loadingNoteId=null}
+    }
+    LaunchedEffect(encryptedUnlocked,pendingPrivateNoteId){
+        if(encryptedUnlocked){
+            val id=pendingPrivateNoteId?:return@LaunchedEffect
+            val startEditing=pendingPrivateStartInEditMode
+            pendingPrivateNoteId=null
+            pendingPrivateStartInEditMode=false
+            openNote(id,startEditing)
+        }
+    }
     LaunchedEffect(query){if(query.isBlank())matchingNoteIds=null else{delay(180);matchingNoteIds=runCatching{repo.searchNoteIds(query.trim())}.getOrElse{status="搜索失败：${it.localizedMessage}";emptySet()}}}
-    LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->all.firstOrNull{it.id==id}?.let{target->destination=if(target.itemType=="todo")Destination.Today else Destination.All;folderId=null;tagId=null;openNote(id);onNotificationConsumed()}}}
-    fun runSync(){if(syncing)return;scope.launch{syncing=true;changedKey=null;newKey=null;status="正在同步…";runCatching{repo.sync()}.onSuccess{status="同步完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;status="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;status="服务器主机密钥发生变化，需要你确认"};else->status=error.localizedMessage?:error.message?:"同步失败"}};syncing=false}}
+    LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->
+        all.firstOrNull{it.id==id}?.let{target->
+            destination=if(target.itemType=="todo")Destination.Today else Destination.All
+            folderId=null
+            tagId=null
+            openNote(id)
+            onNotificationConsumed()
+        }
+    }}
+    fun runSync(){if(syncing)return;scope.launch{syncing=true;changedKey=null;newKey=null;status="正在同步…";runCatching{repo.sync()}.onSuccess{status="同步完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;status="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;status="服务器主机密钥发生变化，需要你确认"};else->status="同步失败：${error.localizedMessage?:error.message?:"未知错误"}"}};syncing=false}}
     newKey?.let{key->AlertDialog(onDismissRequest={newKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("确认服务器身份")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("首次连接不会自动信任服务器。请将下面的 SHA-256 指纹与桌面端或服务器管理员提供的值核对，确认一致后再继续。");Text(key.actual,style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(key.actual);newKey=null;runSync()}){Text("指纹一致，信任并继续")}},dismissButton={TextButton({newKey=null}){Text("取消")}})}
     changedKey?.let{change->AlertDialog(onDismissRequest={changedKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("服务器身份已变化")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("确认这是你的服务器后，可以信任新的主机指纹并继续同步。");Text("原指纹\n${change.expected}",style=MaterialTheme.typography.bodySmall);Text("新指纹\n${change.actual}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(change.actual);changedKey=null;runSync()}){Text("信任并继续")}},dismissButton={TextButton({changedKey=null}){Text("取消")}})}
 
-    if(!isTablet) editing?.let { note -> Editor(note,repo,startInEditMode){editing=null};return }
+    val privacyLifecycleOwner=LocalLifecycleOwner.current
+    DisposableEffect(privacyLifecycleOwner){
+        val observer=LifecycleEventObserver{_,event->
+            if(event==Lifecycle.Event.ON_STOP&&!deviceCredentialInProgress)lockPrivateContent()
+        }
+        privacyLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose{privacyLifecycleOwner.lifecycle.removeObserver(observer)}
+    }
+    if(!isTablet) editing?.let { note -> Editor(note,repo,startInEditMode,encryptedUnlocked,{id->openNote(id)}){editing=null};return }
     if(showSettings){ServerSettings(repo){showSettings=false};return}
     manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
 
     fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;scope.launch{drawer.close()}}
-    fun openEncrypted(folder:String){if(encryptedUnlocked){select(Destination.All,folder)}else{val manager=context.getSystemService(android.content.Context.KEYGUARD_SERVICE) as android.app.KeyguardManager;if(!manager.isDeviceSecure){status="请先在手机系统设置中设置锁屏密码或指纹";scope.launch{drawer.close()}}else{pendingEncryptedFolder=folder;encryptedUnlocker.launch(manager.createConfirmDeviceCredentialIntent("解锁加密文件夹","验证手机锁屏密码或指纹后查看锁定内容"))}}}
-    val endOfToday=remember{Calendar.getInstance().apply{set(Calendar.HOUR_OF_DAY,23);set(Calendar.MINUTE,59);set(Calendar.SECOND,59);set(Calendar.MILLISECOND,999)}.timeInMillis}
+    fun openEncrypted(folder:String){if(encryptedUnlocked){select(Destination.All,folder)}else{requestPrivateUnlock(folder);scope.launch{drawer.close()}}}
+    var todayKey by remember{mutableStateOf(Calendar.getInstance().get(Calendar.DAY_OF_YEAR) to Calendar.getInstance().get(Calendar.YEAR))}
+    LaunchedEffect(Unit){while(true){delay(60_000);val now=Calendar.getInstance();todayKey=now.get(Calendar.DAY_OF_YEAR) to now.get(Calendar.YEAR)}}
+    val endOfToday=remember(todayKey){Calendar.getInstance().apply{set(Calendar.HOUR_OF_DAY,23);set(Calendar.MINUTE,59);set(Calendar.SECOND,59);set(Calendar.MILLISECOND,999)}.timeInMillis}
     val visible=all.filter { n ->
         val encrypted=repo.isEncrypted(n);val selectedFolderType=folders.firstOrNull{it.id==folderId}?.type
         val section=when {
@@ -189,18 +268,20 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             DrawerRow("同步冲突",Icons.Default.Warning,destination==Destination.Conflicts&&folderId==null){select(Destination.Conflicts)}
             DrawerRow("回收站",Icons.Default.Delete,destination==Destination.Trash&&folderId==null){select(Destination.Trash)}
             Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("文件夹",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("管理",Modifier.clickable{manage="folder"},style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)}
-            folders.filter{it.type=="noteFolder"}.sortedBy{it.sortOrder}.forEach{f->DrawerRow(f.name,Icons.Default.Folder,folderId==f.id,all.count{it.itemType=="note"&&it.deletedAt==null&&it.folderId==f.id}){select(Destination.All,f.id)}}
-            Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("加密文件夹",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Icon(if(encryptedUnlocked)Icons.Default.LockOpen else Icons.Default.Lock,null,Modifier.size(16.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)}
-            val encryptedFolders=folders.filter{it.type=="encryptedFolder"}.sortedBy{it.sortOrder};if(encryptedFolders.isNotEmpty()){if(!encryptedUnlocked)DrawerRow("点击解锁",Icons.Default.Lock,false){openEncrypted(encryptedFolders.first().id)}else encryptedFolders.forEach{f->DrawerRow(f.name,Icons.Default.Lock,folderId==f.id,all.count{it.deletedAt==null&&repo.encryptedFolderId(it)==f.id}){openEncrypted(f.id)}}}
+            val noteFolders=folders.filter{it.type=="noteFolder"}.sortedBy{it.sortOrder};noteFolders.take(if(showAllFolders)noteFolders.size else 6).forEach{f->DrawerRow(f.name,Icons.Default.Folder,folderId==f.id,all.count{it.itemType=="note"&&it.deletedAt==null&&it.folderId==f.id}){select(Destination.All,f.id)}}
+            if(noteFolders.size>6)Text(if(showAllFolders)"收起文件夹" else "查看全部文件夹（${noteFolders.size}）",Modifier.fillMaxWidth().clickable{showAllFolders=!showAllFolders}.padding(start=28.dp,top=6.dp,bottom=8.dp),style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.primary)
+            Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("私密文件夹",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Icon(if(encryptedUnlocked)Icons.Default.LockOpen else Icons.Default.Lock,null,Modifier.size(16.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)}
+            val encryptedFolders=folders.filter{it.type=="encryptedFolder"}.sortedBy{it.sortOrder};if(encryptedFolders.isNotEmpty()){if(!encryptedUnlocked)DrawerRow("点击解锁私密内容",Icons.Default.Lock,false){openEncrypted(encryptedFolders.first().id)}else encryptedFolders.forEach{f->DrawerRow(f.name,Icons.Default.Lock,folderId==f.id,all.count{it.deletedAt==null&&repo.encryptedFolderId(it)==f.id}){openEncrypted(f.id)}}}
             Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("标签",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("管理",Modifier.clickable{manage="tag"},style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)}
-            tags.forEach{tag->DrawerRow(tag.name,Icons.Default.Label,tagId==tag.id){select(Destination.All,tag=tag.id)}}
+            tags.take(if(showAllTags)tags.size else 6).forEach{tag->DrawerRow(tag.name,Icons.Default.Label,tagId==tag.id){select(Destination.All,tag=tag.id)}}
+            if(tags.size>6)Text(if(showAllTags)"收起标签" else "查看全部标签（${tags.size}）",Modifier.fillMaxWidth().clickable{showAllTags=!showAllTags}.padding(start=28.dp,top=6.dp,bottom=8.dp),style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
-        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}}){Icon(Icons.Default.Menu,"导航")}},actions={IconButton({textImporter.launch(arrayOf("text/plain","text/markdown","application/octet-stream"))}){Icon(Icons.Default.UploadFile,"导入 txt/md")};UpdateAction(appUpdate);IconButton({runSync()},enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"同步")}})},floatingActionButton={if(destination.newItemType!=null)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday);if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id);repo.markUnsaved(draft.id);startInEditMode=true;editing=draft},Modifier.testTag("new-item")){Icon(Icons.Default.Add,if(destination.newItemType=="todo"||folders.firstOrNull{it.id==folderId}?.type=="todoList")"新建计划" else "新建笔记")}}){pad->
+        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Menu,"导航")}},actions={UpdateAction(appUpdate);IconButton({runSync()},Modifier.minimumInteractiveComponentSize(),enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"立即同步")}})},floatingActionButton={if(destination.newItemType!=null)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday);if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id);repo.markUnsaved(draft.id);startInEditMode=true;editing=draft},Modifier.testTag("new-item")){Icon(Icons.Default.Add,if(destination.newItemType=="todo"||folders.firstOrNull{it.id==folderId}?.type=="todoList")"新建计划" else "新建笔记")}}){pad->
             Column(Modifier.padding(pad).fillMaxSize().background(MaterialTheme.colorScheme.background)){
                 OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(12.dp),singleLine=true,shape=MaterialTheme.shapes.large,placeholder={Text("搜索全部笔记")},leadingIcon={Icon(Icons.Default.Search,null)})
-                status?.let{Text(it,Modifier.padding(horizontal=16.dp),color=MaterialTheme.colorScheme.primary)}
+                SyncStatusCard(status,syncing,{runSync()})
                 loadingNoteId?.let{LinearProgressIndicator(Modifier.fillMaxWidth())}
                 saveError?.let{Text(it,Modifier.padding(horizontal=16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
                 Row(Modifier.fillMaxSize()){
@@ -221,7 +302,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
                         onDeleted={deletedID->if(editing?.id==deletedID)editing=null},
                         onStatus={message->status=message}
                     )}
-                    if(isTablet){VerticalDivider();Box(Modifier.weight(1.65f).fillMaxHeight().background(MaterialTheme.colorScheme.background)){editing?.let{note->EditorPane(note,repo,initiallyEditing=startInEditMode,onDone={editing=null})}?:Box(Modifier.fillMaxSize().padding(40.dp)){Text("选择一篇笔记开始阅读",color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
+                    if(isTablet){VerticalDivider();Box(Modifier.weight(1.65f).fillMaxHeight().background(MaterialTheme.colorScheme.background)){editing?.let{note->EditorPane(note,repo,initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={id->openNote(id)},onDone={editing=null})}?:Box(Modifier.fillMaxSize().padding(40.dp)){Text("选择一篇笔记开始阅读",color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
                 }
             }
         }
@@ -231,6 +312,12 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 }
 
 @Composable private fun DrawerRow(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,selected:Boolean,count:Int?=null,onClick:()->Unit){NavigationDrawerItem(label={Row{Text(label);Spacer(Modifier.weight(1f));count?.let{Text(it.toString(),style=MaterialTheme.typography.labelMedium)}}},icon={Icon(icon,null)},selected=selected,onClick=onClick,modifier=Modifier.padding(horizontal=8.dp,vertical=1.dp))}
+
+@Composable private fun SyncStatusCard(status:String?,syncing:Boolean,onRetry:()->Unit){
+    val message=status?:return
+    val failed=message.startsWith("同步失败")
+    Card(Modifier.fillMaxWidth().padding(start=12.dp,end=12.dp,bottom=4.dp).testTag("sync-status"),colors=CardDefaults.cardColors(containerColor=when{failed->MaterialTheme.colorScheme.errorContainer;syncing->MaterialTheme.colorScheme.secondaryContainer;else->MaterialTheme.colorScheme.primaryContainer})){Row(Modifier.padding(horizontal=12.dp,vertical=8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)){if(syncing)CircularProgressIndicator(Modifier.size(18.dp),strokeWidth=2.dp)else Icon(if(failed)Icons.Default.ErrorOutline else Icons.Default.CheckCircle,if(failed)"同步失败" else "同步状态",tint=if(failed)MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary);Text(message,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall,maxLines=2);if(failed)TextButton(onRetry,modifier=Modifier.minimumInteractiveComponentSize()){Text("重试")}}}
+}
 
 internal data class VisibleNoteTreeRow(val note:NoteSummary,val depth:Int,val hasChildren:Boolean)
 
@@ -349,7 +436,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         ){Text("删除")}},
         dismissButton={TextButton({deleteDialog=false;settle(0f)}){Text("取消")}}
     )
-    if(moveDialog)MovePageDialog(note,allNotes,{moveDialog=false}){parentId->
+    if(moveDialog)MovePageDialog(note,allNotes.filter{candidate->repo.isEncrypted(candidate)==repo.isEncrypted(note)},{moveDialog=false}){parentId->
         moveDialog=false
         scope.launch{
             runCatching{repo.movePage(note.id,parentId)}
@@ -386,10 +473,10 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     AlertDialog(onDismissRequest=onDismiss,title={Text("移动页面")},text={Column(Modifier.fillMaxWidth().heightIn(max=540.dp)){OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索目标页面")});LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){item{ListItem(headlineContent={Text("当前分区的顶层")},leadingContent={Icon(Icons.Default.Home,null)},modifier=Modifier.clickable{onMove(null)})};items(targets,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"})},supportingContent={Text(target.folderName)},leadingContent={Icon(if(notes.any{it.parentPageId==target.id})Icons.Default.Folder else Icons.Default.Description,null)},modifier=Modifier.clickable{onMove(target.id)})}}}},confirmButton={},dismissButton={TextButton(onDismiss){Text("取消")}})
 }
 
-@Composable private fun Editor(original:NoteEntity,repo:SyncRepository,initiallyEditing:Boolean,onBack:()->Unit){Scaffold(containerColor=MaterialTheme.colorScheme.background){p->Box(Modifier.padding(p)){EditorPane(original,repo,showBack=true,initiallyEditing=initiallyEditing,onDone={onBack()})}}}
+@Composable private fun Editor(original:NoteEntity,repo:SyncRepository,initiallyEditing:Boolean,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,onBack:()->Unit){Scaffold(containerColor=MaterialTheme.colorScheme.background){p->Box(Modifier.padding(p)){EditorPane(original,repo,showBack=true,initiallyEditing=initiallyEditing,encryptedUnlocked=encryptedUnlocked,onOpenNote=onOpenNote,onDone={onBack()})}}}
 
 @OptIn(ExperimentalMaterial3Api::class,ExperimentalLayoutApi::class)
-@Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,showBack:Boolean=false,initiallyEditing:Boolean=false,onDone:(NoteEntity)->Unit){
+@Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,showBack:Boolean=false,initiallyEditing:Boolean=false,encryptedUnlocked:Boolean=false,onOpenNote:(String)->Unit={},onDone:(NoteEntity)->Unit){
     var n by remember(original.id,original.version){mutableStateOf(original)}
     var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body))}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
@@ -446,7 +533,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
         Row{if(showBack)IconButton({scope.launch{repo.flushDraft(n).join();onDone(n)}}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(n)};IconButton({scope.launch{historyRevisions=repo.revisions(n.id);historyDialog=true}}){Icon(Icons.Default.History,"版本历史")};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
-            ReadingPane(n,repo,steps,attachments,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
+            ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
         OutlinedTextField(n.title,{updateNote(n.copy(title=it))},Modifier.fillMaxWidth().testTag("title-field"),textStyle=MaterialTheme.typography.headlineSmall,label={Text("标题")})
         val encrypted=repo.isEncrypted(n)
@@ -461,7 +548,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         }
     }
     if(referencePicker)ReferencePickerDialog(
-        notes=allNotes.filter{it.id!=n.id&&it.deletedAt==null&&it.itemType=="note"},
+        notes=visibleReferenceNotes(allNotes,n.id,encryptedUnlocked,repo::isEncrypted),
         onDismiss={referencePicker=false},
         onSelect={target,embed->
             val syntax="${if(embed)"!" else ""}[[page:${target.id}]]"
@@ -552,23 +639,23 @@ private data class ReaderStyle(val fontSizeSp:Float=17f,val lineHeight:Float=1.2
 private sealed interface ReaderDocumentState { data object Loading:ReaderDocumentState;data class Ready(val document:ParsedMarkdownDocument):ReaderDocumentState;data class Failed(val message:String):ReaderDocumentState }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,modifier:Modifier=Modifier){
-    val context=LocalContext.current
+@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,modifier:Modifier=Modifier){
     val allNotes by repo.notes.collectAsState(initial=emptyList())
     val backlinks by repo.backlinks(note.id).collectAsState(initial=emptyList())
+    val visibleBacklinks=backlinks.filter{link->canExposeNote(allNotes.firstOrNull{it.id==link.sourceNoteId},encryptedUnlocked,repo::isEncrypted)}
     val references=remember(note.body){NotebookReferenceSyntax.parse(note.body)}
     val referencedAssetIds=remember(note.body){NotebookAssetSyntax.images(note.body).map{it.assetId}.toSet()}
     var referenceTargets by remember(note.id){mutableStateOf<Map<String,NoteEntity>>(emptyMap())}
     var referenceAssets by remember(note.id){mutableStateOf<Map<String,AssetEntity>>(emptyMap())}
-    LaunchedEffect(note.id,references.map{it.pageId}.distinct()){
+    LaunchedEffect(note.id,references.map{it.pageId}.distinct(),encryptedUnlocked){
         val targetIds=references.map{it.pageId}.distinct()
-        referenceTargets=targetIds.mapNotNull{id->repo.loadNote(id)?.let{id to it}}.toMap()
-        referenceAssets=targetIds.flatMap{repo.assetList(it)}.associateBy{it.id}
+        referenceTargets=targetIds.mapNotNull{id->repo.loadNote(id)?.takeIf{target->!repo.isEncrypted(target)||encryptedUnlocked}?.let{id to it}}.toMap()
+        referenceAssets=referenceTargets.keys.flatMap{repo.assetList(it)}.associateBy{it.id}
     }
     fun openReference(uri:String){
         val parsed=android.net.Uri.parse(uri)
         val targetId=parsed.pathSegments.firstOrNull()?:return
-        context.startActivity(Intent(context,MainActivity::class.java).putExtra("noteId",targetId).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        onOpenNote(targetId)
     }
     var documentState by remember(note.id,note.body) { mutableStateOf<ReaderDocumentState>(ReaderDocumentState.Loading) }
     LaunchedEffect(note.id,note.body) {
@@ -596,26 +683,33 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     }
     LaunchedEffect(note.id,note.body){
         val position=repo.readingPosition(note.id);if(position!=null&&note.body.isNotEmpty()){
-            val anchor=position.anchorUtf16Offset.coerceIn(0,note.body.length);val blockIndex=blocks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+blockIndex;state.scrollToItem(itemIndex)
-            for(attempt in 0 until 30){val view=views[blockIndex];val layout=view?.layout;if(layout!=null&&view.text.isNotEmpty()){val block=blocks[blockIndex];val sourceLocal=(anchor-block.startUtf16).coerceIn(0,block.text.length);val rendered=(sourceLocal.toDouble()/block.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1));val line=layout.getLineForOffset(rendered);val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);val desired=(layout.getLineTop(line)-position.viewportOffsetFraction*viewport).roundToInt().coerceAtLeast(0);state.scrollToItem(itemIndex,desired);break};delay(16)}
+            val anchor=position.anchorUtf16Offset.coerceIn(0,note.body.length);val blockIndex=blocks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+blockIndex;withContext(Dispatchers.Main.immediate){state.scrollToItem(itemIndex)}
+            for(attempt in 0 until 30){val view=views[blockIndex];val layout=view?.layout;if(layout!=null&&view.text.isNotEmpty()){val block=blocks[blockIndex];val sourceLocal=(anchor-block.startUtf16).coerceIn(0,block.text.length);val rendered=(sourceLocal.toDouble()/block.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1));val line=layout.getLineForOffset(rendered);val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);val desired=(layout.getLineTop(line)-position.viewportOffsetFraction*viewport).roundToInt().coerceAtLeast(0);withContext(Dispatchers.Main.immediate){state.scrollToItem(itemIndex,desired)};break};delay(16)}
         }
         restored=true
     }
     LaunchedEffect(note.id,restored,blocks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
     DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
     Box(modifier){LazyColumn(Modifier.fillMaxSize(),state=state,contentPadding=PaddingValues(top=if(showingSearch)64.dp else 0.dp,bottom=36.dp),horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){
-        item(key="reader-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Text("${blocks.size} 个内容块",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=14.dp));Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};if(document.headings.isNotEmpty())IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};BadgedBox(badge={if(backlinks.isNotEmpty())Badge{Text(backlinks.size.toString())}}){IconButton({showingBacklinks=true}){Icon(Icons.Default.Link,"反向链接")}};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
-        item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=12.dp))}
+        item(key="reader-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Text("${blocks.size} 个内容块",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=14.dp));Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};if(document.headings.isNotEmpty())IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};BadgedBox(badge={if(visibleBacklinks.isNotEmpty())Badge{Text(visibleBacklinks.size.toString())}}){IconButton({showingBacklinks=true}){Icon(Icons.Default.Link,"反向链接")}};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
+        item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=12.dp).testTag("reader-note-${note.id}"))}
         if(hasMetadata)item(key="note-folder"){Text(note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp))}
         if(blocks.isEmpty())item(key="empty-note"){Text("暂无正文",Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)}
         items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->
             val block=blocks[index]
             if(block.kind==MarkdownBlockKind.Blank)Spacer(Modifier.fillMaxWidth().height(8.dp))else{
-                val expandedMarkdown=NotebookReferenceSyntax.forDisplay(block.text,pageTitle={id->allNotes.firstOrNull{it.id==id}?.title},targetContent={reference->referenceTargets[reference.pageId]?.let{NotebookReferenceSyntax.extractTarget(it.body,reference)}})
+                val expandedMarkdown=NotebookReferenceSyntax.forDisplay(block.text,pageTitle={id->allNotes.firstOrNull{it.id==id}?.takeIf{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}?.title},targetContent={reference->referenceTargets[reference.pageId]?.let{NotebookReferenceSyntax.extractTarget(it.body,reference)}})
                 val imageRefs=NotebookAssetSyntax.images(expandedMarkdown)
                 val displayMarkdown=NotebookAssetSyntax.withoutImages(expandedMarkdown)
                 Column(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=if(index==0)12.dp else 0.dp)){
                     if(displayMarkdown.isNotBlank())MarkdownView(markdown=displayMarkdown,modifier=Modifier.fillMaxWidth(),style=readerStyle,highlightQuery=searchQuery,onNotebookLink=::openReference,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})
+                    val blockReferences=references.filter{it.start in block.startUtf16 until block.endUtf16}
+                    if(blockReferences.isNotEmpty())FlowRow(Modifier.padding(top=6.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){
+                        blockReferences.forEach{reference->
+                            val title=allNotes.firstOrNull{it.id==reference.pageId}?.takeIf{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}?.title?.ifBlank{"无标题"}?:reference.alias?:"关联页面"
+                            AssistChip(onClick={onOpenNote(reference.pageId)},label={Text(if(reference.embed)"打开嵌入：$title" else "打开：$title",maxLines=1)},leadingIcon={Icon(Icons.Default.OpenInNew,null)},modifier=Modifier.testTag("open-reference-${reference.pageId}"))
+                        }
+                    }
                     imageRefs.forEach{image->(attachments.firstOrNull{it.id==image.assetId}?:referenceAssets[image.assetId])?.let{asset->AttachmentView(asset,caption=image.title?:asset.caption?:image.alt.takeIf(String::isNotBlank))}}
                 }
             }
@@ -624,7 +718,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
     };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
     if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
-    if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(backlinks.isEmpty())Text("还没有其他页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(backlinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when(link.targetKind){"block"->"引用了内容块";"group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
+    if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(visibleBacklinks.isEmpty())Text("还没有其他可查看的页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(visibleBacklinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when(link.targetKind){"block"->"引用了内容块";"group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
 }
 
@@ -679,13 +773,14 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 @Composable private fun ReminderDialog(current:Long?,currentRule:String,onDismiss:()->Unit,onConfirm:(Long?,String)->Unit){val base=current?:System.currentTimeMillis()+3_600_000;val cal=remember(base){Calendar.getInstance().apply{timeInMillis=base}};val date=rememberDatePickerState(initialSelectedDateMillis=base);val time=rememberTimePickerState(cal.get(Calendar.HOUR_OF_DAY),cal.get(Calendar.MINUTE),true);var rule by remember{mutableStateOf(currentRule)};AlertDialog(onDismissRequest=onDismiss,title={Text("设置提醒")},text={Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())){DatePicker(date);TimePicker(time);Text("重复",fontWeight=FontWeight.Medium);SingleChoiceSegmentedButtonRow{listOf("none" to "一次","daily" to "每天","weekly" to "每周","monthly" to "每月").forEachIndexed{i,p->SegmentedButton(selected=rule==p.first,onClick={rule=p.first},shape=SegmentedButtonDefaults.itemShape(i,4)){Text(p.second)}}}}},confirmButton={Button({val selected=date.selectedDateMillis;if(selected==null)onConfirm(null,"none")else{val c=Calendar.getInstance().apply{timeInMillis=selected;set(Calendar.HOUR_OF_DAY,time.hour);set(Calendar.MINUTE,time.minute);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0)};onConfirm(c.timeInMillis,rule)}}){Text("确定")}},dismissButton={Row{TextButton({onConfirm(null,"none")}){Text("清除")};TextButton(onDismiss){Text("取消")}}})}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack){Icon(Icons.Default.ArrowBack,null)}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}}){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({scope.launch{repo.deleteFolder(item.id)}}){Icon(Icons.Default.Delete,"删除")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({scope.launch{repo.deleteTag(item.id)}}){Icon(Icons.Default.Delete,"删除")}})}}}}}
+@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit){
     var backend by remember{mutableStateOf(repo.syncBackend())}
     var w by remember{mutableStateOf(repo.webdavSettings())}
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
+    var showLegacySync by remember{mutableStateOf(backend==SyncBackend.SSH||backend==SyncBackend.API)}
     suspend fun syncNow(){syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null;runCatching{repo.sync()}.onSuccess{message="连接成功，同步已完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"};else->message="连接或同步失败：${error.localizedMessage?:error.javaClass.simpleName}"};isError=true};syncing=false}
     fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
     val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{
@@ -702,10 +797,13 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
     Scaffold(topBar={TopAppBar(title={Text("设置与同步")},navigationIcon={IconButton(onBack){Icon(Icons.Default.ArrowBack,null)}})}){p->
         Column(Modifier.padding(p).padding(20.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()),verticalArrangement=Arrangement.spacedBy(10.dp)){
             ReminderPermissionCard()
-            Text("同步方式",fontWeight=FontWeight.SemiBold)
-            Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
-                FilterChip(selected=backend==SyncBackend.WEBDAV,onClick={backend=SyncBackend.WEBDAV},label={Text("坚果云 WebDAV")})
-                FilterChip(selected=backend==SyncBackend.SSH,onClick={backend=SyncBackend.SSH},label={Text("SSH 服务器（旧版）")})
+            Text("正式同步",fontWeight=FontWeight.SemiBold)
+            Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.primaryContainer),modifier=Modifier.fillMaxWidth()){
+                Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(6.dp)){
+                    Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(Icons.Default.CloudSync,"坚果云 WebDAV");Spacer(Modifier.width(8.dp));Text("坚果云 WebDAV",style=MaterialTheme.typography.titleMedium,fontWeight=FontWeight.SemiBold);Spacer(Modifier.weight(1f));if(backend==SyncBackend.WEBDAV)AssistChip(onClick={},label={Text("当前使用")})}
+                    Text("唯一推荐的正式同步方式。支持可靠的跨设备同步与冲突处理。",style=MaterialTheme.typography.bodySmall)
+                    if(backend!=SyncBackend.WEBDAV)OutlinedButton({backend=SyncBackend.WEBDAV;showLegacySync=false},Modifier.minimumInteractiveComponentSize()){Text("使用坚果云 WebDAV")}
+                }
             }
             message?.let{Card(colors=CardDefaults.cardColors(containerColor=if(isError)MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer),modifier=Modifier.fillMaxWidth()){Row(Modifier.padding(12.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp);Icon(if(isError)Icons.Default.ErrorOutline else Icons.Default.CheckCircle,null);Text(it,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall)}}}
             HorizontalDivider()
@@ -715,14 +813,31 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 OutlinedTextField(w.username,{w=w.copy(username=it)},label={Text("用户名")})
                 OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
                 OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},label={Text("远程目录")})
-                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("同步密码（桌面端兼容）")},visualTransformation=PasswordVisualTransformation())
-                Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。隐私笔记及其关联数据当前严格保留在本机。",style=MaterialTheme.typography.bodySmall)
+                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("同步密码（可选预留）")},visualTransformation=PasswordVisualTransformation())
+                Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。私密笔记及关联附件不走 WebDAV，只保留在此设备。",style=MaterialTheme.typography.bodySmall)
+                Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.secondaryContainer),modifier=Modifier.fillMaxWidth()){
+                    Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(4.dp)){
+                        Text("私密文件夹说明",fontWeight=FontWeight.SemiBold)
+                        Text("私密文件夹通过设备锁保护访问；本地数据依赖 Android 系统存储加密，并非额外的应用层文件加密。私密内容不会同步到坚果云，卸载应用或设备丢失后无法从云端恢复。",style=MaterialTheme.typography.bodySmall)
+                    }
+                }
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                     OutlinedButton({testWebdavNow()},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在检测…" else "检测连接")}
                     Button({repo.saveWebdavSettings(w);backend=SyncBackend.WEBDAV;scope.launch{syncNow()}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
                 }
-            }else{
-                Text("SSH/SFTP 同步",fontWeight=FontWeight.SemiBold)
+            }
+            OutlinedCard(onClick={showLegacySync=!showLegacySync},modifier=Modifier.fillMaxWidth()){
+                Row(Modifier.padding(14.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(Icons.Default.History,"旧同步方式与迁移");Spacer(Modifier.width(8.dp));Column(Modifier.weight(1f)){Text("旧同步方式与迁移",fontWeight=FontWeight.SemiBold);Text("仅用于迁移已有 SSH 或 API 仓库，不建议持续同步。",style=MaterialTheme.typography.bodySmall)};Icon(if(showLegacySync)Icons.Default.ExpandLess else Icons.Default.ExpandMore,if(showLegacySync)"收起旧同步方式" else "展开旧同步方式")}
+            }
+            if(showLegacySync){
+                Text("SSH/SFTP 旧仓库迁移",fontWeight=FontWeight.SemiBold)
+                Text("旧配置会保留，方便完成迁移；请先同步并导入到坚果云 WebDAV，之后将正式同步切回 WebDAV。HTTP API 也仅作为旧部署迁移兼容，不作为新的客户端同步入口。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                if(backend!=SyncBackend.SSH)OutlinedButton({backend=SyncBackend.SSH},Modifier.minimumInteractiveComponentSize()){Text("打开 SSH 旧配置")}
+            }
+            if(showLegacySync&&backend==SyncBackend.SSH){
+                Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surfaceVariant),modifier=Modifier.fillMaxWidth()){
+                    Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(8.dp)){
+                Text("SSH/SFTP 同步（仅迁移）",fontWeight=FontWeight.SemiBold)
                 Button({scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("扫描 Notebook 配置二维码").setBeepEnabled(false).setOrientationLocked(false))},Modifier.fillMaxWidth()){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描配置二维码")}
                 fun update(host:String=s.host,port:Int=s.port,user:String=s.username,password:String=s.password,path:String=s.path,privateKeyPath:String=s.privateKeyPath){s=SshSettings(host,port,user,password,path,s.fingerprint,privateKeyPath,privateKeyPassphrase)}
                 OutlinedTextField(s.host,{update(host=it)},label={Text("服务器地址")});OutlinedTextField(s.port.toString(),{update(port=it.toIntOrNull()?:22)},label={Text("端口")});OutlinedTextField(s.username,{update(user=it)},label={Text("用户名")});OutlinedTextField(s.password,{update(password=it)},label={Text("密码（可选）")},visualTransformation=PasswordVisualTransformation());OutlinedTextField(s.path,{update(path=it)},label={Text("远程目录")})
@@ -732,8 +847,10 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 Button({keyPicker.launch(arrayOf("*/*"))},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.Key,null);Spacer(Modifier.width(8.dp));Text(if(s.privateKeyPath.isBlank())"导入私钥文件" else "重新导入私钥")}
                 if(s.privateKeyPath.isNotBlank())OutlinedButton({repo.clearPrivateKey();s=repo.settings()}){Text("清除私钥")}
                 if(s.fingerprint.isNotBlank())Text("已信任主机指纹：${s.fingerprint}",style=MaterialTheme.typography.bodySmall)
-                Text("与 Notebook 网页助手和 Electron 桌面版共用同一套 SSH JSON 仓库，可长期双向同步。",style=MaterialTheme.typography.bodySmall)
-                Button({repo.saveSettings(s);scope.launch{syncNow()}},Modifier.fillMaxWidth(),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
+                Text("仅用于读取和迁移旧 SSH JSON 仓库。迁移完成后请改用上方的坚果云 WebDAV；不要把 SSH 作为持续同步方案。",style=MaterialTheme.typography.bodySmall)
+                Button({repo.saveSettings(s);scope.launch{syncNow()}},Modifier.fillMaxWidth(),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存旧配置并迁移")}
+                    }
+                }
             }
         }
     }
