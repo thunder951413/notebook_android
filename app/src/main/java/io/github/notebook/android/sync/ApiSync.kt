@@ -45,6 +45,7 @@ internal object SyncEntityIdentityContract {
         require(type in atomicTypes || type in compositeTypes) { "远端同步包含不支持的实体类型：$type" }
         when (type) {
             "page_link" -> requireOpaque(id, "实体 ID")
+            "asset" -> requireAssetId(id)
             in atomicTypes -> requireAtom(id, "实体 ID")
             "page_tag" -> requireComposite(id, "实体 ID")
             "reading_position" -> requireReadingPositionId(id)
@@ -55,7 +56,10 @@ internal object SyncEntityIdentityContract {
 
     fun requireEntityId(type:String, id:String): String {
         require(type in atomicTypes || type in compositeTypes) { "远端同步包含不支持的实体类型：$type" }
+        // Desktop migration namespaces asset ids as legacy-asset:page:id and
+        // appends :sidecar:index. These are opaque ids, never filesystem paths.
         if (type == "page_link") requireOpaque(id)
+        else if (type == "asset") requireAssetId(id)
         else if (type in atomicTypes) requireAtom(id)
         else if (type == "reading_position") requireReadingPositionId(id)
         else requireComposite(id, "实体 ID")
@@ -70,6 +74,24 @@ internal object SyncEntityIdentityContract {
     private fun requireOpaque(value:String,label:String="实体 ID"):String {
         require(safeOpaque.matches(value)&&!value.contains("..")) { "$label 格式不正确" }
         return value
+    }
+
+    private fun requireAssetId(value:String) {
+        if (atom.matches(value)) return
+        requireOpaque(value)
+        val parts=value.split(':')
+        val suffixStart=if(parts.first()=="legacy-asset") {
+            require(parts.size==3 || parts.size==5) { "实体 ID 格式不正确" }
+            requireAtom(parts[1]);requireAtom(parts[2])
+            3
+        } else {
+            require(parts.size==3) { "实体 ID 格式不正确" }
+            requireAtom(parts[0])
+            1
+        }
+        if(parts.size>suffixStart) {
+            require(parts[suffixStart]=="sidecar" && parts[suffixStart+1].toIntOrNull()?.let{it>=0}==true) { "实体 ID 格式不正确" }
+        }
     }
 
     private fun requireComposite(value:String, label:String) {

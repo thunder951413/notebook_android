@@ -409,6 +409,31 @@ class WebdavSyncTest {
         }
     }
 
+    @Test
+    fun `desktop migrated asset and sidecar ids survive pull and delete without remapping`() = runBlocking {
+        database.dao().put(note().copy(dirty = false))
+        val ids = listOf("legacy-asset:$noteId:asset-1", "legacy-asset:$noteId:asset-1:sidecar:0")
+        val bytes = "migrated asset bytes".toByteArray()
+        val hash = WebdavJournalProtocol.sha256(bytes)
+        webdav.putObject(hash, bytes)
+        val remoteDevice = "30000000-0000-4000-8000-000000000019"
+        val entries = ids.mapIndexed { index, id ->
+            """{"seq":${index + 1},"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"asset","id":"$id","ver":0,"hash":"$hash","payload":{"id":"$id","pageId":"$noteId","filename":"image.png","objectHash":"$hash"}}"""
+        }
+        webdav.putJournal(remoteDevice, entries)
+
+        client.sync(settings())
+
+        for (id in ids) assertArrayEquals(bytes, File(database.dao().getAsset(id)!!.localPath!!).readBytes())
+        webdav.putJournal(remoteDevice, entries + """{"seq":3,"ts":"2026-08-04T00:00:01Z","op":"delete","type":"asset","id":"${ids[1]}","ver":1,"payload":{}}""")
+        client.sync(settings())
+        assertNotNull(database.dao().getAsset(ids[0]))
+        assertNull(database.dao().getAsset(ids[1]))
+        for (unsafe in listOf("legacy-asset:../secret", "legacy-asset:page:../../file", "legacy-asset:page:bad\\id")) {
+            assertTrue(runCatching { SyncEntityIdentityContract.requireEntityId("asset", unsafe) }.isFailure)
+        }
+    }
+
     private suspend fun missingAsset(bytes: ByteArray): AssetEntity {
         val id = UUID.randomUUID().toString()
         val asset = AssetEntity(

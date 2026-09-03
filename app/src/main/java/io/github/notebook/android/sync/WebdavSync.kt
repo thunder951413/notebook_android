@@ -271,7 +271,11 @@ class WebdavSyncClient(
                 payload = JsonParser.parseString(String(bytes, Charsets.UTF_8)).asJsonObject
             }
         }
-        if (operation == "upsert") SyncEntityIdentityContract.requireChange(type, id, payload)
+        if (operation == "upsert") try {
+            SyncEntityIdentityContract.requireChange(type, id, payload)
+        } catch (error: IllegalArgumentException) {
+            throw IllegalArgumentException("云端 $type 记录（序号 ${entry.seq}）：${error.message}", error)
+        }
         val pending = dao.apiOutboxItem(type, id)
         val affectedPage = api.pageIdFor(type, id, payload)
         val locallyDirty = affectedPage?.let { dao.get(it)?.dirty } == true

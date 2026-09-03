@@ -178,6 +178,30 @@ class WebdavSyncInstrumentedTest {
         assertFalse(requests.any{it.method=="PUT"&&it.path.endsWith(asset.contentHash)})
     }
 
+    @Test fun desktopMigratedAttachmentIdsRestoreOnAndroid()=runBlocking {
+        val (settings,app)=fixtureArguments("_legacy_asset_ids")
+        app.repository.saveWebdavSettings(settings)
+        val id=UUID.randomUUID().toString()
+        val assetId="legacy-asset:$id:asset-1:sidecar:0"
+        val bytes="legacy attachment".toByteArray()
+        val file=java.io.File(app.filesDir,"attachments/$id/source.png").apply{parentFile?.mkdirs();writeBytes(bytes)}
+        val note=NoteEntity(id=id,title="legacy attachment",dirty=true)
+        val asset=AssetEntity(assetId,id,"image","image.png","image/png","$id/source.png",file.absolutePath,WebdavJournalProtocol.sha256(bytes),bytes.size.toLong(),true)
+        app.database.dao().put(note)
+        app.database.dao().putAssets(listOf(asset))
+        ApiSyncClient(app,app.database.dao(),allowInsecureHttp=true).queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,note)
+        app.repository.sync()
+
+        val fresh=FixtureContext(app)
+        try {
+            fresh.repository.saveWebdavSettings(settings)
+            fresh.repository.sync()
+            val restored=fresh.database.dao().getAsset(assetId)!!
+            assertArrayEquals(bytes,java.io.File(restored.localPath!!).readBytes())
+            assertFalse(restored.dirty)
+        } finally { fresh.database.close() }
+    }
+
     @Test fun transientJournalFailureKeepsOutboxAndRetryRecovers()=runBlocking {
         val (settings,app)=fixtureArguments("_retry")
         val repo=app.repository
