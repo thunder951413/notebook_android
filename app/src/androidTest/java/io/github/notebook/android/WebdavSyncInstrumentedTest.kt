@@ -3,6 +3,12 @@ package io.github.notebook.android
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.work.WorkManager
+import android.content.Context
+import android.content.ContextWrapper
+import androidx.room.Room
+import io.github.notebook.android.data.NotebookDatabase
+import io.github.notebook.android.sync.SyncRepository
+import org.junit.After
 import io.github.notebook.android.data.NoteEntity
 import io.github.notebook.android.data.AssetEntity
 import io.github.notebook.android.data.FolderEntity
@@ -46,20 +52,29 @@ import android.util.Base64
 class WebdavSyncInstrumentedTest {
     private data class FixtureRequest(val method:String,val path:String)
     private data class FixtureSnapshot(val requests:List<FixtureRequest>,val files:Map<String,ByteArray>)
+    private class FixtureContext(context:Context):ContextWrapper(context) {
+        val database=Room.inMemoryDatabaseBuilder(context,NotebookDatabase::class.java).build()
+        val prefs=context.getSharedPreferences("webdav-device-test-${UUID.randomUUID()}",0)
+        val repository=SyncRepository(this,database.dao(),prefs)
+    }
+    private var fixture:FixtureContext?=null
 
-    private fun fixtureArguments(suffix:String=""):Pair<WebdavSettings,NotebookApp> {
+    @After fun closeFixture(){fixture?.database?.close()}
+
+    private fun fixtureArguments(suffix:String=""):Pair<WebdavSettings,FixtureContext> {
         val arguments=InstrumentationRegistry.getArguments()
         val baseUrl=arguments.getString("webdavBaseUrl").orEmpty()
         assumeTrue("WebDAV fixture not configured",baseUrl.isNotBlank())
-        val app=InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as NotebookApp
-        WorkManager.getInstance(app).cancelAllWork()
+        val context=InstrumentationRegistry.getInstrumentation().targetContext
+        WorkManager.getInstance(context).cancelAllWork().result.get()
+        val app=FixtureContext(context).also{fixture=it}
         val basePath=arguments.getString("webdavRemotePath").orEmpty().ifBlank{"notebook_backup"}
         val settings=WebdavSettings(
             baseUrl=baseUrl,
             username=arguments.getString("webdavUsername").orEmpty().ifBlank{"notebook"},
             appPassword=arguments.getString("webdavPassword").orEmpty()
                 .ifBlank{arguments.getString("webdavAppPassword").orEmpty()}.ifBlank{"test-app-password"},
-            remotePath=basePath+suffix,
+            remotePath=basePath+suffix+"_${UUID.randomUUID()}",
         )
         fixtureRequest(settings,"/__test__/reset-stats","""{"clearFaults":true}""")
         return settings to app
@@ -99,16 +114,16 @@ class WebdavSyncInstrumentedTest {
         assertFalse(stored.dirty)
         assertEquals(stored.version,stored.lastSyncedVersion)
 
-        // Remove the local row, then prove a fresh device joining the same
-        // journal replays every entry and restores the note. (v4 keeps
-        // per-device read cursors, so this device's own push would otherwise
-        // already be consumed.)
-        app.database.dao().deleteNotePermanently(id)
-        repo.rotateWebdavDeviceId()
-        repo.sync()
-        val restored=app.database.dao().get(id)
-        assertEquals("WebDAV 端到端",restored?.title)
-        assertEquals("# 标题\n- [x] 完成",restored?.body)
+        // A fresh device has neither read cursors nor prior entity versions.
+        // Rotating only the id on the publishing database is not equivalent.
+        val fresh=FixtureContext(app)
+        try {
+            fresh.repository.saveWebdavSettings(settings)
+            fresh.repository.sync()
+            val restored=fresh.database.dao().get(id)
+            assertEquals("WebDAV 端到端",restored?.title)
+            assertEquals("# 标题\n- [x] 完成",restored?.body)
+        } finally { fresh.database.close() }
     }
 
     @Test fun unchangedSyncOnlyReadsSmallHeads()=runBlocking {
@@ -128,6 +143,63 @@ class WebdavSyncInstrumentedTest {
         assertFalse(requests.any{it.method=="PUT"})
         assertFalse(requests.any{it.method=="GET"&&it.path.endsWith(".jsonl")})
         assertTrue(requests.any{it.method=="GET"&&it.path.endsWith(".head.json")})
+    }
+
+    @Test fun missingLocalAttachmentRecoversEvenAfterJournalCursorWasConsumed()=runBlocking {
+        val (settings,app)=fixtureArguments("_missing_local_attachment")
+        val repo=app.repository
+        repo.saveWebdavSettings(settings)
+        val id=UUID.randomUUID().toString()
+        val assetId=UUID.randomUUID().toString()
+        val bytes=ByteArray(4096){(it%251).toByte()}
+        val file=java.io.File(app.filesDir,"attachments/$id/$assetId.png").apply{parentFile?.mkdirs();writeBytes(bytes)}
+        val note=NoteEntity(id=id,title="attachment recovery",body="keep this edit",dirty=true)
+        val asset=AssetEntity(assetId,id,"image","image.png","image/png","$id/$assetId.png",file.absolutePath,WebdavJournalProtocol.sha256(bytes),bytes.size.toLong(),true)
+        app.database.dao().put(note)
+        app.database.dao().putAssets(listOf(asset))
+        val api=ApiSyncClient(app,app.database.dao(),allowInsecureHttp=true)
+        api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,note)
+        repo.sync()
+
+        assertTrue(file.delete())
+        app.database.dao().putAssets(listOf(asset))
+        api.queueAsset(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,asset)
+        fixtureRequest(settings,"/__test__/reset-stats","{}")
+        val progress=mutableListOf<String>()
+        repo.sync(progress::add)
+
+        val restored=app.database.dao().getAsset(assetId)!!
+        assertArrayEquals(bytes,java.io.File(restored.localPath!!).readBytes())
+        assertFalse(restored.dirty)
+        assertNull(app.database.dao().apiOutboxItem("asset",assetId))
+        assertTrue(progress.any{it.contains("恢复附件")})
+        val requests=fixtureSnapshot(settings).requests
+        assertEquals(1,requests.count{it.method=="GET"&&it.path.endsWith(asset.contentHash)})
+        assertFalse(requests.any{it.method=="PUT"&&it.path.endsWith(asset.contentHash)})
+    }
+
+    @Test fun desktopMigratedAttachmentIdsRestoreOnAndroid()=runBlocking {
+        val (settings,app)=fixtureArguments("_legacy_asset_ids")
+        app.repository.saveWebdavSettings(settings)
+        val id=UUID.randomUUID().toString()
+        val assetId="legacy-asset:$id:asset-1:sidecar:0"
+        val bytes="legacy attachment".toByteArray()
+        val file=java.io.File(app.filesDir,"attachments/$id/source.png").apply{parentFile?.mkdirs();writeBytes(bytes)}
+        val note=NoteEntity(id=id,title="legacy attachment",dirty=true)
+        val asset=AssetEntity(assetId,id,"image","image.png","image/png","$id/source.png",file.absolutePath,WebdavJournalProtocol.sha256(bytes),bytes.size.toLong(),true)
+        app.database.dao().put(note)
+        app.database.dao().putAssets(listOf(asset))
+        ApiSyncClient(app,app.database.dao(),allowInsecureHttp=true).queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,note)
+        app.repository.sync()
+
+        val fresh=FixtureContext(app)
+        try {
+            fresh.repository.saveWebdavSettings(settings)
+            fresh.repository.sync()
+            val restored=fresh.database.dao().getAsset(assetId)!!
+            assertArrayEquals(bytes,java.io.File(restored.localPath!!).readBytes())
+            assertFalse(restored.dirty)
+        } finally { fresh.database.close() }
     }
 
     @Test fun transientJournalFailureKeepsOutboxAndRetryRecovers()=runBlocking {

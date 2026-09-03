@@ -439,7 +439,10 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     fun clearPrivateKey(){saveSettings(settings().copy(privateKeyPath="",privateKeyPassphrase=""))}
 
-    suspend fun sync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
+    suspend fun sync(onProgress:(String)->Unit={}):Unit {
+        onProgress("正在等待其他同步任务…")
+        syncMutex.withLock{withContext(Dispatchers.IO){
+        onProgress("正在保存本地更改…")
         flushAll()
         queueDirtyReadingPositions()
         val backend=syncBackend()
@@ -448,7 +451,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         // the pre-sync size so malformed rows do not cause a busy retry loop,
         // while a genuine backlog always receives its next durable worker.
         val outboxBefore=workspace?.let{dao.apiOutboxCount(it)}?:0
-        when(backend){SyncBackend.API->{apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());workspace?.let{scheduleNextOutboxBatch(it,outboxBefore)};return@withContext};SyncBackend.WEBDAV->{webdavSync.sync(webdavSettings());Reminders.reconcile(appContext,dao.reminders());workspace?.let{scheduleNextOutboxBatch(it,outboxBefore)};return@withContext};SyncBackend.SSH->Unit}
+        when(backend){SyncBackend.API->{apiSync.sync(apiSettings());Reminders.reconcile(appContext,dao.reminders());workspace?.let{scheduleNextOutboxBatch(it,outboxBefore)};return@withContext};SyncBackend.WEBDAV->{webdavSync.sync(webdavSettings(),onProgress);Reminders.reconcile(appContext,dao.reminders());workspace?.let{scheduleNextOutboxBatch(it,outboxBefore)};return@withContext};SyncBackend.SSH->Unit}
         val s=settings(); require(s.host.isNotBlank()&&s.username.isNotBlank()){ "请先配置 SSH 服务器" }
         require(s.password.isNotBlank()||s.privateKeyPath.isNotBlank()){ "请配置 SSH 私钥文件路径或密码" }
         val verifier=FingerprintHostKeyRepository(s.host,s.fingerprint)
@@ -498,6 +501,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             }
         } finally { remoteReadBudget=null;ch.disconnect();session.disconnect() }
     }}
+    }
 
     private suspend fun pullLibrary(c:ChannelSftp,s:SshSettings){
         val root=readJson(c,"${s.path}/library.json")?:return

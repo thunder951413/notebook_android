@@ -314,6 +314,139 @@ class WebdavSyncTest {
     }
 
     @Test
+    fun `queued asset with missing local bytes recovers the verified remote object`() = runBlocking {
+        val bytes = ByteArray(4096) { (it % 251).toByte() }
+        val asset = missingAsset(bytes)
+        webdav.putObject(asset.contentHash, bytes)
+        val progress = mutableListOf<String>()
+
+        client.sync(settings(), progress::add)
+
+        val restored = database.dao().getAsset(asset.id)!!
+        assertArrayEquals(bytes, File(restored.localPath!!).readBytes())
+        assertTrue(progress.any { it.contains("恢复附件") })
+        assertEquals(asset.caption, restored.caption)
+        assertEquals(asset.width, restored.width)
+        assertFalse(restored.dirty)
+        assertNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.objectPuts.isEmpty())
+        assertEquals(1, webdav.gets.count { it.endsWith(asset.contentHash) })
+        assertTrue(webdav.journalText(deviceId)!!.contains(asset.contentHash))
+    }
+
+    @Test
+    fun `stale absolute asset path is repaired from the app attachment directory`() = runBlocking {
+        val bytes = "existing local attachment".toByteArray()
+        val asset = missingAsset(bytes)
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val file = AttachmentStorageContract.file(context, asset.relativePath).apply {
+            parentFile?.mkdirs()
+            writeBytes(bytes)
+        }
+
+        client.sync(settings())
+
+        assertEquals(file.absolutePath, database.dao().getAsset(asset.id)!!.localPath)
+        assertArrayEquals(bytes, webdav.files.getValue("notebook_backup/objects/${asset.contentHash.take(2)}/${asset.contentHash}"))
+    }
+
+    @Test
+    fun `missing cloud and local attachment keeps edits queued until bytes are restored`() = runBlocking {
+        val bytes = "recover later".toByteArray()
+        val asset = missingAsset(bytes)
+
+        val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+
+        assertTrue(failure is MissingAttachmentException)
+        assertTrue(failure!!.message.orEmpty().contains(asset.filename))
+        assertTrue(database.dao().get(noteId)!!.dirty)
+        assertTrue(database.dao().getAsset(asset.id)!!.dirty)
+        assertNotNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.journalPuts.isEmpty())
+        webdav.putObject(asset.contentHash, bytes)
+
+        client.sync(settings())
+
+        assertFalse(database.dao().get(noteId)!!.dirty)
+        assertFalse(database.dao().getAsset(asset.id)!!.dirty)
+    }
+
+    @Test
+    fun `corrupt recovery object is rejected without publishing or clearing dirty state`() = runBlocking {
+        val asset = missingAsset("expected bytes".toByteArray())
+        webdav.putObject(asset.contentHash, "corrupt".toByteArray())
+
+        val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+
+        assertTrue(failure?.message.orEmpty().contains("SHA-256"))
+        assertTrue(database.dao().getAsset(asset.id)!!.dirty)
+        assertNotNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.journalPuts.isEmpty())
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        assertFalse(AttachmentStorageContract.file(context, asset.relativePath).exists())
+    }
+
+    @Test
+    fun `invalid directory XML fails before an empty repository can be seeded`() = runBlocking {
+        database.dao().put(note())
+        val invalidBodies = listOf(
+            "", "<html>not WebDAV</html>", "<d:multistatus xmlns:d=\"DAV:\"><d:response>",
+            """<!DOCTYPE multistatus [<!ENTITY external SYSTEM "file:///etc/passwd">]><multistatus xmlns="DAV:"><response><href>&external;</href></response></multistatus>""",
+        )
+        for (body in invalidBodies) {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest) =
+                    if (request.method == "MKCOL") MockResponse().setResponseCode(405)
+                    else MockResponse().setResponseCode(207).setBody(body)
+            }
+
+            val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+
+            assertTrue("invalid directory accepted: $body", failure is java.io.IOException)
+            assertEquals("无法解析 WebDAV 目录，请稍后重试", failure?.message)
+            assertTrue(database.dao().get(noteId)!!.dirty)
+            assertEquals(0, database.dao().apiOutboxCount(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID))
+        }
+    }
+
+    @Test
+    fun `desktop migrated asset and sidecar ids survive pull and delete without remapping`() = runBlocking {
+        database.dao().put(note().copy(dirty = false))
+        val ids = listOf("legacy-asset:$noteId:asset-1", "legacy-asset:$noteId:asset-1:sidecar:0")
+        val bytes = "migrated asset bytes".toByteArray()
+        val hash = WebdavJournalProtocol.sha256(bytes)
+        webdav.putObject(hash, bytes)
+        val remoteDevice = "30000000-0000-4000-8000-000000000019"
+        val entries = ids.mapIndexed { index, id ->
+            """{"seq":${index + 1},"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"asset","id":"$id","ver":0,"hash":"$hash","payload":{"id":"$id","pageId":"$noteId","filename":"image.png","objectHash":"$hash"}}"""
+        }
+        webdav.putJournal(remoteDevice, entries)
+
+        client.sync(settings())
+
+        for (id in ids) assertArrayEquals(bytes, File(database.dao().getAsset(id)!!.localPath!!).readBytes())
+        webdav.putJournal(remoteDevice, entries + """{"seq":3,"ts":"2026-08-04T00:00:01Z","op":"delete","type":"asset","id":"${ids[1]}","ver":1,"payload":{}}""")
+        client.sync(settings())
+        assertNotNull(database.dao().getAsset(ids[0]))
+        assertNull(database.dao().getAsset(ids[1]))
+        for (unsafe in listOf("legacy-asset:../secret", "legacy-asset:page:../../file", "legacy-asset:page:bad\\id")) {
+            assertTrue(runCatching { SyncEntityIdentityContract.requireEntityId("asset", unsafe) }.isFailure)
+        }
+    }
+
+    private suspend fun missingAsset(bytes: ByteArray): AssetEntity {
+        val id = UUID.randomUUID().toString()
+        val asset = AssetEntity(
+            id, noteId, "image", "image.png", "image/png", "$noteId/$id-image.png",
+            "/missing/$id-image.png", WebdavJournalProtocol.sha256(bytes), bytes.size.toLong(), true,
+            width = 320, caption = "keep attachment metadata",
+        )
+        database.dao().put(note())
+        database.dao().putAssets(listOf(asset))
+        return asset
+    }
+
+    @Test
     fun `concurrent journal parent version records conflict without advancing cursor`() = runBlocking {
         database.dao().put(note().copy(dirty = false))
         database.dao().putApiVersion(io.github.notebook.android.data.ApiSyncVersionEntity(

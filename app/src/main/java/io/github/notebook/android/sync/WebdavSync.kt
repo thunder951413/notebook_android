@@ -33,6 +33,10 @@ data class WebdavSettings(
 
 data class WebdavTestResult(val ok: Boolean, val remotePathExists: Boolean, val latencyMs: Long, val message: String)
 
+internal class MissingAttachmentException(filename: String) : java.io.IOException(
+    "附件 $filename 在本机和云端均无法恢复。待同步内容已保留，请在原设备恢复附件后重试。",
+)
+
 internal data class WebdavJournalEntry(
     val seq: Long,
     val ts: String,
@@ -186,7 +190,7 @@ class WebdavSyncClient(
         }
     }
 
-    suspend fun sync(settings: WebdavSettings) {
+    suspend fun sync(settings: WebdavSettings, onProgress: (String) -> Unit = {}) {
         validate(settings)
         withContext(Dispatchers.IO) {
             conflictKeys.clear()
@@ -195,13 +199,15 @@ class WebdavSyncClient(
             // shared state before publishing; an empty repository is seeded by
             // the full local library (equivalent to the desktop migration).
             val client = client(settings)
+            onProgress("正在读取云端更改…")
             val deviceIds = pull(settings, client, budget)
             val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
             if (deviceIds.isEmpty()) queueInitialSnapshot()
             else if (dao.apiOutboxCount(workspace) == 0 && (dao.dirtyNoteCount() > 0 || dao.dirtyAssetCount() > 0)) api.queueDirtyRecords(workspace)
-            push(settings, client)
+            push(settings, client, budget, onProgress)
             // Second pull catches entries published by other devices while this
             // device was pushing (mirrors the API backend's pull/push/pull).
+            onProgress("正在核对云端更改…")
             pull(settings, client, budget)
         }
     }
@@ -265,7 +271,11 @@ class WebdavSyncClient(
                 payload = JsonParser.parseString(String(bytes, Charsets.UTF_8)).asJsonObject
             }
         }
-        if (operation == "upsert") SyncEntityIdentityContract.requireChange(type, id, payload)
+        if (operation == "upsert") try {
+            SyncEntityIdentityContract.requireChange(type, id, payload)
+        } catch (error: IllegalArgumentException) {
+            throw IllegalArgumentException("云端 $type 记录（序号 ${entry.seq}）：${error.message}", error)
+        }
         val pending = dao.apiOutboxItem(type, id)
         val affectedPage = api.pageIdFor(type, id, payload)
         val locallyDirty = affectedPage?.let { dao.get(it)?.dirty } == true
@@ -417,7 +427,39 @@ class WebdavSyncClient(
         return ids + mappings.filterValues { it in encryptedFolderIds }.keys
     }
 
-    private suspend fun push(settings: WebdavSettings, client: WebdavClient) {
+    /** Recover bytes without acknowledging the queued edit before its journal commits. */
+    private suspend fun resolveAssetFile(
+        client: WebdavClient,
+        asset: AssetEntity,
+        budget: RemoteTransferLimits.Budget,
+        onProgress: (String) -> Unit,
+    ): File {
+        asset.localPath?.let(::File)?.takeIf(File::isFile)?.let { return it }
+        // Absolute paths may outlive an app-directory move or be absent on
+        // legacy imported metadata. The relative path remains portable.
+        val target = AttachmentStorageContract.file(context, asset.relativePath)
+        val hash = asset.contentHash.takeIf { it.isNotBlank() }?.let(WebdavJournalProtocol::requireHash)
+        if (target.isFile && (hash == null || target.inputStream().use(WebdavJournalProtocol::sha256).equals(hash, true))) {
+            dao.putAssets(listOf(asset.copy(localPath = target.absolutePath)))
+            return target
+        }
+        if (hash == null) throw MissingAttachmentException(asset.filename)
+        onProgress("正在从云端恢复附件 ${asset.filename}…")
+        target.parentFile?.mkdirs()
+        val temp = AttachmentStorageContract.temporaryFile(target, context)
+        try {
+            client.downloadObjectToFile(hash, temp, budget)
+            if (!temp.renameTo(target)) { temp.copyTo(target, true); temp.delete() }
+            dao.putAssets(listOf(asset.copy(localPath = target.absolutePath, size = target.length())))
+            return target
+        } catch (error: WebdavObjectNotFoundException) {
+            throw MissingAttachmentException(asset.filename)
+        } finally {
+            temp.delete()
+        }
+    }
+
+    private suspend fun push(settings: WebdavSettings, client: WebdavClient, budget: RemoteTransferLimits.Budget, onProgress: (String) -> Unit) {
         val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
         val outgoing = dao.apiOutbox(workspace, 200).filter { "${it.entityType}:${it.entityId}" !in conflictKeys }
         if (outgoing.isEmpty()) return
@@ -430,7 +472,8 @@ class WebdavSyncClient(
         // from the network outbox because they are intentionally local-only.
         val published = mutableListOf<io.github.notebook.android.data.ApiSyncOutboxEntity>()
         val localOnly = mutableListOf<io.github.notebook.android.data.ApiSyncOutboxEntity>()
-        for (item in outgoing) {
+        for ((index, item) in outgoing.withIndex()) {
+            onProgress("正在上传更改 ${index + 1}/${outgoing.size}…")
             var payload = runCatching { JsonParser.parseString(item.payloadJson).asJsonObject }.getOrNull() ?: continue
             // Assets, steps, page-tag relations and reading positions use ids
             // different from their owning note, so resolve pageId from payload.
@@ -457,11 +500,12 @@ class WebdavSyncClient(
                 }
                 "asset" -> if (item.operation == "upsert") {
                     val asset = dao.getAsset(item.entityId) ?: error("附件 ${item.entityId} 的元数据不存在")
-                    val file = asset.localPath?.let(::File)?.takeIf(File::isFile) ?: error("附件 ${asset.filename} 缺少本地文件，已阻止不完整同步")
+                    val file = resolveAssetFile(client, asset, budget, onProgress)
                     RemoteTransferLimits.requireUploadSize(file.length())
                     val hash = file.inputStream().use { WebdavJournalProtocol.sha256(it) }
                     client.putObject(hash, file)
                     payload.addProperty("objectHash", hash)
+                    payload.addProperty("checksum", hash)
                     payload.addProperty("byteSize", file.length())
                     entry.addProperty("hash", hash)
                 }
@@ -476,6 +520,7 @@ class WebdavSyncClient(
             if (item.entityType == "asset") dao.getAsset(item.entityId)?.let { dao.putAssets(listOf(it.copy(dirty = false))) }
         }
         if (entries.isEmpty()) return
+        onProgress("正在提交同步记录…")
         val pushed = appendJournal(client, deviceId, entries)
         for (item in published) {
             dao.deleteApiOutboxById(item.id)
