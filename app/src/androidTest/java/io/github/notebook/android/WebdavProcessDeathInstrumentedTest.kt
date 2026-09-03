@@ -3,6 +3,9 @@ package io.github.notebook.android
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.work.WorkManager
+import androidx.room.Room
+import io.github.notebook.android.data.NotebookDatabase
+import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.data.NoteEntity
 import io.github.notebook.android.sync.ApiSyncClient
 import io.github.notebook.android.sync.WebdavJournalProtocol
@@ -68,13 +71,16 @@ class WebdavProcessDeathInstrumentedTest {
         assertFalse(app.database.dao().get(id)!!.dirty)
         assertFalse(app.database.dao().apiOutbox(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID).any{it.entityId==id})
 
-        // Replay from a fresh device cursor to prove the durable change reached
-        // the remote journal rather than only being marked clean locally.
-        app.database.dao().deleteNotePermanently(id)
-        app.repository.rotateWebdavDeviceId()
-        app.repository.sync()
-        val restored=app.database.dao().get(id)
-        assertNotNull(restored)
-        assertTrue(restored!!.body.contains(marker))
+        // A second device needs a fresh version table as well as fresh cursors.
+        val freshDatabase=Room.inMemoryDatabaseBuilder(app,NotebookDatabase::class.java).build()
+        try {
+            val prefs=app.getSharedPreferences("process-death-fresh-${UUID.randomUUID()}",0)
+            val fresh=SyncRepository(app,freshDatabase.dao(),prefs)
+            fresh.saveWebdavSettings(settings())
+            fresh.sync()
+            val restored=freshDatabase.dao().get(id)
+            assertNotNull(restored)
+            assertTrue(restored!!.body.contains(marker))
+        } finally { freshDatabase.close() }
     }
 }

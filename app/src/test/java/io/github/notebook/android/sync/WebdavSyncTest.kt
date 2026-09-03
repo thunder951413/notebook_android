@@ -386,6 +386,29 @@ class WebdavSyncTest {
         assertFalse(AttachmentStorageContract.file(context, asset.relativePath).exists())
     }
 
+    @Test
+    fun `invalid directory XML fails before an empty repository can be seeded`() = runBlocking {
+        database.dao().put(note())
+        val invalidBodies = listOf(
+            "", "<html>not WebDAV</html>", "<d:multistatus xmlns:d=\"DAV:\"><d:response>",
+            """<!DOCTYPE multistatus [<!ENTITY external SYSTEM "file:///etc/passwd">]><multistatus xmlns="DAV:"><response><href>&external;</href></response></multistatus>""",
+        )
+        for (body in invalidBodies) {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest) =
+                    if (request.method == "MKCOL") MockResponse().setResponseCode(405)
+                    else MockResponse().setResponseCode(207).setBody(body)
+            }
+
+            val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+
+            assertTrue("invalid directory accepted: $body", failure is java.io.IOException)
+            assertEquals("无法解析 WebDAV 目录，请稍后重试", failure?.message)
+            assertTrue(database.dao().get(noteId)!!.dirty)
+            assertEquals(0, database.dao().apiOutboxCount(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID))
+        }
+    }
+
     private suspend fun missingAsset(bytes: ByteArray): AssetEntity {
         val id = UUID.randomUUID().toString()
         val asset = AssetEntity(

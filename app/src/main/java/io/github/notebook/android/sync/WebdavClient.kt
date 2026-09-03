@@ -13,9 +13,8 @@ import java.io.IOException
 import java.io.StringReader
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
-import javax.xml.parsers.DocumentBuilderFactory
-import javax.xml.XMLConstants
-import org.w3c.dom.Element
+import android.util.Xml
+import org.xmlpull.v1.XmlPullParser
 
 internal class WebdavObjectNotFoundException(hash: String) : IOException("远端对象 $hash 不存在")
 
@@ -226,21 +225,42 @@ class WebdavClient(
             .filter { WebdavJournalProtocol.validDeviceId(it) }
 
     private fun parseHrefs(text: String): List<String> {
-            if (text.isBlank()) return emptyList()
-            return runCatching {
-                val factory = DocumentBuilderFactory.newInstance().apply {
-                    isNamespaceAware = true
-                    setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
-                    setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-                    setFeature("http://xml.org/sax/features/external-general-entities", false)
-                    setFeature("http://xml.org/sax/features/external-parameter-entities", false)
-                    isXIncludeAware = false
-                    isExpandEntityReferences = false
+        try {
+            // Android's DOM factory does not support FEATURE_SECURE_PROCESSING.
+            // A swallowed configuration error used to make every directory look
+            // empty on a real phone, even though JVM tests passed.
+            val parser = Xml.newPullParser().apply {
+                setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+                setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false)
+                setInput(StringReader(text))
+            }
+            val hrefs = mutableListOf<String>()
+            var rootSeen = false
+            var rootClosed = false
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                when (event) {
+                    XmlPullParser.DOCDECL -> throw IOException("WebDAV 目录响应不允许包含 DTD")
+                    XmlPullParser.START_TAG -> {
+                        require(!rootClosed) { "WebDAV 目录响应包含多个根节点" }
+                        if (!rootSeen) {
+                            require(parser.name == "multistatus" && parser.namespace == "DAV:") { "不是 WebDAV 目录响应" }
+                            rootSeen = true
+                        } else if (parser.name == "href" && parser.namespace == "DAV:") {
+                            parser.nextText().trim().takeIf(String::isNotBlank)?.let(hrefs::add)
+                        }
+                    }
+                    XmlPullParser.END_TAG -> if (parser.depth == 1) rootClosed = true
                 }
-                val document = factory.newDocumentBuilder().parse(org.xml.sax.InputSource(StringReader(text)))
-                val hrefs = document.getElementsByTagNameNS("*", "href")
-                (0 until hrefs.length).map { (hrefs.item(it) as Element).textContent.trim() }.filter(String::isNotBlank)
-            }.getOrDefault(emptyList())
+                event = parser.nextToken()
+            }
+            require(rootSeen && rootClosed) { "WebDAV 目录响应为空或不完整" }
+            return hrefs
+        } catch (error: Exception) {
+            // A broken response is not evidence of an empty repository. Fail
+            // before seeding or advancing cursors, without exposing the body.
+            throw IOException("无法解析 WebDAV 目录，请稍后重试", error)
+        }
     }
 }
 

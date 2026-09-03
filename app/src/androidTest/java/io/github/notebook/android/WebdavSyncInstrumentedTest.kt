@@ -114,16 +114,16 @@ class WebdavSyncInstrumentedTest {
         assertFalse(stored.dirty)
         assertEquals(stored.version,stored.lastSyncedVersion)
 
-        // Remove the local row, then prove a fresh device joining the same
-        // journal replays every entry and restores the note. (v4 keeps
-        // per-device read cursors, so this device's own push would otherwise
-        // already be consumed.)
-        app.database.dao().deleteNotePermanently(id)
-        repo.rotateWebdavDeviceId()
-        repo.sync()
-        val restored=app.database.dao().get(id)
-        assertEquals("WebDAV 端到端",restored?.title)
-        assertEquals("# 标题\n- [x] 完成",restored?.body)
+        // A fresh device has neither read cursors nor prior entity versions.
+        // Rotating only the id on the publishing database is not equivalent.
+        val fresh=FixtureContext(app)
+        try {
+            fresh.repository.saveWebdavSettings(settings)
+            fresh.repository.sync()
+            val restored=fresh.database.dao().get(id)
+            assertEquals("WebDAV 端到端",restored?.title)
+            assertEquals("# 标题\n- [x] 完成",restored?.body)
+        } finally { fresh.database.close() }
     }
 
     @Test fun unchangedSyncOnlyReadsSmallHeads()=runBlocking {
