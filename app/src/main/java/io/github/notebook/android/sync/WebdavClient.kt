@@ -17,6 +17,8 @@ import javax.xml.parsers.DocumentBuilderFactory
 import javax.xml.XMLConstants
 import org.w3c.dom.Element
 
+internal class WebdavObjectNotFoundException(hash: String) : IOException("远端对象 $hash 不存在")
+
 /**
  * WebDAV transport for the v4 append-only journal repository (e.g. 坚果云).
  *
@@ -174,7 +176,7 @@ class WebdavClient(
         val digest = java.security.MessageDigest.getInstance("SHA-256")
         var total = 0L
         request("GET", objectPath(hash)).use { response ->
-            if (response.code == 404) throw IOException("远端对象 $hash 不存在")
+            if (response.code == 404) throw WebdavObjectNotFoundException(hash)
             if (!response.isSuccessful) throw fail(response, "下载对象 $hash 失败")
             response.body?.let { body ->
                 body.contentLength().takeIf { it >= 0 }?.let { RemoteTransferLimits.requireDownloadSize(it) }
@@ -196,6 +198,7 @@ class WebdavClient(
         }
         val actual = digest.digest().joinToString("") { "%02x".format(it) }
         require(actual.equals(hash, ignoreCase = true)) { "对象 $hash 的 SHA-256 校验失败" }
+        knownObjects.add(hash)
     }
 
     /** PROPFIND Depth 1: basenames of the direct children of a collection. */

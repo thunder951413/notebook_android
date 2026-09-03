@@ -314,6 +314,91 @@ class WebdavSyncTest {
     }
 
     @Test
+    fun `queued asset with missing local bytes recovers the verified remote object`() = runBlocking {
+        val bytes = ByteArray(4096) { (it % 251).toByte() }
+        val asset = missingAsset(bytes)
+        webdav.putObject(asset.contentHash, bytes)
+        val progress = mutableListOf<String>()
+
+        client.sync(settings(), progress::add)
+
+        val restored = database.dao().getAsset(asset.id)!!
+        assertArrayEquals(bytes, File(restored.localPath!!).readBytes())
+        assertTrue(progress.any { it.contains("恢复附件") })
+        assertEquals(asset.caption, restored.caption)
+        assertEquals(asset.width, restored.width)
+        assertFalse(restored.dirty)
+        assertNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.objectPuts.isEmpty())
+        assertEquals(1, webdav.gets.count { it.endsWith(asset.contentHash) })
+        assertTrue(webdav.journalText(deviceId)!!.contains(asset.contentHash))
+    }
+
+    @Test
+    fun `stale absolute asset path is repaired from the app attachment directory`() = runBlocking {
+        val bytes = "existing local attachment".toByteArray()
+        val asset = missingAsset(bytes)
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val file = AttachmentStorageContract.file(context, asset.relativePath).apply {
+            parentFile?.mkdirs()
+            writeBytes(bytes)
+        }
+
+        client.sync(settings())
+
+        assertEquals(file.absolutePath, database.dao().getAsset(asset.id)!!.localPath)
+        assertArrayEquals(bytes, webdav.files.getValue("notebook_backup/objects/${asset.contentHash.take(2)}/${asset.contentHash}"))
+    }
+
+    @Test
+    fun `missing cloud and local attachment keeps edits queued until bytes are restored`() = runBlocking {
+        val bytes = "recover later".toByteArray()
+        val asset = missingAsset(bytes)
+
+        val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+
+        assertTrue(failure is MissingAttachmentException)
+        assertTrue(failure!!.message.orEmpty().contains(asset.filename))
+        assertTrue(database.dao().get(noteId)!!.dirty)
+        assertTrue(database.dao().getAsset(asset.id)!!.dirty)
+        assertNotNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.journalPuts.isEmpty())
+        webdav.putObject(asset.contentHash, bytes)
+
+        client.sync(settings())
+
+        assertFalse(database.dao().get(noteId)!!.dirty)
+        assertFalse(database.dao().getAsset(asset.id)!!.dirty)
+    }
+
+    @Test
+    fun `corrupt recovery object is rejected without publishing or clearing dirty state`() = runBlocking {
+        val asset = missingAsset("expected bytes".toByteArray())
+        webdav.putObject(asset.contentHash, "corrupt".toByteArray())
+
+        val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+
+        assertTrue(failure?.message.orEmpty().contains("SHA-256"))
+        assertTrue(database.dao().getAsset(asset.id)!!.dirty)
+        assertNotNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.journalPuts.isEmpty())
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        assertFalse(AttachmentStorageContract.file(context, asset.relativePath).exists())
+    }
+
+    private suspend fun missingAsset(bytes: ByteArray): AssetEntity {
+        val id = UUID.randomUUID().toString()
+        val asset = AssetEntity(
+            id, noteId, "image", "image.png", "image/png", "$noteId/$id-image.png",
+            "/missing/$id-image.png", WebdavJournalProtocol.sha256(bytes), bytes.size.toLong(), true,
+            width = 320, caption = "keep attachment metadata",
+        )
+        database.dao().put(note())
+        database.dao().putAssets(listOf(asset))
+        return asset
+    }
+
+    @Test
     fun `concurrent journal parent version records conflict without advancing cursor`() = runBlocking {
         database.dao().put(note().copy(dirty = false))
         database.dao().putApiVersion(io.github.notebook.android.data.ApiSyncVersionEntity(

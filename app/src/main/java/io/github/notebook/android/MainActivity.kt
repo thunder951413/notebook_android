@@ -214,7 +214,25 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             onNotificationConsumed()
         }
     }}
-    fun runSync(){if(syncing)return;scope.launch{syncing=true;changedKey=null;newKey=null;status="正在同步…";runCatching{repo.sync()}.onSuccess{status="同步完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;status="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;status="服务器主机密钥发生变化，需要你确认"};else->status="同步失败：${error.localizedMessage?:error.message?:"未知错误"}"}};syncing=false}}
+    fun runSync(){
+        if(syncing)return
+        syncing=true
+        scope.launch{
+            changedKey=null;newKey=null;status="正在同步…"
+            try{
+                repo.sync{status=it}
+                status="同步完成"
+            }catch(error:kotlinx.coroutines.CancellationException){
+                status="同步已取消";throw error
+            }catch(error:Exception){
+                when(error){
+                    is HostKeyConfirmationRequiredException->{newKey=error;status="首次连接需要确认服务器身份"}
+                    is HostKeyChangedException->{changedKey=error;status="服务器主机密钥发生变化，需要你确认"}
+                    else->status="同步失败：${error.localizedMessage?:error.message?:"未知错误"}"
+                }
+            }finally{syncing=false}
+        }
+    }
     newKey?.let{key->AlertDialog(onDismissRequest={newKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("确认服务器身份")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("首次连接不会自动信任服务器。请将下面的 SHA-256 指纹与桌面端或服务器管理员提供的值核对，确认一致后再继续。");Text(key.actual,style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(key.actual);newKey=null;runSync()}){Text("指纹一致，信任并继续")}},dismissButton={TextButton({newKey=null}){Text("取消")}})}
     changedKey?.let{change->AlertDialog(onDismissRequest={changedKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("服务器身份已变化")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("确认这是你的服务器后，可以信任新的主机指纹并继续同步。");Text("原指纹\n${change.expected}",style=MaterialTheme.typography.bodySmall);Text("新指纹\n${change.actual}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(change.actual);changedKey=null;runSync()}){Text("信任并继续")}},dismissButton={TextButton({changedKey=null}){Text("取消")}})}
 
@@ -316,7 +334,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 @Composable private fun SyncStatusCard(status:String?,syncing:Boolean,onRetry:()->Unit){
     val message=status?:return
     val failed=message.startsWith("同步失败")
-    Card(Modifier.fillMaxWidth().padding(start=12.dp,end=12.dp,bottom=4.dp).testTag("sync-status"),colors=CardDefaults.cardColors(containerColor=when{failed->MaterialTheme.colorScheme.errorContainer;syncing->MaterialTheme.colorScheme.secondaryContainer;else->MaterialTheme.colorScheme.primaryContainer})){Row(Modifier.padding(horizontal=12.dp,vertical=8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)){if(syncing)CircularProgressIndicator(Modifier.size(18.dp),strokeWidth=2.dp)else Icon(if(failed)Icons.Default.ErrorOutline else Icons.Default.CheckCircle,if(failed)"同步失败" else "同步状态",tint=if(failed)MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary);Text(message,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall,maxLines=2);if(failed)TextButton(onRetry,modifier=Modifier.minimumInteractiveComponentSize()){Text("重试")}}}
+    Card(Modifier.fillMaxWidth().padding(start=12.dp,end=12.dp,bottom=4.dp).testTag("sync-status"),colors=CardDefaults.cardColors(containerColor=when{failed->MaterialTheme.colorScheme.errorContainer;syncing->MaterialTheme.colorScheme.secondaryContainer;else->MaterialTheme.colorScheme.primaryContainer})){Row(Modifier.padding(horizontal=12.dp,vertical=8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)){if(syncing)CircularProgressIndicator(Modifier.size(18.dp),strokeWidth=2.dp)else Icon(if(failed)Icons.Default.ErrorOutline else Icons.Default.CheckCircle,if(failed)"同步失败" else "同步状态",tint=if(failed)MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary);Text(message,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall);if(failed)TextButton(onRetry,modifier=Modifier.minimumInteractiveComponentSize()){Text("重试")}}}
 }
 
 internal data class VisibleNoteTreeRow(val note:NoteSummary,val depth:Int,val hasChildren:Boolean)
@@ -781,7 +799,23 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
     var w by remember{mutableStateOf(repo.webdavSettings())}
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
     var showLegacySync by remember{mutableStateOf(backend==SyncBackend.SSH||backend==SyncBackend.API)}
-    suspend fun syncNow(){syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null;runCatching{repo.sync()}.onSuccess{message="连接成功，同步已完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"};else->message="连接或同步失败：${error.localizedMessage?:error.javaClass.simpleName}"};isError=true};syncing=false}
+    suspend fun syncNow(){
+        if(syncing)return
+        syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null
+        try{
+            repo.sync{message=it}
+            message="连接成功，同步已完成"
+        }catch(error:kotlinx.coroutines.CancellationException){
+            message="同步已取消";throw error
+        }catch(error:Exception){
+            when(error){
+                is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"}
+                is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"}
+                else->message="连接或同步失败：${error.localizedMessage?:error.javaClass.simpleName}"
+            }
+            isError=true
+        }finally{syncing=false}
+    }
     fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
     val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{
         val type=runCatching{com.google.gson.JsonParser.parseString(payload).asJsonObject.get("type")?.asString}.getOrNull()
