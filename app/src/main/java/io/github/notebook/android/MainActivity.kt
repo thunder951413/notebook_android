@@ -72,6 +72,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
 import java.text.DateFormat
 import java.util.*
@@ -89,6 +90,7 @@ import io.noties.markwon.ext.tables.TablePlugin
 import io.github.notebook.android.update.AppUpdateViewModel
 import io.github.notebook.android.update.DownloadProgress
 import io.github.notebook.android.update.UpdatePhase
+import io.github.notebook.android.diagnostics.DiagnosticLogger
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository:SyncRepository
@@ -478,6 +480,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
 @OptIn(ExperimentalMaterial3Api::class,ExperimentalLayoutApi::class)
 @Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,showBack:Boolean=false,initiallyEditing:Boolean=false,encryptedUnlocked:Boolean=false,onOpenNote:(String)->Unit={},onDone:(NoteEntity)->Unit){
     var n by remember(original.id,original.version){mutableStateOf(original)}
+    val latestDraft=remember(original.id,original.version){mutableStateOf(original)}
     var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body))}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
     val allNotes by repo.notes.collectAsState(initial=emptyList())
@@ -495,6 +498,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 val next=bodyValue.text.substring(0,start)+syntax+bodyValue.text.substring(end)
                 bodyValue=TextFieldValue(next,TextRange(start+syntax.length))
                 val updated=n.copy(body=next)
+                latestDraft.value=updated
                 n=updated
                 repo.queueDraft(updated)
             }
@@ -507,31 +511,36 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     var referencePicker by remember(original.id){mutableStateOf(false)}
     var editMode by remember(original.id){mutableStateOf(initiallyEditing || original.viewMode == "text")}
     val initialEditableKey=remember(original.id,original.version){editableKey(original)}
-    var hasEdited by remember(original.id,original.version){mutableStateOf(false)}
-    val currentEditableKey=editableKey(n)
-    val latestNote by rememberUpdatedState(n)
     LaunchedEffect(saveState){if(saveState==NoteSaveState.Saved){showSavedCheck=true;delay(200);showSavedCheck=false;repo.acknowledgeSaved(n.id)}else showSavedCheck=false}
-    fun updateNote(next:NoteEntity){n=next;repo.queueDraft(next)}
-    LaunchedEffect(currentEditableKey){
-        if(currentEditableKey!=initialEditableKey)hasEdited=true
-        if(hasEdited)repo.queueDraft(n)
-    }
+    fun updateNote(next:NoteEntity){latestDraft.value=next;n=next;repo.queueDraft(next)}
     DisposableEffect(lifecycleOwner,original.id,original.version){
         val observer=LifecycleEventObserver{_,event->
-            if(event==Lifecycle.Event.ON_STOP&&editableKey(latestNote)!=initialEditableKey)repo.flushDraft(latestNote)
+            val latest=latestDraft.value
+            if(event==Lifecycle.Event.ON_STOP&&editableKey(latest)!=initialEditableKey)repo.flushDraft(latest)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose{
             lifecycleOwner.lifecycle.removeObserver(observer)
-            if(editableKey(latestNote)!=initialEditableKey)repo.flushDraft(latestNote)
+            val latest=latestDraft.value
+            if(editableKey(latest)!=initialEditableKey)repo.flushDraft(latest)
         }
     }
-    BackHandler{scope.launch{repo.flushDraft(n).join();onDone(n)}}
+    var leaving by remember(original.id){mutableStateOf(false)}
+    fun flushLatestAndFinish(){
+        if(leaving)return
+        leaving=true
+        scope.launch{
+            val latest=latestDraft.value
+            repo.flushDraft(latest).join()
+            onDone(latest)
+        }
+    }
+    BackHandler(onBack=::flushLatestAndFinish)
     Column(Modifier.fillMaxSize().padding(horizontal=20.dp,vertical=12.dp)){
         saveError?.let{Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Row(Modifier.padding(10.dp)){Text(it,Modifier.weight(1f));TextButton({repo.clearSaveError()}){Text("知道了")}}};Spacer(Modifier.height(6.dp))}
         if(n.conflict){Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改",fontWeight=FontWeight.SemiBold);Row{TextButton({scope.launch{repo.keepLocal(n.id)}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id)}}){Text("采用服务器版本")}}}};Spacer(Modifier.height(8.dp))}
         if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
-        Row{if(showBack)IconButton({scope.launch{repo.flushDraft(n).join();onDone(n)}}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(n)};IconButton({scope.launch{historyRevisions=repo.revisions(n.id);historyDialog=true}}){Icon(Icons.Default.History,"版本历史")};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
+        Row{if(showBack)IconButton(::flushLatestAndFinish,enabled=!leaving){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(latestDraft.value)};IconButton({scope.launch{historyRevisions=repo.revisions(n.id);historyDialog=true}}){Icon(Icons.Default.History,"版本历史")};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(latestDraft.value);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
         if(!editMode){
             ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
         }else{
@@ -566,6 +575,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         onRestore={revision->
             scope.launch{
                 runCatching{repo.restoreRevision(n.id,revision.id)}.onSuccess{restored->
+                    latestDraft.value=restored
                     n=restored
                     bodyValue=TextFieldValue(restored.body)
                     editMode=false
@@ -777,10 +787,12 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit){
+    val context=LocalContext.current
     var backend by remember{mutableStateOf(repo.syncBackend())}
     var w by remember{mutableStateOf(repo.webdavSettings())}
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
     var showLegacySync by remember{mutableStateOf(backend==SyncBackend.SSH||backend==SyncBackend.API)}
+    var diagnosticMessage by remember{mutableStateOf<String?>(null)}
     suspend fun syncNow(){syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null;runCatching{repo.sync()}.onSuccess{message="连接成功，同步已完成"}.onFailure{error->when(error){is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"};is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"};else->message="连接或同步失败：${error.localizedMessage?:error.javaClass.simpleName}"};isError=true};syncing=false}
     fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
     val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{
@@ -852,6 +864,21 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                     }
                 }
             }
+            HorizontalDivider()
+            Text("诊断日志",fontWeight=FontWeight.SemiBold)
+            Text("导出最近约 2 MiB 的结构化运行日志。日志不含笔记标题、正文、密码、令牌、原始网址或服务器响应。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick={scope.launch{
+                runCatching{
+                        val file=withContext(Dispatchers.IO){DiagnosticLogger.exportArchive(context)}
+                        val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file)
+                        val share=Intent(Intent.ACTION_SEND).setType("application/zip").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        context.startActivity(Intent.createChooser(share,"分享 Notebook 诊断日志"))
+                    }.onSuccess{diagnosticMessage=null}.onFailure{error->
+                        if(error is CancellationException)throw error
+                        diagnosticMessage="诊断日志导出失败"
+                    }
+            }},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Share,null);Spacer(Modifier.width(8.dp));Text("导出并分享诊断日志")}
+            diagnosticMessage?.let{Text(it,color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)}
         }
     }
 }

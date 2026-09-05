@@ -2,7 +2,7 @@
 
 项目迁移、架构约束、自动保存/提醒说明、完整使用场景审计和 AI 接手步骤见 [`AI_HANDOFF.md`](AI_HANDOFF.md)。后续开发应先阅读该文档。
 
-这是 Notebook 的 Android 移动端子项目。应用离线优先，本地使用 Room 保存数据。**坚果云 WebDAV 是唯一推荐的正式同步方式**；SSH/SFTP Markdown v3 和 Notebook Next HTTP API 仅为已有部署的数据迁移兼容，不用于新的长期同步配置。
+这是 Notebook 的独立 Android 项目。当前开发与验收以 `next` 分支为准；默认 `main` 可能仍是旧实现，比较行为或发布前请先核对分支与提交。应用离线优先，本地使用 Room 保存数据。**坚果云 WebDAV 是唯一推荐的正式同步方式**；SSH/SFTP Markdown v3 和 Notebook Next HTTP API 仅为已有部署的数据迁移兼容，不用于新的长期同步配置。
 
 旧 SSH/SFTP Markdown v3 仓库的交换文件包括：
 
@@ -42,7 +42,7 @@
 
 已在本机真实执行并通过 `assembleDebug`，调试 APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
 
-迁出时直接移动整个 `android-app` 目录即可，它不依赖上级 Xcode 项目。
+仓库可独立克隆、构建和测试，不依赖桌面端 Notebook 或 Xcode 工程。
 
 ## 同步设置
 
@@ -69,7 +69,7 @@ Pad 宽度达到 840dp 后使用“常驻侧栏 + 摘要列表 + 编辑器”三
 ./gradlew connectedDebugAndroidTest
 ```
 
-当前测试覆盖协议日期、索引墓碑合并、OpenSSH 指纹、块文档与富文本往返、Room 持久化/级联删除/并发同步确认、Notebook Next HTTP 契约，以及设备环境下的新建、编辑和保存主流程。
+当前测试覆盖协议日期、索引墓碑合并、OpenSSH 指纹、块文档与富文本往返、Room 持久化/级联删除/并发同步确认、Notebook Next HTTP 契约，以及设备环境下的新建、编辑、保存和 WebDAV XML 安全解析。仅 JVM 测试不能覆盖 Android 平台 XML、生命周期和进程行为；这些变化必须补跑对应的 connected tests。
 
 Notebook Next 真机往返测试要求本机 8787 端口运行隔离服务并执行 `adb reverse tcp:8787 tcp:8787`，随后运行：
 
@@ -126,3 +126,7 @@ git push origin android-v0.3.0
 - 发布前应在隔离的坚果云 WebDAV 目录完成桌面 → Android → 桌面的附件、冲突、取消/重试和私密笔记本地保留演练，并配置正式签名。若仍需兼容旧 SSH 仓库，另行执行一次迁移回归，但不把它作为正式同步验收。
 
 建议先用一个测试用远程目录联调，确认 macOS 往返不会改变原始笔记后，再连接正式数据目录。
+
+## 问题诊断
+
+日志默认只保存在手机本地，自动轮转，合计最多约 2 MiB。设置与同步中可导出并分享；Debug 包可通过 adb 提取。具体字段、容量与命令见 [DIAGNOSTICS.md](DIAGNOSTICS.md)。

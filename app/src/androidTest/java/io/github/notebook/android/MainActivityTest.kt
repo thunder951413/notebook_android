@@ -3,6 +3,7 @@ package io.github.notebook.android
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import org.junit.Rule
+import org.junit.Before
 import org.junit.Test
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
@@ -11,11 +12,23 @@ import androidx.lifecycle.Lifecycle
 import io.github.notebook.android.data.FolderEntity
 import io.github.notebook.android.data.NoteEntity
 import io.github.notebook.android.data.PageLinkEntity
+import io.github.notebook.android.sync.WebdavSettings
+import androidx.work.WorkManager
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 
 class MainActivityTest {
     @get:Rule val rule=createAndroidComposeRule<MainActivity>()
+
+    @Before fun isolateAppState(){
+        val app=rule.activity.application as NotebookApp
+        WorkManager.getInstance(app).cancelAllWork().result.get()
+        runBlocking{
+            app.repository.flushAll()
+            app.database.clearAllTables()
+        }
+        app.repository.saveWebdavSettings(WebdavSettings("https://example.invalid/dav/","","","notebook_test"))
+    }
 
     @Test fun createEditAndSaveNote(){
         rule.onNodeWithTag("new-item").performClick()
@@ -75,6 +88,7 @@ class MainActivityTest {
         val selectedName="已选目录-$suffix";val targetName="下方目录-$suffix";val targetNote="下方目录笔记-$suffix"
         val app=rule.activity.application as NotebookApp
         runBlocking{
+            repeat(7){index->app.database.dao().putFolder(FolderEntity("target-filler-$suffix-$index","占位文件夹 $index",index))}
             app.database.dao().putFolder(FolderEntity(selectedId,selectedName,10_000,"noteFolder"))
             app.database.dao().putFolder(FolderEntity(targetId,targetName,10_001,"noteFolder"))
             app.database.dao().put(NoteEntity("target-note-$suffix",title=targetNote,folderId=targetId,folderName=targetName))

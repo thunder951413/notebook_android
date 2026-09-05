@@ -8,14 +8,17 @@ import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import android.util.Xml
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.StringReader
+import java.net.URI
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
-import javax.xml.parsers.DocumentBuilderFactory
-import javax.xml.XMLConstants
-import org.w3c.dom.Element
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserException
 
 /**
  * WebDAV transport for the v4 append-only journal repository (e.g. 坚果云).
@@ -59,6 +62,7 @@ class WebdavClient(
     companion object {
         /** Idempotent WebDAV verbs make retrying a dropped connection safe. */
         private const val REQUEST_ATTEMPTS = 3
+        private const val MAX_PROPFIND_BYTES = 2 * 1024 * 1024
     }
 
     init {
@@ -203,8 +207,8 @@ class WebdavClient(
         request("PROPFIND", path, propfindBody, depth = "1").use { response ->
             if (response.code == 404) return emptyList()
             if (!response.isSuccessful) throw fail(response, "读取远端目录 $path 失败")
-            val text = response.body?.string().orEmpty()
-            return parseHrefs(text).map { it.substringAfterLast('/').trimEnd('/') }.filter(String::isNotBlank)
+            return parseWebdavHrefs(response.readPropfindBody("读取远端目录 $path 失败"))
+                .mapNotNull(::webdavHrefBasename)
         }
     }
 
@@ -213,7 +217,7 @@ class WebdavClient(
         request("PROPFIND", path, propfindBody, depth = "0").use { response ->
             if (response.code == 404) return false
             if (!response.isSuccessful) throw fail(response, "检查远端目录 $path 失败")
-            return parseHrefs(response.body?.string().orEmpty()).isNotEmpty()
+            return parseWebdavHrefs(response.readPropfindBody("检查远端目录 $path 失败")).isNotEmpty()
         }
     }
 
@@ -222,23 +226,108 @@ class WebdavClient(
         listNames("$root/journal").filter { it.endsWith(".jsonl") }.map { it.removeSuffix(".jsonl") }
             .filter { WebdavJournalProtocol.validDeviceId(it) }
 
-    private fun parseHrefs(text: String): List<String> {
-            if (text.isBlank()) return emptyList()
-            return runCatching {
-                val factory = DocumentBuilderFactory.newInstance().apply {
-                    isNamespaceAware = true
-                    setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
-                    setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-                    setFeature("http://xml.org/sax/features/external-general-entities", false)
-                    setFeature("http://xml.org/sax/features/external-parameter-entities", false)
-                    isXIncludeAware = false
-                    isExpandEntityReferences = false
-                }
-                val document = factory.newDocumentBuilder().parse(org.xml.sax.InputSource(StringReader(text)))
-                val hrefs = document.getElementsByTagNameNS("*", "href")
-                (0 until hrefs.length).map { (hrefs.item(it) as Element).textContent.trim() }.filter(String::isNotBlank)
-            }.getOrDefault(emptyList())
+    private fun Response.readPropfindBody(context: String): String {
+        val responseBody = body ?: throw IOException("$context：响应为空")
+        val declaredLength = responseBody.contentLength()
+        if (declaredLength > MAX_PROPFIND_BYTES) throw IOException("$context：目录响应超过上限")
+        val output = ByteArrayOutputStream(
+            declaredLength.takeIf { it in 1..MAX_PROPFIND_BYTES.toLong() }?.toInt() ?: 8 * 1024,
+        )
+        responseBody.byteStream().use { input ->
+            val buffer = ByteArray(8 * 1024)
+            var total = 0
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > MAX_PROPFIND_BYTES) throw IOException("$context：目录响应超过上限")
+                output.write(buffer, 0, count)
+            }
+        }
+        val charset = responseBody.contentType()?.charset(StandardCharsets.UTF_8) ?: StandardCharsets.UTF_8
+        return output.toByteArray().toString(charset)
     }
+}
+
+private const val MAX_PROPFIND_CHARACTERS = 2 * 1024 * 1024
+private const val MAX_PROPFIND_HREFS = 10_000
+private const val MAX_PROPFIND_HREF_CHARACTERS = 16 * 1024
+private const val MAX_PROPFIND_DEPTH = 128
+private val FORBIDDEN_XML_DECLARATION = Regex("<!\\s*(?:DOCTYPE|ENTITY)\\b", RegexOption.IGNORE_CASE)
+
+/** Android's pull parser has no external resolver. Declarations are rejected before parsing. */
+internal fun parseWebdavHrefs(text: String): List<String> {
+    if (text.isBlank()) throw IOException("WebDAV 返回的目录 XML 为空")
+    if (text.length > MAX_PROPFIND_CHARACTERS) throw IOException("WebDAV 返回的目录 XML 超过上限")
+    if (FORBIDDEN_XML_DECLARATION.containsMatchIn(text)) {
+        throw IOException("WebDAV 返回的目录 XML 包含不允许的 DOCTYPE 或实体声明")
+    }
+    try {
+        val parser = Xml.newPullParser().apply {
+            setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+            setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false)
+            setInput(StringReader(text))
+        }
+        val hrefs = mutableListOf<String>()
+        var hrefDepth = -1
+        var href = StringBuilder()
+        var openElements = 0
+        var rootSeen = false
+        var event = parser.eventType
+        while (event != XmlPullParser.END_DOCUMENT) {
+            when (event) {
+                XmlPullParser.START_TAG -> {
+                    openElements++
+                    if (parser.depth > MAX_PROPFIND_DEPTH) throw IOException("WebDAV 返回的目录 XML 嵌套过深")
+                    if (parser.depth == 1) {
+                        if (rootSeen || parser.name != "multistatus" ||
+                            !(parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
+                            throw IOException("WebDAV 返回的目录 XML 根元素不是 DAV multistatus")
+                        }
+                        rootSeen = true
+                    }
+                    if (parser.name == "href" && (parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
+                        hrefDepth = parser.depth
+                        href = StringBuilder()
+                    }
+                }
+                XmlPullParser.TEXT -> if (hrefDepth >= 0) {
+                    if (href.length + parser.text.length > MAX_PROPFIND_HREF_CHARACTERS) {
+                        throw IOException("WebDAV 返回的 href 超过上限")
+                    }
+                    href.append(parser.text)
+                }
+                XmlPullParser.END_TAG -> {
+                    if (hrefDepth == parser.depth && parser.name == "href") {
+                        href.toString().trim().takeIf(String::isNotBlank)?.let(hrefs::add)
+                        if (hrefs.size > MAX_PROPFIND_HREFS) throw IOException("WebDAV 返回的 href 数量超过上限")
+                        hrefDepth = -1
+                    }
+                    openElements--
+                }
+            }
+            event = parser.next()
+        }
+        if (!rootSeen || openElements != 0 || hrefDepth >= 0) throw IOException("WebDAV 返回的目录 XML 格式无效")
+        return hrefs
+    } catch (error: IOException) {
+        throw error
+    } catch (error: XmlPullParserException) {
+        throw IOException("WebDAV 返回的目录 XML 格式无效", error)
+    } catch (error: RuntimeException) {
+        throw IOException("WebDAV 返回的目录 XML 无法解析", error)
+    }
+}
+
+internal fun webdavHrefBasename(href: String): String? {
+    val trimmed = href.trim().trimEnd('/')
+    if (trimmed.isBlank()) return null
+    val rawPath = runCatching { URI(trimmed).rawPath }.getOrNull()
+        ?: trimmed.substringBefore('?').substringBefore('#')
+    val encodedName = rawPath.trimEnd('/').substringAfterLast('/').takeIf(String::isNotBlank) ?: return null
+    return runCatching {
+        URLDecoder.decode(encodedName.replace("+", "%2B"), StandardCharsets.UTF_8.name())
+    }.getOrDefault(encodedName)
 }
 
 /** Repository path relative to the WebDAV root; rejects traversal and absolute paths. */

@@ -11,6 +11,8 @@ import io.github.notebook.android.data.TodoStepEntity
 import io.github.notebook.android.sync.ApiSyncClient
 import io.github.notebook.android.sync.WebdavJournalProtocol
 import io.github.notebook.android.sync.WebdavSettings
+import io.github.notebook.android.sync.parseWebdavHrefs
+import io.github.notebook.android.sync.webdavHrefBasename
 import kotlinx.coroutines.runBlocking
 import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
@@ -83,6 +85,42 @@ class WebdavSyncInstrumentedTest {
         return FixtureSnapshot(requests,files)
     }
 
+    @Test fun androidRuntimeParsesNamespacedAndEscapedPropfindHrefs() {
+        val xml="""<?xml version="1.0" encoding="utf-8"?>
+            <d:multistatus xmlns:d="DAV:">
+              <d:response><d:href>/dav/notebook/journal/device%2D01.jsonl</d:href></d:response>
+              <response xmlns="DAV:"><href>/dav/notebook/folder&amp;notes/</href></response>
+            </d:multistatus>""".trimIndent()
+
+        val names=parseWebdavHrefs(xml).mapNotNull(::webdavHrefBasename)
+
+        assertEquals(listOf("device-01.jsonl","folder&notes"),names)
+    }
+
+    @Test fun androidRuntimeRejectsHostileAndMalformedPropfindXml() {
+        val hostile="""<?xml version="1.0"?><!DOCTYPE x [<!ENTITY secret SYSTEM "file:///proc/version">]><d:multistatus xmlns:d="DAV:"><d:href>&secret;</d:href></d:multistatus>"""
+        val malformed="""<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/a"""
+        val wrongRoot="""<html><href>/dav/notebook/journal/device.jsonl</href></html>"""
+        val wrongNamespace="""<multistatus xmlns="urn:not-dav"><href>/dav/notebook/journal/device.jsonl</href></multistatus>"""
+        val missingRoot="""<!-- a successful 207 still requires a WebDAV document -->"""
+        val overNested="""<d:multistatus xmlns:d="DAV:">${"<x>".repeat(128)}${"</x>".repeat(128)}</d:multistatus>"""
+
+        val hostileError=runCatching{parseWebdavHrefs(hostile)}.exceptionOrNull()
+        val malformedError=runCatching{parseWebdavHrefs(malformed)}.exceptionOrNull()
+        val wrongRootError=runCatching{parseWebdavHrefs(wrongRoot)}.exceptionOrNull()
+        val wrongNamespaceError=runCatching{parseWebdavHrefs(wrongNamespace)}.exceptionOrNull()
+        val missingRootError=runCatching{parseWebdavHrefs(missingRoot)}.exceptionOrNull()
+        val overNestedError=runCatching{parseWebdavHrefs(overNested)}.exceptionOrNull()
+
+        assertTrue(hostileError is java.io.IOException)
+        assertTrue(hostileError?.message.orEmpty().contains("DOCTYPE"))
+        assertTrue(malformedError is java.io.IOException)
+        assertTrue(wrongRootError is java.io.IOException)
+        assertTrue(wrongNamespaceError is java.io.IOException)
+        assertTrue(missingRootError is java.io.IOException)
+        assertTrue(overNestedError is java.io.IOException)
+    }
+
     @Test fun firstSyncPublishesLibraryAndRemoteRestoresIt()=runBlocking {
         val (settings,app)=fixtureArguments("_roundtrip")
         val repo=app.repository
@@ -103,7 +141,9 @@ class WebdavSyncInstrumentedTest {
         // journal replays every entry and restores the note. (v4 keeps
         // per-device read cursors, so this device's own push would otherwise
         // already be consumed.)
-        app.database.dao().deleteNotePermanently(id)
+        // A new device has neither rows nor per-entity version counters. Clearing
+        // both keeps this test faithful to that state before replaying journals.
+        app.database.clearAllTables()
         repo.rotateWebdavDeviceId()
         repo.sync()
         val restored=app.database.dao().get(id)

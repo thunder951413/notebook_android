@@ -13,6 +13,9 @@ import io.github.notebook.android.data.*
 import io.github.notebook.android.NotebookReference
 import io.github.notebook.android.NotebookReferenceSyntax
 import io.github.notebook.android.reminder.Reminders
+import io.github.notebook.android.diagnostics.DiagnosticEvent
+import io.github.notebook.android.diagnostics.DiagnosticLevel
+import io.github.notebook.android.diagnostics.DiagnosticLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
@@ -302,12 +305,12 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private fun encryptedNoteIds():Set<String> = runCatching{gson.fromJson(prefs.getString("encryptedNoteIds","[]"),Array<String>::class.java).toSet()}.getOrDefault(emptySet())
     private fun encryptedMappings():Map<String,String> = runCatching{gson.fromJson(prefs.getString("encryptedMappings","{}"),JsonObject::class.java).entrySet().associate{it.key to it.value.asString}}.getOrDefault(emptyMap())
     suspend fun save(n:NoteEntity):NoteEntity{setSaveState(n.id,NoteSaveState.Saving);return try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));persistDraft(n).also{setSaveState(n.id,NoteSaveState.Saved)}}catch(error:Throwable){setSaveState(n.id,NoteSaveState.Failed);throw error}}
-    fun queueDraft(n:NoteEntity){if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return;setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
-    fun flushDraft(n:NoteEntity):Job{if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return appScope.launch{};setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
+    fun queueDraft(n:NoteEntity){if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return;setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=DiagnosticLogger.operationId(),resourceId=n.id,error=error);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
+    fun flushDraft(n:NoteEntity):Job{if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return appScope.launch{};val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=operationId,resourceId=n.id,error=error,durationMs=System.currentTimeMillis()-startedAt);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
     fun flushAllAsync(){pendingDrafts.values.toList().forEach(::flushDraft)}
-    suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);throw error}}}
-    suspend fun recoverDrafts(){dao.draftNoteIds().forEach{id->readLargeText(dao.draftPayloadLength(id)){start,length->dao.draftPayloadChunk(id,start,length)}?.let{payload->runCatching{gson.fromJson(payload,NoteEntity::class.java)}.getOrNull()?.let{persistDraft(it)}}}}
-    fun recoverDraftsAsync(){appScope.launch{runCatching{recoverDrafts()}.onFailure{_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
+    suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=operationId,resourceId=draft.id,error=error,durationMs=System.currentTimeMillis()-startedAt);throw error}}}
+    suspend fun recoverDrafts():Int{var recovered=0;dao.draftNoteIds().forEach{id->val payload=readLargeText(dao.draftPayloadLength(id)){start,length->dao.draftPayloadChunk(id,start,length)}?:return@forEach;val draft=runCatching{gson.fromJson(payload,NoteEntity::class.java)}.onFailure{DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_RECOVERY_FAILURE,operationId=DiagnosticLogger.operationId(),resourceId=id,error=it)}.getOrNull()?:return@forEach;persistDraft(draft);recovered++};return recovered}
+    fun recoverDraftsAsync(){val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.DRAFT_RECOVERY_START,operationId=operationId);appScope.launch{runCatching{recoverDrafts()}.onSuccess{DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.DRAFT_RECOVERY_SUCCESS,operationId=operationId,durationMs=System.currentTimeMillis()-startedAt,counts=mapOf("recovered" to it.toLong()))}.onFailure{DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_RECOVERY_FAILURE,operationId=operationId,error=it,durationMs=System.currentTimeMillis()-startedAt);_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
     fun rebuildReferenceIndexAsync(){appScope.launch{runCatching{dao.allNoteIds().forEach{id->loadEditable(id)?.let{indexReferences(it)}}}.onFailure{_saveError.value="重建双链索引失败：${it.localizedMessage}"}}}
 
     suspend fun readingPosition(noteId:String)=withContext(Dispatchers.IO){dao.readingPosition(noteId)}
@@ -439,7 +442,26 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     fun clearPrivateKey(){saveSettings(settings().copy(privateKeyPath="",privateKeyPassphrase=""))}
 
-    suspend fun sync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
+    suspend fun sync(){
+        val operationId=DiagnosticLogger.operationId()
+        val startedAt=System.currentTimeMillis()
+        DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_START,operationId=operationId,counts=diagnosticSyncCounts())
+        try{
+            performSync()
+            DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_SUCCESS,operationId=operationId,durationMs=System.currentTimeMillis()-startedAt,counts=diagnosticSyncCounts())
+        }catch(error:Throwable){
+            if(error is CancellationException)throw error
+            DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.SYNC_FAILURE,operationId=operationId,error=error,durationMs=System.currentTimeMillis()-startedAt,counts=diagnosticSyncCounts())
+            throw error
+        }
+    }
+
+    private suspend fun diagnosticSyncCounts():Map<String,Long> = runCatching{
+        val workspace=if(syncBackend()==SyncBackend.SSH)null else syncWorkspaceId()
+        mapOf("outbox" to (workspace?.let{dao.apiOutboxCount(it)}?:0).toLong(),"dirtyNotes" to dao.dirtyNoteCount().toLong(),"dirtyAssets" to dao.dirtyAssetCount().toLong())
+    }.getOrDefault(emptyMap())
+
+    private suspend fun performSync():Unit=syncMutex.withLock{withContext(Dispatchers.IO){
         flushAll()
         queueDirtyReadingPositions()
         val backend=syncBackend()

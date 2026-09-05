@@ -70,7 +70,9 @@ class WebdavProcessDeathInstrumentedTest {
 
         // Replay from a fresh device cursor to prove the durable change reached
         // the remote journal rather than only being marked clean locally.
-        app.database.dao().deleteNotePermanently(id)
+        // Simulate the empty Room database and empty version table of a newly
+        // joined device while retaining the isolated WebDAV configuration.
+        app.database.clearAllTables()
         app.repository.rotateWebdavDeviceId()
         app.repository.sync()
         val restored=app.database.dao().get(id)
