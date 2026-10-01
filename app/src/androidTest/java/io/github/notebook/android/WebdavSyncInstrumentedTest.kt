@@ -17,6 +17,7 @@ import io.github.notebook.android.data.TodoStepEntity
 import io.github.notebook.android.sync.ApiSyncClient
 import io.github.notebook.android.sync.WebdavJournalProtocol
 import io.github.notebook.android.sync.WebdavSettings
+import io.github.notebook.android.sync.WebdavSyncClient
 import kotlinx.coroutines.runBlocking
 import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
@@ -96,6 +97,52 @@ class WebdavSyncInstrumentedTest {
         val requests=root["requests"].asJsonArray.map{raw->val item=raw.asJsonObject;FixtureRequest(item["method"].asString,item["path"].asString)}
         val files=root["files"].asJsonObject.entrySet().associate{it.key to Base64.decode(it.value.asString,Base64.DEFAULT)}
         return FixtureSnapshot(requests,files)
+    }
+
+    @Test fun firstSyncRestoresDependenciesBeforeTheirPageOnAndroidSqlite():Unit=runBlocking {
+        val (settings,app)=fixtureArguments("_dependencies_${UUID.randomUUID()}")
+        val uri=URI(settings.baseUrl)
+        assertTrue("Use an isolated loopback fixture",uri.host in setOf("127.0.0.1","localhost"))
+        val http=OkHttpClient()
+        fun remote(method:String,path:String,bytes:ByteArray=byteArrayOf()) {
+            val request=Request.Builder().url(settings.baseUrl.trimEnd('/')+"/"+settings.remotePath+"/"+path)
+                .header("Authorization",Credentials.basic(settings.username,settings.appPassword))
+                .method(method,bytes.toRequestBody("application/octet-stream".toMediaType())).build()
+            http.newCall(request).execute().use { assertTrue("fixture $method failed: ${it.code}",it.isSuccessful||it.code==405) }
+        }
+        val pageId=UUID.randomUUID().toString()
+        val childDevice="10000000-0000-4000-8000-000000000001"
+        val parentDevice="20000000-0000-4000-8000-000000000001"
+        val bytes="preserved child attachment".toByteArray()
+        val hash=WebdavJournalProtocol.sha256(bytes)
+        remote("MKCOL","");remote("MKCOL","journal");remote("MKCOL","objects");remote("MKCOL","objects/${hash.take(2)}")
+        remote("PUT","objects/${hash.take(2)}/$hash",bytes)
+        fun row(seq:Int,type:String,id:String,payload:String)=
+            """{"seq":$seq,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"$type","id":"$id","ver":0,"payload":$payload}"""
+        val children=listOf(
+            row(1,"reading_position",pageId,"""{"pageId":"$pageId","deviceId":"$childDevice","anchorUtf16Offset":17}"""),
+            row(2,"asset","early-asset","""{"pageId":"$pageId","filename":"early.txt","checksum":"$hash","byteSize":${bytes.size}}"""),
+            row(3,"task_step","early-step","""{"pageId":"$pageId","text":"Preserved step"}"""),
+        )
+        remote("PUT","journal/$childDevice.jsonl",(children.joinToString("\n")+"\n").toByteArray())
+        val parent=row(1,"page",pageId,"""{"id":"$pageId","title":"Parent received later","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:00:00Z"}""")
+        remote("PUT","journal/$parentDevice.jsonl",(parent+"\n").toByteArray())
+        val database=Room.inMemoryDatabaseBuilder(app,NotebookDatabase::class.java).build()
+        try {
+            val dao=database.dao()
+            val prefs=app.getSharedPreferences("dependency-test-${UUID.randomUUID()}",android.content.Context.MODE_PRIVATE)
+            val api=ApiSyncClient(app,dao,allowInsecureHttp=true)
+            val sync=WebdavSyncClient(app,dao,prefs,api,allowInsecureHttp=true)
+            sync.sync(settings)
+            assertEquals("Parent received later",dao.get(pageId)!!.title)
+            assertEquals(17,dao.readingPosition(pageId)!!.anchorUtf16Offset)
+            assertEquals("Preserved step",dao.getStep("early-step")!!.text)
+            val asset=dao.getAsset("early-asset")!!
+            assertArrayEquals(bytes,java.io.File(asset.localPath!!).readBytes())
+            sync.sync(settings)
+            assertEquals(1,dao.steps(pageId).size)
+            java.io.File(asset.localPath!!).delete()
+        } finally { database.close() }
     }
 
     @Test fun firstSyncPublishesLibraryAndRemoteRestoresIt()=runBlocking {

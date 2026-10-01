@@ -147,6 +147,186 @@ class WebdavSyncTest {
         folderId = null, folderName = "未分类", version = 0, dirty = true,
     )
 
+    private fun remoteEntry(seq:Long,type:String,id:String,payload:JsonObject,op:String="upsert",version:Long=0) = JsonObject().apply {
+        addProperty("seq",seq);addProperty("ts","2026-08-04T00:00:00Z");addProperty("op",op)
+        addProperty("type",type);addProperty("id",id);addProperty("ver",version);add("payload",payload)
+    }.toString()
+
+    private fun remotePage() = JsonObject().apply {
+        addProperty("id",noteId);addProperty("title","Restored page");addProperty("kind","document")
+        addProperty("createdAt","2026-08-04T00:00:00Z");addProperty("updatedAt","2026-08-04T00:00:00Z")
+    }
+
+    @Test fun `first sync restores dependents before a later page in the same journal`() = runBlocking {
+        val remoteDevice="30000000-0000-4000-8000-000000000021"
+        val bytes="restored attachment".toByteArray()
+        val hash=WebdavJournalProtocol.sha256(bytes)
+        webdav.putObject(hash,bytes)
+        webdav.putJournal(remoteDevice,listOf(
+            remoteEntry(1,"reading_position",noteId,JsonObject().apply {
+                addProperty("pageId",noteId);addProperty("deviceId",remoteDevice);addProperty("anchorUtf16Offset",7)
+            }),
+            remoteEntry(2,"asset","asset-early",JsonObject().apply {
+                addProperty("pageId",noteId);addProperty("filename","early.txt");addProperty("checksum",hash);addProperty("byteSize",bytes.size)
+            }),
+            remoteEntry(3,"task_step","step-early",JsonObject().apply {
+                addProperty("pageId",noteId);addProperty("text","Preserved step")
+            }),
+            remoteEntry(4,"page_tag","$noteId:tag-early",JsonObject().apply {
+                addProperty("pageId",noteId);addProperty("tagId","tag-early")
+            }),
+            remoteEntry(5,"page_link","link-early",JsonObject().apply {
+                addProperty("sourcePageId",noteId);addProperty("targetPageId","target-page");addProperty("kind","link")
+            }),
+            remoteEntry(6,"page",noteId,remotePage()),
+        ))
+
+        client.sync(settings())
+
+        assertEquals(7,database.dao().readingPosition(noteId)!!.anchorUtf16Offset)
+        assertArrayEquals(bytes,File(database.dao().getAsset("asset-early")!!.localPath!!).readBytes())
+        assertEquals("Preserved step",database.dao().getStep("step-early")!!.text)
+        assertEquals("tag-early",database.dao().get(noteId)!!.tagIds)
+        assertEquals("link-early",database.dao().pageLinks(noteId).single().id)
+        assertEquals(6L,JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject[remoteDevice].asLong)
+        client.sync(settings())
+        assertEquals(1,database.dao().steps(noteId).size)
+    }
+
+    @Test fun `first sync restores a dependent from a journal listed before its parent journal`() = runBlocking {
+        val childDevice="30000000-0000-4000-8000-000000000022"
+        val parentDevice="30000000-0000-4000-8000-000000000023"
+        webdav.putJournal(childDevice,listOf(remoteEntry(1,"reading_position",noteId,JsonObject().apply {
+            addProperty("pageId",noteId);addProperty("deviceId",childDevice);addProperty("anchorUtf16Offset",11)
+        })))
+        webdav.putJournal(parentDevice,listOf(remoteEntry(1,"page",noteId,remotePage())))
+
+        client.sync(settings())
+
+        assertEquals("Restored page",database.dao().get(noteId)!!.title)
+        assertEquals(11,database.dao().readingPosition(noteId)!!.anchorUtf16Offset)
+        val seqs=JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject
+        assertEquals(1L,seqs[childDevice].asLong);assertEquals(1L,seqs[parentDevice].asLong)
+    }
+
+    @Test fun `missing parent keeps the cursor before the dependent and recovers on retry`() = runBlocking {
+        val remoteDevice="30000000-0000-4000-8000-000000000024"
+        val child=remoteEntry(1,"task_step","waiting-step",JsonObject().apply {
+            addProperty("pageId",noteId);addProperty("text","Wait for parent")
+        })
+        webdav.putJournal(remoteDevice,listOf(child))
+
+        val error=runCatching { client.sync(settings()) }.exceptionOrNull()
+
+        assertTrue(error?.message.orEmpty().contains("对应笔记"))
+        assertNull(database.dao().getStep("waiting-step"))
+        val seqs=JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject
+        assertEquals(0L,seqs[remoteDevice]?.asLong?:0L)
+        webdav.putJournal(remoteDevice,listOf(child,remoteEntry(2,"page",noteId,remotePage())))
+        client.sync(settings())
+        assertEquals("Wait for parent",database.dao().getStep("waiting-step")!!.text)
+    }
+
+    @Test fun `stale dependents of a deleted page do not recreate the page or block later entries`() = runBlocking {
+        val remoteDevice="30000000-0000-4000-8000-000000000025"
+        webdav.putJournal(remoteDevice,listOf(
+            remoteEntry(1,"task_step","stale-step",JsonObject().apply {addProperty("pageId",noteId);addProperty("text","Stale")}),
+            remoteEntry(2,"page",noteId,JsonObject(),op="delete"),
+            remoteEntry(3,"tag","after-delete",JsonObject().apply {addProperty("id","after-delete");addProperty("name","Still syncs")}),
+        ))
+
+        client.sync(settings())
+
+        assertNull(database.dao().get(noteId));assertNull(database.dao().getStep("stale-step"))
+        assertNotNull(database.dao().getTag("after-delete"))
+        assertEquals(3L,JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject[remoteDevice].asLong)
+    }
+
+    @Test fun `document received before page metadata keeps its body when the page arrives`() = runBlocking {
+        val remoteDevice="30000000-0000-4000-8000-000000000026"
+        webdav.putJournal(remoteDevice,listOf(
+            remoteEntry(1,"document",noteId,JsonObject().apply {
+                addProperty("pageId",noteId);addProperty("schemaVersion",1)
+                add("tiptapJson",TipTapCodec.encode("Body received first"))
+                addProperty("updatedAt","2026-08-04T00:00:01Z")
+            }),
+            remoteEntry(2,"page",noteId,remotePage()),
+        ))
+
+        client.sync(settings())
+
+        assertEquals("Body received first",database.dao().get(noteId)!!.body)
+        assertFalse(database.dao().get(noteId)!!.dirty)
+    }
+
+    @Test fun `identical externalized document and page metadata replays do not create conflicts`() = runBlocking {
+        val firstDevice="30000000-0000-4000-8000-000000000027"
+        val replayDevice="30000000-0000-4000-8000-000000000028"
+        val document=TipTapCodec.encode("Body changes the reader preview")
+        val hash=WebdavJournalProtocol.sha256(document.toString().toByteArray())
+        val inline=JsonObject().apply {addProperty("pageId",noteId);add("tiptapJson",document)}
+        webdav.putJournal(firstDevice,listOf(remoteEntry(1,"document",noteId,inline),remoteEntry(2,"page",noteId,remotePage())))
+        client.sync(settings())
+        webdav.putObject(hash,document.toString().toByteArray())
+        val externalized=JsonObject().apply {
+            addProperty("pageId",noteId)
+            add("tiptapJson",JsonObject().apply {addProperty(WebdavJournalProtocol.OBJECT_MARKER,hash)})
+        }
+        webdav.putJournal(replayDevice,listOf(remoteEntry(1,"page",noteId,remotePage()),remoteEntry(2,"document",noteId,externalized)))
+
+        client.sync(settings())
+
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertEquals("Body changes the reader preview",database.dao().get(noteId)!!.body)
+        assertEquals(2L,JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject[replayDevice].asLong)
+    }
+
+    @Test fun `canonical Markdown wins over an empty projection and survives page hydration and publication`() = runBlocking {
+        val remoteDevice="30000000-0000-4000-8000-000000000029"
+        val markdown="# Exact Markdown\n\n| Name | Value |\n| --- | --- |\n| A | **B** |\n\n![](notebook-asset:asset-1)\n"
+        val payload=JsonObject().apply {
+            addProperty("pageId",noteId);addProperty("schemaVersion",3);addProperty("markdown",markdown)
+            add("tiptapJson",JsonObject().apply {addProperty("type","doc");add("content",com.google.gson.JsonArray())})
+        }
+        webdav.putJournal(remoteDevice,listOf(remoteEntry(1,"document",noteId,payload),remoteEntry(2,"page",noteId,remotePage())))
+        client.sync(settings())
+        val restored=database.dao().get(noteId)!!
+        assertEquals(markdown,restored.body)
+        assertEquals(markdown,TipTapCodec.decode(JsonParser.parseString(database.dao().apiDocument(noteId)!!.tiptapJson)))
+
+        api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,restored.copy(body=markdown+"Edited\n",dirty=true))
+
+        val queued=JsonParser.parseString(database.dao().apiOutboxItem("document",noteId)!!.payloadJson).asJsonObject
+        assertEquals(3,queued["schemaVersion"].asInt)
+        assertEquals(markdown+"Edited\n",queued["markdown"].asString)
+    }
+
+    @Test fun `an unrelated conflict does not conceal a remote-only parent or advance its journal cursor`() = runBlocking {
+        val blockedDevice="30000000-0000-4000-8000-000000000030"
+        val childDevice="30000000-0000-4000-8000-000000000031"
+        val localId="locally-edited-page"
+        database.dao().put(note().copy(id=localId,title="Keep local edit",dirty=true))
+        webdav.putJournal(blockedDevice,listOf(
+            remoteEntry(1,"page",localId,JsonObject().apply {addProperty("id",localId);addProperty("title","Conflicting edit")}),
+            remoteEntry(2,"page",noteId,remotePage()),
+            remoteEntry(3,"tag","blocked-tag",JsonObject().apply {addProperty("id","blocked-tag");addProperty("name","Must stay blocked")}),
+        ))
+        webdav.putJournal(childDevice,listOf(remoteEntry(1,"reading_position",noteId,JsonObject().apply {
+            addProperty("pageId",noteId);addProperty("deviceId",childDevice);addProperty("anchorUtf16Offset",19)
+        })))
+
+        client.sync(settings())
+
+        assertEquals("Keep local edit",database.dao().get(localId)!!.title)
+        assertTrue(database.dao().get(localId)!!.conflict)
+        assertEquals("Restored page",database.dao().get(noteId)!!.title)
+        assertEquals(19,database.dao().readingPosition(noteId)!!.anchorUtf16Offset)
+        assertNull(database.dao().getTag("blocked-tag"))
+        val seqs=JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject
+        assertEquals(0L,seqs[blockedDevice]?.asLong?:0L)
+        assertEquals(1L,seqs[childDevice].asLong)
+    }
+
     @Test
     fun `first sync publishes the full local library as version-0 journal entries`() = runBlocking {
         database.dao().putFolder(FolderEntity("folder-1", "收集箱", 0, "noteFolder", System.currentTimeMillis()))

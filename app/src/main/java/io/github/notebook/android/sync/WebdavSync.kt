@@ -214,10 +214,25 @@ class WebdavSyncClient(
 
     // ---- Pull -----------------------------------------------------------------
 
+    private class JournalReplay(val deviceId:String,val entries:List<WebdavJournalEntry>) {
+        val applied=BooleanArray(entries.size)
+        var limit=entries.size
+    }
+
+    private fun requiredParentPage(entry:WebdavJournalEntry):String? {
+        if(entry.op!="upsert")return null
+        return when(entry.type) {
+            "asset","task_step","reading_position","page_tag" -> entry.payload.string("pageId")
+            "page_link" -> entry.payload.string("sourcePageId")
+            else -> null
+        }
+    }
+
     private suspend fun pull(settings: WebdavSettings, client: WebdavClient, budget: RemoteTransferLimits.Budget): List<String> {
         client.ensureDirectory("${settings.remotePath.trim()}/journal")
         val deviceIds = client.listJournalNames()
         val seqs = knownSeqs(settings)
+        val journals=mutableListOf<JournalReplay>()
         for (deviceId in deviceIds) {
             val known = seqs[deviceId] ?: 0L
             val head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
@@ -228,6 +243,8 @@ class WebdavSyncClient(
             }
             // No head is a legacy v4 journal; retain its full-read compatibility.
             val text = client.getText(client.journalPath(deviceId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES) ?: continue
+            val journalBytes=utf8Size(text).toLong()
+            budget.consume(journalBytes,journalBytes)
             val entries = WebdavJournalProtocol.parseJournal(text)
             if (head != null) {
                 val bytes = text.toByteArray(Charsets.UTF_8)
@@ -242,15 +259,85 @@ class WebdavSyncClient(
                     require((entries.maxOfOrNull { it.seq } ?: 0L) > head.lastSeq && committedPrefixMatches) { "远端日志索引校验失败" }
                 }
             }
-            var committed = known
-            for (entry in entries.asSequence().filter { it.seq <= (head?.lastSeq ?: Long.MAX_VALUE) }) {
-                if (entry.seq <= known) continue
-                if (!applyJournalEntry(client, entry, budget)) break
-                committed = max(committed, entry.seq)
+            journals.add(JournalReplay(deviceId,entries.filter { it.seq>known && it.seq<=(head?.lastSeq?:Long.MAX_VALUE) }))
+        }
+        // A compacted journal, or another device's journal, can contain a child
+        // before its page. Defer that child without losing its cursor position,
+        // then retry after all available parent records have been materialized.
+        // Keep changes to the same entity in order, including a later delete.
+        while(true) {
+            var progressed=false
+            for(journal in journals) {
+                val blockedEntities=mutableSetOf<Pair<String,String>>()
+                for(index in 0 until journal.limit) {
+                    if(journal.applied[index])continue
+                    val entry=journal.entries[index]
+                    val entity=entry.type to entry.id
+                    if(entity in blockedEntities)continue
+                    val parent=requiredParentPage(entry)
+                    if(parent!=null && dao.getNoteHeader(parent)==null) {
+                        blockedEntities.add(entity)
+                        continue
+                    }
+                    if(!applyJournalEntry(client,entry,budget)) {
+                        journal.limit=index
+                        break
+                    }
+                    journal.applied[index]=true
+                    progressed=true
+                }
             }
-            seqs[deviceId] = committed
+            if(progressed)continue
+            // An unrelated conflict must not make an existing remote-only
+            // parent look missing. Import only the absent page prerequisites
+            // from validated tails; their source cursor still stops before
+            // its unresolved conflict, and no existing local page is changed.
+            val missingParents=journals.flatMap { journal ->
+                (0 until journal.limit).mapNotNull { index ->
+                    if(journal.applied[index])null else requiredParentPage(journal.entries[index])
+                }
+            }.toSet()
+            for(journal in journals)for(index in journal.entries.indices) {
+                if(journal.applied[index])continue
+                val entry=journal.entries[index]
+                if(entry.type!="page" || entry.op!="upsert" || entry.id !in missingParents || dao.getNoteHeader(entry.id)!=null)continue
+                val knownPage=dao.apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",entry.id))
+                if(knownPage!=null && dao.apiPage(entry.id)==null)continue
+                if(applyJournalEntry(client,entry,budget)) {
+                    journal.applied[index]=true
+                    progressed=true
+                }
+            }
+            if(progressed)continue
+            // A confirmed remote page tombstone makes its remaining children
+            // obsolete. Consume those records without resurrecting the page.
+            for(journal in journals)for(index in 0 until journal.limit) {
+                if(journal.applied[index])continue
+                val entry=journal.entries[index]
+                val parent=requiredParentPage(entry)?:continue
+                val parentVersion=dao.apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",parent))
+                if(dao.getNoteHeader(parent)==null && dao.apiPage(parent)==null && parentVersion!=null) {
+                    val key=api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,entry.type,entry.id)
+                    dao.putApiVersion(ApiSyncVersionEntity(key,maxOf(dao.apiVersion(key)?.version?:0L,entry.ver+1)))
+                    journal.applied[index]=true
+                    progressed=true
+                }
+            }
+            if(!progressed)break
+        }
+        for(journal in journals) {
+            var committed=seqs[journal.deviceId]?:0L
+            for((index,entry) in journal.entries.withIndex()) {
+                if(!journal.applied[index])break
+                committed=max(committed,entry.seq)
+            }
+            seqs[journal.deviceId]=committed
         }
         saveKnownSeqs(settings, seqs)
+        val missing=journals.firstNotNullOfOrNull { journal ->
+            (0 until journal.limit).firstOrNull { !journal.applied[it] }?.let { journal.entries[it] }
+        }
+        check(missing==null) { "云端 ${missing!!.type} 记录（序号 ${missing.seq}）缺少对应笔记；已保留同步位置，待笔记恢复后重试" }
         return deviceIds
     }
 
@@ -275,6 +362,19 @@ class WebdavSyncClient(
             SyncEntityIdentityContract.requireChange(type, id, payload)
         } catch (error: IllegalArgumentException) {
             throw IllegalArgumentException("云端 $type 记录（序号 ${entry.seq}）：${error.message}", error)
+        }
+        // Compare the actual document, rather than an external-object marker,
+        // when a retained cursor causes an already applied record to replay.
+        if (type == "document" && operation == "upsert") {
+            val marker = payload["tiptapJson"]?.takeIf { it.isJsonObject }?.asJsonObject
+                ?.get(WebdavJournalProtocol.OBJECT_MARKER)?.takeIf { it.isJsonPrimitive }?.asString
+            if (marker != null) {
+                val hash = WebdavJournalProtocol.requireHash(marker)
+                val bytes = downloadObjectBytes(client, hash, budget)
+                require(WebdavJournalProtocol.sha256(bytes).equals(hash, ignoreCase = true)) { "远端对象 $hash 的 SHA-256 校验失败" }
+                payload = payload.deepCopy()
+                payload.add("tiptapJson", JsonParser.parseString(String(bytes, Charsets.UTF_8)))
+            }
         }
         val pending = dao.apiOutboxItem(type, id)
         val affectedPage = api.pageIdFor(type, id, payload)
@@ -303,18 +403,6 @@ class WebdavSyncClient(
         if (parentMismatch && localStateExists) {
             dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), maxOf(localVersion, version + 1)))
             return true
-        }
-        // Restore externalized document bodies fetched from objects/.
-        if (type == "document" && operation == "upsert") {
-            val marker = payload["tiptapJson"]?.takeIf { it.isJsonObject }?.asJsonObject
-                ?.get(WebdavJournalProtocol.OBJECT_MARKER)?.takeIf { it.isJsonPrimitive }?.asString
-            if (marker != null) {
-                val hash = WebdavJournalProtocol.requireHash(marker)
-                val bytes = downloadObjectBytes(client, hash, budget)
-                require(WebdavJournalProtocol.sha256(bytes).equals(hash, ignoreCase = true)) { "远端对象 $hash 的 SHA-256 校验失败" }
-                payload = payload.deepCopy()
-                payload.add("tiptapJson", JsonParser.parseString(String(bytes, Charsets.UTF_8)))
-            }
         }
         if (type == "asset" && operation == "upsert") {
             val hash = entry.hash ?: payload.optionalString("objectHash") ?: payload.optionalString("checksum")
@@ -358,10 +446,15 @@ class WebdavSyncClient(
 
     private suspend fun sameRemoteState(type:String,id:String,payload:JsonObject,hash:String?):Boolean {
         return when(type) {
-            "page" -> dao.get(id)?.let { it.title == payload.string("title") && it.previewText == payload.string("preview") } == true
+            "page" -> {
+                val accepted=dao.apiPage(id)?.let { JsonParser.parseString(it.payloadJson).asJsonObject }
+                if(accepted!=null)accepted.string("title")==payload.string("title") && accepted.string("preview")==payload.string("preview")
+                else dao.get(id)?.let { it.title == payload.string("title") && it.previewText == payload.string("preview") } == true
+            }
             "document" -> {
-                val tiptap = payload["tiptapJson"] ?: return false
-                dao.get(id)?.let { TipTapCodec.decode(tiptap) == it.body } == true
+                val tiptap = api.documentRepresentation(payload)
+                val accepted=dao.apiDocument(id)?.let { JsonParser.parseString(it.tiptapJson) }
+                accepted==tiptap || dao.get(id)?.let { TipTapCodec.decode(tiptap) == it.body } == true
             }
             "asset" -> dao.getAsset(id)?.let { asset ->
                 val remoteHash = hash ?: payload.optionalString("objectHash") ?: payload.optionalString("checksum")

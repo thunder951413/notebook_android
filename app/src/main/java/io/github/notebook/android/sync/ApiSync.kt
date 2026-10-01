@@ -220,9 +220,10 @@ class ApiSyncClient(
         dao.putApiPage(ApiPageEntity(note.id,gson.toJson(page),note.updatedAt))
         enqueue(workspaceId,"page",note.id,"upsert",page)
         val preserved=dao.apiDocument(note.id)?.tiptapJson?.let{runCatching{JsonParser.parseString(it)}.getOrNull()}
-        val document=preserved?.takeIf{TipTapCodec.decode(it)==note.body}?:TipTapCodec.encode(note.body)
-        dao.putApiDocument(ApiDocumentEntity(note.id,gson.toJson(document),1,note.updatedAt))
-        enqueue(workspaceId,"document",note.id,"upsert",JsonObject().apply{addProperty("pageId",note.id);addProperty("schemaVersion",1);add("tiptapJson",document);addProperty("updatedAt",iso(note.updatedAt))})
+        val document=(preserved?.takeIf{TipTapCodec.decode(it)==note.body}?:TipTapCodec.encode(note.body)).asJsonObject.deepCopy()
+        document.addProperty("markdown",note.body)
+        dao.putApiDocument(ApiDocumentEntity(note.id,gson.toJson(document),3,note.updatedAt))
+        enqueue(workspaceId,"document",note.id,"upsert",JsonObject().apply{addProperty("pageId",note.id);addProperty("schemaVersion",3);addProperty("markdown",note.body);add("tiptapJson",document);addProperty("updatedAt",iso(note.updatedAt))})
         val tagIds=note.tagIds.split(',').map(String::trim).filter(String::isNotBlank).toSet()
         tagIds.forEach{tagId->enqueue(workspaceId,"page_tag","${note.id}:$tagId","upsert",JsonObject().apply{addProperty("pageId",note.id);addProperty("tagId",tagId)})}
         dao.steps(note.id).forEach{step->enqueue(workspaceId,"task_step",step.id,"upsert",stepPayload(step))}
@@ -321,12 +322,25 @@ class ApiSyncClient(
 
     internal suspend fun applyPage(id:String,p:JsonObject,serverVersion:Long) {
         val local=dao.get(id);val folderId=p.optionalString("sectionId");val folderName=folderId?.let{dao.getFolder(it)?.name}?:"未分类"
-        val note=NoteEntity(id=id,title=p.string("title"),body=local?.body.orEmpty(),previewText=p.string("preview"),createdAt=p.millis("createdAt"),updatedAt=p.millis("updatedAt"),folderId=folderId,folderName=folderName,icon=p.optionalString("icon"),parentPageId=p.optionalString("parentPageId"),sortOrder=p["sortOrder"]?.asDouble?:local?.sortOrder?:0.0,treeUpdatedAt=p.optionalMillis("treeUpdatedAt")?:local?.treeUpdatedAt?:p.millis("createdAt"),reminderAt=p.optionalMillis("reminderAt"),recurrence=p.string("recurrenceRule","none"),version=p["legacyVersion"]?.asLong?:local?.version?:1,tagIds=local?.tagIds.orEmpty(),deletedAt=p.optionalMillis("deletedAt"),itemType=if(p.string("kind","document")=="task")"todo" else "note",dueAt=p.optionalMillis("dueAt"),completedAt=p.optionalMillis("completedAt"),important=p.boolean("important"),viewMode=local?.viewMode?:"preview",dirty=false,conflict=false,snapshotJson=local?.snapshotJson,conflictSnapshotJson=null,lastSyncedVersion=serverVersion)
+        // Document rows have no page foreign key and may arrive first. Hydrate
+        // the newly materialized note from that already persisted document.
+        val document=if(local==null)dao.apiDocument(id) else null
+        val body=local?.body?:document?.let { TipTapCodec.decode(JsonParser.parseString(it.tiptapJson)) }.orEmpty()
+        val note=NoteEntity(id=id,title=p.string("title"),body=body,previewText=p.string("preview").ifBlank { TipTapCodec.plainText(body).take(240) },createdAt=p.millis("createdAt"),updatedAt=maxOf(p.millis("updatedAt"),document?.updatedAt?:0L),folderId=folderId,folderName=folderName,icon=p.optionalString("icon"),parentPageId=p.optionalString("parentPageId"),sortOrder=p["sortOrder"]?.asDouble?:local?.sortOrder?:0.0,treeUpdatedAt=p.optionalMillis("treeUpdatedAt")?:local?.treeUpdatedAt?:p.millis("createdAt"),reminderAt=p.optionalMillis("reminderAt"),recurrence=p.string("recurrenceRule","none"),version=p["legacyVersion"]?.asLong?:local?.version?:1,tagIds=local?.tagIds.orEmpty(),deletedAt=p.optionalMillis("deletedAt"),itemType=if(p.string("kind","document")=="task")"todo" else "note",dueAt=p.optionalMillis("dueAt"),completedAt=p.optionalMillis("completedAt"),important=p.boolean("important"),viewMode=local?.viewMode?:"preview",dirty=false,conflict=false,snapshotJson=local?.snapshotJson,conflictSnapshotJson=null,lastSyncedVersion=serverVersion)
         dao.put(note);dao.putApiPage(ApiPageEntity(id,gson.toJson(p),note.updatedAt))
     }
 
+    internal fun documentRepresentation(p:JsonObject):JsonObject {
+        val json=p["tiptapJson"]?.takeIf { it.isJsonObject }?.asJsonObject?.deepCopy()
+            ?:JsonObject().apply{addProperty("type","doc");add("content",JsonArray())}
+        // Keep canonical Markdown verbatim in the existing durable document
+        // row; the older TipTap projection may be empty or stale in schema v3.
+        p.optionalString("markdown")?.let { json.addProperty("markdown",it) }
+        return json
+    }
+
     internal suspend fun applyDocument(id:String,p:JsonObject) {
-        val json=p["tiptapJson"]?:JsonObject().apply{addProperty("type","doc");add("content",JsonArray())}
+        val json=documentRepresentation(p)
         val updated=p.optionalMillis("updatedAt")?:System.currentTimeMillis();dao.putApiDocument(ApiDocumentEntity(id,gson.toJson(json),p.integer("schemaVersion",1),updated))
         dao.get(id)?.let{note->val markdown=TipTapCodec.decode(json);dao.put(note.copy(body=markdown,previewText=TipTapCodec.plainText(markdown).take(240),updatedAt=maxOf(note.updatedAt,updated),dirty=false))}
     }
@@ -404,7 +418,7 @@ object TipTapCodec {
         addProperty("type","doc")
         add("content",JsonArray().apply{children(parser.parse(markdown)).forEach{add(block(it))}})
     }
-    fun decode(root:JsonElement):String {val content=root.takeIf{it.isJsonObject}?.asJsonObject?.get("content")?.takeIf{it.isJsonArray}?.asJsonArray?:return "";return content.joinToString("\n"){render(it,0)}.trimEnd()}
+    fun decode(root:JsonElement):String {val objectRoot=root.takeIf{it.isJsonObject}?.asJsonObject;objectRoot?.get("markdown")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.let { return it.asString };val content=objectRoot?.get("content")?.takeIf{it.isJsonArray}?.asJsonArray?:return "";return content.joinToString("\n"){render(it,0)}.trimEnd()}
     private fun block(node:org.commonmark.node.Node):JsonObject=when(node){
         is org.commonmark.node.Heading->container("heading",node).apply{add("attrs",JsonObject().apply{addProperty("level",node.level)})}
         is org.commonmark.node.Paragraph->container("paragraph",node)
