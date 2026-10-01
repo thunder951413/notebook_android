@@ -170,7 +170,12 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
 @Dao interface NotebookDao {
     @Query("SELECT * FROM notes ORDER BY updatedAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
     @Query("SELECT id,title,previewText AS preview,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,dirty,conflict,lastSyncedVersion FROM notes ORDER BY updatedAt DESC") fun observeNoteSummaries():Flow<List<NoteSummary>>
-    @Query("SELECT * FROM notes WHERE id=:id") suspend fun get(id:String): NoteEntity?
+    @Transaction suspend fun get(id:String): NoteEntity? {
+        val header=getNoteHeader(id)?:return null
+        return header.copy(body=readStoredText(bodyLength(id)){start,length->bodyChunk(id,start,length)}.orEmpty(),
+            snapshotJson=readStoredText(snapshotLength(id)){start,length->snapshotChunk(id,start,length)},
+            conflictSnapshotJson=readStoredText(conflictSnapshotLength(id)){start,length->conflictSnapshotChunk(id,start,length)})
+    }
     @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE id=:id") suspend fun getNoteHeader(id:String):NoteEntity?
     @Query("SELECT length(body) FROM notes WHERE id=:id") suspend fun bodyLength(id:String):Int?
     @Query("SELECT substr(body,:start,:length) FROM notes WHERE id=:id") suspend fun bodyChunk(id:String,start:Int,length:Int):String?
@@ -181,8 +186,8 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("SELECT id FROM notes") suspend fun allNoteIds():List<String>
     @Query("SELECT id FROM notes WHERE dirty=1") suspend fun dirtyNoteIds():List<String>
     @Query("SELECT id FROM notes WHERE title LIKE '%' || :query || '%' OR body LIKE '%' || :query || '%'") suspend fun searchNoteIds(query:String):List<String>
-    @Query("SELECT * FROM notes") suspend fun allNotes(): List<NoteEntity>
-    @Query("SELECT * FROM notes WHERE dirty=1") suspend fun dirtyNotes(): List<NoteEntity>
+    @Transaction suspend fun allNotes(): List<NoteEntity> = allNoteIds().mapNotNull{get(it)}
+    @Transaction suspend fun dirtyNotes(): List<NoteEntity> = dirtyNoteIds().mapNotNull{get(it)}
     @Query("SELECT COUNT(*) FROM notes WHERE dirty=1") suspend fun dirtyNoteCount():Int
     @Query("SELECT id,title,'' AS body,previewText,createdAt,updatedAt,folderId,folderName,icon,parentPageId,sortOrder,treeUpdatedAt,reminderAt,recurrence,version,tagIds,deletedAt,itemType,dueAt,completedAt,important,viewMode,dirty,conflict,NULL AS snapshotJson,NULL AS conflictSnapshotJson,lastSyncedVersion FROM notes WHERE deletedAt IS NULL AND completedAt IS NULL AND reminderAt IS NOT NULL") suspend fun reminders():List<NoteEntity>
     @Upsert suspend fun put(note:NoteEntity)
@@ -242,7 +247,10 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Upsert suspend fun putPageLinks(items:List<PageLinkEntity>)
     @Transaction suspend fun replacePageLinks(noteId:String,items:List<PageLinkEntity>){deletePageLinks(noteId);if(items.isNotEmpty())putPageLinks(items)}
     @Query("SELECT id FROM notes WHERE deletedAt IS NULL") suspend fun nonDeletedNoteIds():List<String>
-    @Query("SELECT * FROM api_documents WHERE pageId=:pageId") suspend fun apiDocument(pageId:String):ApiDocumentEntity?
+    @Query("SELECT pageId,'' AS tiptapJson,schemaVersion,updatedAt FROM api_documents WHERE pageId=:pageId") suspend fun apiDocumentHeader(pageId:String):ApiDocumentEntity?
+    @Query("SELECT length(tiptapJson) FROM api_documents WHERE pageId=:pageId") suspend fun apiDocumentLength(pageId:String):Int?
+    @Query("SELECT substr(tiptapJson,:start,:length) FROM api_documents WHERE pageId=:pageId") suspend fun apiDocumentChunk(pageId:String,start:Int,length:Int):String?
+    @Transaction suspend fun apiDocument(pageId:String):ApiDocumentEntity?=apiDocumentHeader(pageId)?.let{it.copy(tiptapJson=readStoredText(apiDocumentLength(pageId)){start,length->apiDocumentChunk(pageId,start,length)}.orEmpty())}
     @Upsert suspend fun putApiDocument(document:ApiDocumentEntity)
     @Query("DELETE FROM api_documents WHERE pageId=:pageId") suspend fun deleteApiDocument(pageId:String)
     @Query("SELECT * FROM api_pages WHERE pageId=:pageId") suspend fun apiPage(pageId:String):ApiPageEntity?
@@ -252,13 +260,20 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("SELECT * FROM api_notebooks WHERE id=:id") suspend fun apiNotebook(id:String):ApiNotebookEntity?
     @Upsert suspend fun putApiNotebook(notebook:ApiNotebookEntity)
     @Query("DELETE FROM api_notebooks WHERE id=:id") suspend fun deleteApiNotebook(id:String)
-    @Query("SELECT * FROM api_sync_outbox WHERE workspaceId=:workspaceId ORDER BY createdAt LIMIT :limit") suspend fun apiOutbox(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity>
+    @Query("SELECT id,workspaceId,entityType,entityId,expectedVersion,operation,'' AS payloadJson,createdAt FROM api_sync_outbox WHERE workspaceId=:workspaceId ORDER BY createdAt LIMIT :limit") suspend fun apiOutboxHeaders(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity>
+    @Query("SELECT length(payloadJson) FROM api_sync_outbox WHERE id=:id") suspend fun apiOutboxLength(id:String):Int?
+    @Query("SELECT substr(payloadJson,:start,:length) FROM api_sync_outbox WHERE id=:id") suspend fun apiOutboxChunk(id:String,start:Int,length:Int):String?
+    @Transaction suspend fun apiOutbox(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity> = apiOutboxHeaders(workspaceId,limit).map{outbox->outbox.copy(payloadJson=readStoredText(apiOutboxLength(outbox.id)){start,length->apiOutboxChunk(outbox.id,start,length)}.orEmpty())}
     @Query("SELECT COUNT(*) FROM api_sync_outbox WHERE workspaceId=:workspaceId") suspend fun apiOutboxCount(workspaceId:String):Int
-    @Query("SELECT * FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId LIMIT 1") suspend fun apiOutboxItem(entityType:String,entityId:String):ApiSyncOutboxEntity?
+    @Query("SELECT id,workspaceId,entityType,entityId,expectedVersion,operation,'' AS payloadJson,createdAt FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId LIMIT 1") suspend fun apiOutboxHeader(entityType:String,entityId:String):ApiSyncOutboxEntity?
+    @Transaction suspend fun apiOutboxItem(entityType:String,entityId:String):ApiSyncOutboxEntity? = apiOutboxHeader(entityType,entityId)?.let{outbox->outbox.copy(payloadJson=readStoredText(apiOutboxLength(outbox.id)){start,length->apiOutboxChunk(outbox.id,start,length)}.orEmpty())}
     @Upsert suspend fun putApiOutbox(item:ApiSyncOutboxEntity)
     @Query("DELETE FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId") suspend fun deleteApiOutbox(entityType:String,entityId:String)
     @Query("DELETE FROM api_sync_outbox WHERE id=:id") suspend fun deleteApiOutboxById(id:String)
-    @Query("SELECT * FROM remote_revisions WHERE noteId=:noteId ORDER BY createdAt DESC") suspend fun remoteRevisions(noteId:String):List<RemoteRevisionEntity>
+    @Query("SELECT id,noteId,createdAt,reason,'' AS markdown,pageIcon FROM remote_revisions WHERE noteId=:noteId ORDER BY createdAt DESC") suspend fun remoteRevisionHeaders(noteId:String):List<RemoteRevisionEntity>
+    @Query("SELECT length(markdown) FROM remote_revisions WHERE id=:id") suspend fun remoteRevisionLength(id:String):Int?
+    @Query("SELECT substr(markdown,:start,:length) FROM remote_revisions WHERE id=:id") suspend fun remoteRevisionChunk(id:String,start:Int,length:Int):String?
+    @Transaction suspend fun remoteRevisions(noteId:String):List<RemoteRevisionEntity> = remoteRevisionHeaders(noteId).map{revision->revision.copy(markdown=readStoredText(remoteRevisionLength(revision.id)){start,length->remoteRevisionChunk(revision.id,start,length)}.orEmpty())}
     @Upsert suspend fun putRemoteRevision(revision:RemoteRevisionEntity)
     @Query("DELETE FROM remote_revisions WHERE id=:id") suspend fun deleteRemoteRevision(id:String)
     @Query("DELETE FROM remote_revisions WHERE noteId=:noteId") suspend fun deleteRemoteRevisionsForNote(noteId:String)
@@ -339,4 +354,17 @@ abstract class NotebookDatabase:RoomDatabase(){ abstract fun dao():NotebookDao
         }}
         fun create(c:Context)=Room.databaseBuilder(c,NotebookDatabase::class.java,"notebook.db").addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4,MIGRATION_4_5,MIGRATION_5_6,MIGRATION_6_7,MIGRATION_7_8,MIGRATION_8_9,MIGRATION_9_10,MIGRATION_10_11,MIGRATION_11_12,MIGRATION_12_13).build()
     }
+}
+
+/** SQLite substr offsets count Unicode scalars, not UTF-16 code units. */
+private suspend fun readStoredText(length:Int?,read:suspend (Int,Int)->String?):String? {
+    if(length==null)return null
+    val text=StringBuilder()
+    var start=1
+    while(start<=length) {
+        val count=minOf(65_536,length-start+1)
+        text.append(read(start,count)?:error("大文本记录读取失败"))
+        start+=count
+    }
+    return text.toString()
 }

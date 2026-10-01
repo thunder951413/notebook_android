@@ -168,6 +168,20 @@ class WebdavSyncTest {
         assertEquals(5L,database.dao().apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",noteId))!!.version)
     }
 
+    @Test fun `large Unicode bodies documents history and outbox load without a full CursorWindow row`() = runBlocking {
+        val body="中文🙂".repeat(300_000)
+        val large=note("Large note",body)
+        database.dao().put(large)
+        assertEquals(body,database.dao().get(noteId)!!.body)
+        api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,large)
+        assertEquals(body,TipTapCodec.decode(JsonParser.parseString(database.dao().apiDocument(noteId)!!.tiptapJson)))
+        val queued=database.dao().apiOutbox(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID).first{it.entityType=="document"}
+        assertEquals(body,JsonParser.parseString(queued.payloadJson).asJsonObject["markdown"].asString)
+        val revision=JsonObject().apply{addProperty("pageId",noteId);addProperty("reason","manual");addProperty("createdAt","2026-10-01T00:00:00Z");add("document",JsonObject().apply{addProperty("markdown",body)})}
+        api.applyRevision("large-revision",revision)
+        assertEquals(body,database.dao().remoteRevisions(noteId).single().markdown)
+    }
+
     @Test fun `private snapshot encrypts notebook metadata body attachments and positions before publication`() = runBlocking {
         val privateNote=note("PRIVATE TITLE","PRIVATE BODY").copy(dirty=false,folderId="private-folder")
         database.dao().put(privateNote)
