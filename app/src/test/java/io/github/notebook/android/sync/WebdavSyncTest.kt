@@ -157,6 +157,72 @@ class WebdavSyncTest {
         addProperty("createdAt","2026-08-04T00:00:00Z");addProperty("updatedAt","2026-08-04T00:00:00Z")
     }
 
+    @Test fun `empty replica adopts compacted successors before old peer snapshots without conflicts`() = runBlocking {
+        val old=remotePage().apply{addProperty("title","old bootstrap")}
+        val latest=remotePage().apply{addProperty("title","current desktop")}
+        webdav.putJournal("30000000-0000-4000-8000-000000000001",listOf(remoteEntry(1,"page",noteId,old)))
+        webdav.putJournal("30000000-0000-4000-8000-000000000002",listOf(remoteEntry(20,"page",noteId,latest,version=4)))
+        client.sync(settings());client.sync(settings())
+        assertEquals("current desktop",database.dao().get(noteId)!!.title)
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertEquals(5L,database.dao().apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",noteId))!!.version)
+    }
+
+    @Test fun `private snapshot encrypts notebook metadata body attachments and positions before publication`() = runBlocking {
+        val privateNote=note("PRIVATE TITLE","PRIVATE BODY").copy(dirty=false,folderId="private-folder")
+        database.dao().put(privateNote)
+        database.dao().putFolder(FolderEntity("private-folder","PRIVATE FOLDER",type="encryptedFolder"))
+        prefs.edit().putString("encryptedNoteIds","[\"$noteId\"]").putString("encryptedMappings","{\"$noteId\":\"private-folder\"}").apply()
+        val file=File(ApplicationProvider.getApplicationContext<Context>().filesDir,"private-test-file");file.writeText("PRIVATE BYTES")
+        database.dao().putAssets(listOf(AssetEntity("private-asset",noteId,"file","PRIVATE FILE","text/plain","private-test-file",file.absolutePath,size=file.length())))
+        database.dao().putReadingPosition(ReadingPositionEntity(noteId,12,0.2,1,"private-device"))
+        val configuration=settings().copy(syncPassword="shared-private-key")
+        client.sync(configuration)
+        val journal=webdav.files["notebook_backup/journal/$deviceId.jsonl"]!!.toString(Charsets.UTF_8)
+        assertFalse(journal.contains("PRIVATE"))
+        assertTrue(journal.contains("\$encrypted"))
+        for((path,bytes) in webdav.files)if(path.contains("/objects/"))assertFalse(String(bytes).contains("PRIVATE"))
+        val rows=WebdavJournalProtocol.parseJournal(journal)
+        val page=rows.first{it.type=="page"}
+        assertEquals("PRIVATE TITLE",WebdavPrivacyCipher(configuration.syncPassword).decryptPayload(page.type,page.id,page.payload)["title"].asString)
+    }
+
+    @Test fun `wrong private key does not import entities or advance journal cursor`() = runBlocking {
+        val encrypted=WebdavPrivacyCipher("correct-key").encryptPayload("page",noteId,remotePage().apply{addProperty("locked",true)})
+        val peer="30000000-0000-4000-8000-000000000019"
+        webdav.putJournal(peer,listOf(remoteEntry(1,"page",noteId,encrypted)))
+        assertTrue(runCatching{client.sync(settings().copy(syncPassword="wrong-key"))}.isFailure)
+        assertNull(database.dao().get(noteId))
+        client.sync(settings().copy(syncPassword="correct-key"))
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertTrue(prefs.getString("encryptedNoteIds","")!!.contains(noteId))
+    }
+
+    @Test fun `private remote body and attachment decrypt and remain locked on repeated SQLite replay`() = runBlocking {
+        val secret="private-fixture-key";val cipher=WebdavPrivacyCipher(secret)
+        val bytes="PRIVATE ATTACHMENT".toByteArray()
+        val stored=cipher.encrypt("asset-bytes:private-asset",bytes).toString().toByteArray()
+        val hash=WebdavJournalProtocol.sha256(stored);webdav.putObject(hash,stored)
+        val asset=JsonObject().apply{
+            addProperty("pageId",noteId);addProperty("filename","private.txt");addProperty("mimeType","text/plain")
+            addProperty("objectHash",hash);addProperty("checksum",WebdavJournalProtocol.sha256(bytes));addProperty("caption","private caption")
+        }
+        val document=JsonObject().apply{addProperty("pageId",noteId);addProperty("markdown","PRIVATE MARKDOWN\n");addProperty("schemaVersion",3)}
+        val peer="30000000-0000-4000-8000-000000000020"
+        webdav.putJournal(peer,listOf(
+            remoteEntry(1,"asset","private-asset",cipher.encryptPayload("asset","private-asset",asset)),
+            remoteEntry(2,"document",noteId,cipher.encryptPayload("document",noteId,document)),
+            remoteEntry(3,"page",noteId,cipher.encryptPayload("page",noteId,remotePage().apply{addProperty("locked",true)}))
+        ))
+        client.sync(settings().copy(syncPassword=secret));client.sync(settings().copy(syncPassword=secret))
+        assertEquals("PRIVATE MARKDOWN\n",database.dao().get(noteId)!!.body)
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        val restored=database.dao().getAsset("private-asset")!!
+        assertArrayEquals(bytes,File(restored.localPath!!).readBytes())
+        assertEquals("private caption",restored.caption)
+        assertEquals("encryptedFolder",database.dao().getFolder("webdav-private")!!.type)
+    }
+
     @Test fun `first sync restores dependents before a later page in the same journal`() = runBlocking {
         val remoteDevice="30000000-0000-4000-8000-000000000021"
         val bytes="restored attachment".toByteArray()

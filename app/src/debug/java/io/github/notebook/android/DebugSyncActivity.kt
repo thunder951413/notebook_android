@@ -27,6 +27,7 @@ class DebugSyncActivity:Activity() {
                     username=intent.getStringExtra("webdavUsername").orEmpty(),
                     appPassword=intent.getStringExtra("webdavAppPassword").orEmpty(),
                     remotePath=intent.getStringExtra("webdavRemotePath").orEmpty(),
+                    syncPassword=intent.getStringExtra("webdavSyncPassword").orEmpty(),
                 ))
             }else{
             val sshHost=intent.getStringExtra("sshHost").orEmpty()

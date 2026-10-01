@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
@@ -245,6 +246,35 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun webdavSettings()=WebdavSettings(prefs.getString("webdavBaseUrl","https://dav.jianguoyun.com/dav/")!!,prefs.getString("webdavUser","")!!,prefs.getString("webdavAppPassword","")!!,prefs.getString("webdavPath","notebook_backup")!!,prefs.getString("webdavSyncPassword","")!!)
     fun saveWebdavSettings(s:WebdavSettings){prefs.edit().putString("syncBackend",SyncBackend.WEBDAV.name).putString("webdavBaseUrl",s.baseUrl.trim()).putString("webdavUser",s.username.trim()).putString("webdavAppPassword",s.appPassword).putString("webdavPath",s.remotePath.trim()).putString("webdavSyncPassword",s.syncPassword).apply()}
     suspend fun testWebdav():WebdavTestResult=webdavSync.test(webdavSettings())
+    suspend fun syncCompletionMessage():String {
+        val conflicts=dao.allNotes().count{it.conflict}
+        if(conflicts>0)return "同步仍有 $conflicts 条冲突待处理"
+        val pending=dao.apiOutboxCount(syncWorkspaceId())
+        if(pending>0)return "本批同步完成，仍有 $pending 条变更等待上传"
+        return "连接成功，同步已完成"
+    }
+    /** Content-free local report for comparing restored entity ids and hashes. */
+    suspend fun exportSyncDiagnostics():File=withContext(Dispatchers.IO) {
+        val notes=dao.allNotes()
+        val root=JsonObject().apply{
+            addProperty("version",1)
+            addProperty("outbox",dao.apiOutboxCount(syncWorkspaceId()))
+            add("notes",JsonArray().apply{notes.forEach{note->add(JsonObject().apply{
+                addProperty("id",note.id);addProperty("private",isEncrypted(note));addProperty("deleted",note.deletedAt!=null)
+                addProperty("kind",note.itemType);addProperty("bodyHash",sha(note.body));addProperty("dirty",note.dirty);addProperty("conflict",note.conflict)
+            })}})
+            add("assets",JsonArray().apply{for(note in notes)for(asset in dao.assets(note.id))add(JsonObject().apply{
+                addProperty("id",asset.id);addProperty("pageId",asset.noteId);addProperty("hash",asset.contentHash)
+                addProperty("present",asset.localPath?.let{File(it).isFile}==true)
+            })})
+            add("revisions",JsonArray().apply{for(note in notes)for(revision in dao.remoteRevisions(note.id))add(JsonObject().apply{
+                addProperty("id",revision.id);addProperty("pageId",note.id)
+            })})
+            add("folders",JsonArray().apply{dao.allFolders().forEach{folder->add(JsonObject().apply{addProperty("id",folder.id);addProperty("private",folder.type=="encryptedFolder")})}})
+            add("knownSeqs",JsonParser.parseString(prefs.getString("webdav-seqs:${webdavSync.fingerprint(webdavSettings())}","{}")))
+        }
+        File(appContext.getExternalFilesDir("sync-diagnostics"),"status.json").also{it.parentFile?.mkdirs();it.writeText(gson.toJson(root))}
+    }
     fun syncBackend()=runCatching{SyncBackend.valueOf(prefs.getString("syncBackend",SyncBackend.WEBDAV.name)!!)}.getOrDefault(SyncBackend.WEBDAV)
     /** Assign a fresh WebDAV device id and drop read cursors so the next sync replays every journal from scratch. */
     fun rotateWebdavDeviceId(){

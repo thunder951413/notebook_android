@@ -221,7 +221,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             changedKey=null;newKey=null;status="正在同步…"
             try{
                 repo.sync{status=it}
-                status="同步完成"
+                status=repo.syncCompletionMessage()
             }catch(error:kotlinx.coroutines.CancellationException){
                 status="同步已取消";throw error
             }catch(error:Exception){
@@ -804,7 +804,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
         syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null
         try{
             repo.sync{message=it}
-            message="连接成功，同步已完成"
+            message=repo.syncCompletionMessage()
         }catch(error:kotlinx.coroutines.CancellationException){
             message="同步已取消";throw error
         }catch(error:Exception){
@@ -847,12 +847,12 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 OutlinedTextField(w.username,{w=w.copy(username=it)},label={Text("用户名")})
                 OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
                 OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},label={Text("远程目录")})
-                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("同步密码（可选预留）")},visualTransformation=PasswordVisualTransformation())
-                Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。私密笔记及关联附件不走 WebDAV，只保留在此设备。",style=MaterialTheme.typography.bodySmall)
+                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("隐私同步密钥")},visualTransformation=PasswordVisualTransformation())
+                Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。配置与电脑相同的隐私同步密钥后，私密笔记、附件及历史以密文同步；密钥只保存在设备上。",style=MaterialTheme.typography.bodySmall)
                 Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.secondaryContainer),modifier=Modifier.fillMaxWidth()){
                     Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(4.dp)){
                         Text("私密文件夹说明",fontWeight=FontWeight.SemiBold)
-                        Text("私密文件夹通过设备锁保护访问；本地数据依赖 Android 系统存储加密，并非额外的应用层文件加密。私密内容不会同步到坚果云，卸载应用或设备丢失后无法从云端恢复。",style=MaterialTheme.typography.bodySmall)
+                        Text("私密文件夹通过设备锁保护访问。本地数据依赖 Android 系统存储加密；云端内容使用隐私同步密钥加密。请在已有设备上保留密钥，恢复到新设备时需要同一密钥。未设置密钥的私密内容仍只保存在本机。",style=MaterialTheme.typography.bodySmall)
                     }
                 }
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
@@ -863,6 +863,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
             OutlinedCard(onClick={showLegacySync=!showLegacySync},modifier=Modifier.fillMaxWidth()){
                 Row(Modifier.padding(14.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(Icons.Default.History,"旧同步方式与迁移");Spacer(Modifier.width(8.dp));Column(Modifier.weight(1f)){Text("旧同步方式与迁移",fontWeight=FontWeight.SemiBold);Text("仅用于迁移已有 SSH 或 API 仓库，不建议持续同步。",style=MaterialTheme.typography.bodySmall)};Icon(if(showLegacySync)Icons.Default.ExpandLess else Icons.Default.ExpandMore,if(showLegacySync)"收起旧同步方式" else "展开旧同步方式")}
             }
+            OutlinedButton({scope.launch{runCatching{repo.exportSyncDiagnostics()}.onSuccess{message="同步诊断已保存（仅实体标识与校验值，不含正文、标题或密钥）"}.onFailure{message="诊断导出失败：${it.message}";isError=true}}},enabled=!syncing){Text("导出同步诊断")}
             if(showLegacySync){
                 Text("SSH/SFTP 旧仓库迁移",fontWeight=FontWeight.SemiBold)
                 Text("旧配置会保留，方便完成迁移；请先同步并导入到坚果云 WebDAV，之后将正式同步切回 WebDAV。HTTP API 也仅作为旧部署迁移兼容，不作为新的客户端同步入口。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
