@@ -18,6 +18,8 @@
 | --- | --- |
 | `MainActivity.kt` | 数据订阅、阅读／编辑、生命周期刷新、附件、私密凭据与导航 |
 | `reference/ReferenceHome.kt` | 双标签、搜索、多选、库操作、列表位置恢复 |
+| `reference/NoteHierarchy.kt` | 可访问摘要的树索引、路径搜索、最近和固定 ID |
+| `reference/ReferenceHierarchy.kt` | 全局树、局部结构图、可点击路径、定位、子笔记与移动 |
 | `reference/ReferenceComponents.kt` | 卡片、工具、封面、胶囊、空状态与统一尺寸 |
 | `reference/ReferenceFilters.kt` | 父子筛选浮层与返回顺序 |
 | `reference/ReferenceEditor.kt` | 正文输入、IME 与格式／添加面板 |
@@ -37,7 +39,7 @@
 ## 可安装构建与复现
 
 ```bash
-VERSION_CODE=10044 VERSION_NAME=0.4.0-ui.3 \
+VERSION_CODE=10045 VERSION_NAME=0.4.0-ui.4 \
 JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
 ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
 ./gradlew testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
@@ -87,3 +89,13 @@ adb -s emulator-5554 shell am start -W \
 最终构建单元测试 178 项通过，Lint 0 errors／30 warnings。最终 API 35 模拟器深色回归 34 项、浅色受影响回归 14 项通过；新增用例直接等待真实 IME 可见性，不调用测试辅助的 `showSoftInput`，覆盖自动唤起和格式面板关闭恢复。此前一轮调用误写通知测试类名导致的 runner 初始化失败已纠正，最终日志为 `OK (34 tests)` 和 `OK (14 tests)`。
 
 本轮报告在桌面工作区 `docs/audits/2026-10-11/android-phone-refinement-report.md`，交付 APK、真机截图、录屏及构建／测试证据在 `output/android-phone-refinement-2026-10-11/`。
+
+## 2026-10-12 笔记层级
+
+`0.4.0-ui.4-debug`（10045）增加首页常驻“笔记结构”、卡片归属路径／下级数量和阅读／编辑面包屑。结构树按笔记库分组，箭头展开、标题打开，定位会展开祖先并滚动高亮。搜索覆盖标题、路径与轻量正文摘要，结果展示路径和摘要；固定与最近减少重复寻找。
+
+局部结构图显示父级、当前笔记、同级和直接子笔记，点节点切换关注，打开进入同一 ID 的正文。新建子笔记和移动沿用跨端关系与私密边界。新旧草稿交错时保留较新结构时间对应的位置，正文正常落盘；移动时间推进到整棵子树既有时间之后。
+
+最终独立 APK 已覆盖更新 OPPO 预览包，原 6 篇演示正文和新增 10 篇层级数据保留，固定／最近重启后保留；手机安装 APK 与交付 APK SHA-256 一致。单元 187 项通过，Lint 0 errors／33 warnings。完整深色回归 44 项、浅色 23 项通过；最后两项层级细化后最终包另经深／浅色各 12 项专项回归。
+
+实现取舍、测试范围与真机证据详见 `docs/NOTE_HIERARCHY_DESIGN.md` 和桌面工作区 `docs/audits/2026-10-12/note-hierarchy-implementation-report.md`。本轮未连接生产同步目录；复用了现有共享字段和同步链路，本轮没有执行生产跨端同步验收。

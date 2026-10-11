@@ -133,8 +133,28 @@ internal fun ReferenceHome(
     onStatus: (String) -> Unit,
     onCardBounds: (Rect) -> Unit = {},
     tabletEditor: (@Composable () -> Unit)? = null,
+    encryptedUnlocked: Boolean = false,
+    onCreateChild: (String) -> Unit = {},
+    onHierarchyOpen: (String) -> Unit = onOpen,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    var hierarchy by rememberSaveable { mutableStateOf(false) }
+    var hierarchyAnchor by rememberSaveable { mutableStateOf<String?>(null) }
+    val hierarchyNotes = all.filter { canExposeNote(it, encryptedUnlocked, repo::isEncrypted) }
+    val hierarchyIndex = remember(hierarchyNotes) { NoteHierarchyIndex(hierarchyNotes) }
+    if (hierarchy)
+        ReferenceHierarchySheet(
+            hierarchyNotes,
+            folders,
+            repo,
+            currentId = hierarchyAnchor,
+            folderId = folderId,
+            scoped = folderId != null || destination == Destination.Unfiled,
+            onDismiss = { hierarchy = false },
+            onOpen = onHierarchyOpen,
+            onCreateChild = onCreateChild,
+            onStatus = onStatus,
+        )
     var search by rememberSaveable { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var filters by remember { mutableStateOf(false) }
@@ -409,6 +429,15 @@ internal fun ReferenceHome(
                                         tagId != null
                                 )
                                     Spacer(Modifier.weight(1f))
+                                RoundTool(
+                                    Icons.Default.AccountTree,
+                                    "笔记结构",
+                                    {
+                                        hierarchyAnchor = null
+                                        hierarchy = true
+                                    },
+                                    modifier = Modifier.testTag("open-note-hierarchy"),
+                                )
                                 RoundTool(
                                     Icons.Default.Search,
                                     "搜索笔记",
@@ -711,6 +740,15 @@ internal fun ReferenceHome(
                                     onMenu = {
                                         selecting = true
                                         selected = setOf(note.id)
+                                    },
+                                    path =
+                                        hierarchyIndex.path(note.id, false).takeIf {
+                                            search || note.parentPageId != null
+                                        },
+                                    childCount = hierarchyIndex.counts[note.id] ?: 0,
+                                    onChildren = {
+                                        hierarchyAnchor = note.id
+                                        hierarchy = true
                                     },
                                 )
                             }
@@ -1190,6 +1228,9 @@ private fun ReferenceNoteCard(
     onLongClick: () -> Unit,
     onMenu: () -> Unit,
     onBounds: (Rect) -> Unit = {},
+    path: String? = null,
+    childCount: Int = 0,
+    onChildren: () -> Unit = {},
 ) {
     val accent = MaterialTheme.colorScheme.tertiary
     Surface(
@@ -1223,13 +1264,42 @@ private fun ReferenceNoteCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                if (!path.isNullOrBlank())
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            path,
+                            Modifier.weight(1f),
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (!selecting)
+                            IconButton(
+                                onChildren,
+                                Modifier.size(32.dp).testTag("note-path-${note.id}"),
+                            ) {
+                                Icon(
+                                    Icons.Default.MyLocation,
+                                    "在结构中定位 ${note.title}",
+                                    Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                    }
                 Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         SimpleDateFormat("yyyy/M/d HH:mm '更新'", Locale.CHINA)
                             .format(Date(note.updatedAt)),
+                        Modifier.weight(1f),
                         fontSize = 12.sp,
                         lineHeight = 16.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     if (note.reminderAt != null)
                         Icon(
@@ -1244,7 +1314,15 @@ private fun ReferenceNoteCard(
                             Modifier.padding(start = 6.dp).size(13.dp),
                             tint = MaterialTheme.colorScheme.error,
                         )
-                    Spacer(Modifier.weight(1f))
+                    if (!selecting && childCount > 0)
+                        Text(
+                            "$childCount 下级",
+                            Modifier.clickable(onClick = onChildren)
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                                .testTag("note-children-${note.id}"),
+                            fontSize = 11.sp,
+                            color = accent,
+                        )
                     if (!selecting)
                         IconButton(onMenu, Modifier.size(20.dp)) {
                             Icon(

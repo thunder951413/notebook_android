@@ -162,7 +162,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     val homeHolder=androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     var activeDocumentId by rememberSaveable{mutableStateOf<String?>(null)}
     LaunchedEffect(Unit){if(activeDocumentId!=null&&editing==null){repo.flushAll();val restored=repo.loadNote(activeDocumentId!!);if(restored!=null&&!repo.isEncrypted(restored))editing=restored else{activeDocumentId=null;folderId=null;startInEditMode=false}}}
-    LaunchedEffect(editing?.id){editing?.let{activeDocumentId=it.id}}
+    LaunchedEffect(editing?.id){editing?.let{activeDocumentId=it.id;NoteNavigationHistory(context).visited(it.id)}}
     var encryptedUnlocked by remember{mutableStateOf(false)}
     var cardOrigin by remember{mutableStateOf<androidx.compose.ui.geometry.Rect?>(null)}
     var predictiveProgress by remember{mutableFloatStateOf(0f)}
@@ -345,6 +345,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
                 repo.markUnsaved(draft.id);cardOrigin=null;startInEditMode=true;editing=draft
             },onSelect={d,f,t->select(d,f,t)},onNavigation={scope.launch{drawer.open()}},onSettings={showSettings=true},onSync={runSync()},
             onImport={textImporter.launch(arrayOf("text/plain","text/markdown","text/x-markdown"))},onStatus={status=it},onCardBounds={cardOrigin=it},
+            encryptedUnlocked=encryptedUnlocked,onCreateChild={id->cardOrigin=null;scope.launch{repo.loadNote(id)?.let{createChild(it)}}},onHierarchyOpen={cardOrigin=null;openNote(it)},
             tabletEditor=if(isTablet){{editing?.let{note->key(note.id){EditorPane(note,repo,surfaceFor(note.id),initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={openNote(it)},onNewChild={createChild(it)},onEditModeChanged={startInEditMode=it},onDone={closeDocument()})}}?:EmptyNotes("选择一篇笔记","在左侧打开笔记开始阅读")}}else null
         )}
     }
@@ -388,11 +389,12 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     visit(null,0);return result
 }
 
-@Composable private fun MovePageDialog(page:NoteSummary,notes:List<NoteSummary>,onDismiss:()->Unit,onMove:(String?)->Unit){
+@Composable internal fun MovePageDialog(page:NoteSummary,notes:List<NoteSummary>,onDismiss:()->Unit,onMove:(String?)->Unit){
     var query by rememberSaveable{mutableStateOf("")}
-    val descendants=remember(page.id,notes){buildSet{add(page.id);var changed=true;while(changed){changed=false;notes.filter{it.parentPageId in this}.forEach{if(add(it.id))changed=true}}}}
-    val targets=remember(notes,query,descendants){notes.filter{it.itemType=="note"&&it.deletedAt==null&&it.id !in descendants&&(query.isBlank()||it.title.contains(query,true)||it.folderName.contains(query,true))}.sortedWith(compareBy<NoteSummary>{it.folderName}.thenBy{it.title}).take(200)}
-    AlertDialog(onDismissRequest=onDismiss,title={Text("移动页面")},text={Column(Modifier.fillMaxWidth().heightIn(max=540.dp)){OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索目标页面")});LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){item{ListItem(headlineContent={Text("当前分区的顶层")},leadingContent={Icon(Icons.Default.Home,null)},modifier=Modifier.clickable{onMove(null)})};items(targets,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"})},supportingContent={Text(target.folderName)},leadingContent={Icon(if(notes.any{it.parentPageId==target.id})Icons.Default.Folder else Icons.Default.Description,null)},modifier=Modifier.clickable{onMove(target.id)})}}}},confirmButton={},dismissButton={TextButton(onDismiss){Text("取消")}})
+    val index=remember(notes){NoteHierarchyIndex(notes)}
+    val descendants=remember(page.id,index){index.descendants(page.id)+page.id}
+    val targets=remember(notes,query,descendants,index){notes.filter{it.itemType=="note"&&it.deletedAt==null&&it.id !in descendants&&(query.isBlank()||query.trim().split(Regex("\\s+")).all{term->index.path(it.id).contains(term,true)})}.sortedWith(compareBy<NoteSummary>{it.folderName}.thenBy{it.title}).take(200)}
+    AlertDialog(onDismissRequest=onDismiss,title={Text("移动页面")},text={Column(Modifier.fillMaxWidth().heightIn(max=540.dp)){OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索目标页面")});LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){item{ListItem(headlineContent={Text("当前分区的顶层")},leadingContent={Icon(Icons.Default.Home,null)},modifier=Modifier.clickable{onMove(null)})};items(targets,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"})},supportingContent={Text(index.path(target.id,false),maxLines=2)},leadingContent={Icon(Icons.Default.Description,null)},modifier=Modifier.clickable{onMove(target.id)}.testTag("move-target-${target.id}"))}}}},confirmButton={},dismissButton={TextButton(onDismiss){Text("取消")}})
 }
 
 @Composable private fun Editor(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,initiallyEditing:Boolean,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,onBack:()->Unit,onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={}){EditorPane(original,repo,surface,showBack=true,initiallyEditing=initiallyEditing,encryptedUnlocked=encryptedUnlocked,onOpenNote=onOpenNote,onBackProgress=onBackProgress,onNewChild=onNewChild,onEditModeChanged=onEditModeChanged,onDone={onBack()})}
@@ -416,13 +418,16 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     var permanentConfirm by remember{mutableStateOf(false)}
     var editorMessage by remember{mutableStateOf<String?>(null)}
     var readerAction by remember{mutableStateOf<String?>(null)}
+    var showHierarchy by rememberSaveable{mutableStateOf(false)}
     var editorDocument by remember(original.id,n.body){mutableStateOf<ParsedMarkdownDocument?>(null)}
     LaunchedEffect(n.body){delay(120);editorDocument=withContext(Dispatchers.Default){MarkdownDocumentParser.parse(n.body)}}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
     val allNotes by repo.notes.collectAsState(initial=emptyList())
+    val hierarchyNotes=allNotes.filter{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}
     val saveError by repo.saveError.collectAsState()
     val saveStates by repo.noteSaveStates.collectAsState();val saveState=saveStates[n.id]
     val context=LocalContext.current;val lifecycleOwner=LocalLifecycleOwner.current;val audioRecorder=remember{AudioRecorder(context)};var recording by remember{mutableStateOf(false)};var recordingFile by remember{mutableStateOf<java.io.File?>(null)}
+    val editorFocus=androidx.compose.ui.platform.LocalFocusManager.current
     val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)};var parentMenu by remember{mutableStateOf(false)}
     val steps by repo.steps(n.id).collectAsState(initial=emptyList());var newStep by remember{mutableStateOf("")}
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.GetContent()){uri->uri?.let{source->scope.launch{
@@ -536,6 +541,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 }}
             }
         }
+        if(n.itemType=="note"&&n.deletedAt==null)NoteBreadcrumb(n,hierarchyNotes,{onOpenNote(it)},{editorKeyboard?.hide();editorFocus.clearFocus();scope.launch{repo.flushDraft(latestDraft.value).join();if(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){showHierarchy=true}}})
         if(!editMode){
             ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
             FloatingPill(Modifier.align(androidx.compose.ui.Alignment.CenterHorizontally).padding(horizontal=24.dp,vertical=16.dp)){
@@ -560,6 +566,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
             }
         }
     }
+    if(showHierarchy)ReferenceHierarchySheet(hierarchyNotes,folders,repo,currentId=n.id,onDismiss={showHierarchy=false},onOpen=onOpenNote,onCreateChild={id->scope.launch{repo.flushDraft(latestDraft.value).join();repo.loadNote(id)?.let(onNewChild)}},onMoved={scope.launch{repo.loadNote(n.id)?.let{moved->val updated=n.copy(folderId=moved.folderId,folderName=moved.folderName,parentPageId=moved.parentPageId,sortOrder=moved.sortOrder,treeUpdatedAt=moved.treeUpdatedAt);latestDraft.value=updated;n=updated}}},onStatus={editorMessage=it})
     val tableFrom=surface.tableStart.intValue
     val tableTo=surface.tableEnd.intValue
     if(tableFrom>=0&&tableTo in tableFrom..n.body.length)TableEditorDialog(n.body.substring(tableFrom,tableTo),n.deletedAt!=null,{surface.tableStart.intValue=-1}){markdown->
@@ -569,8 +576,8 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     if(folderMenu)ModalBottomSheet(onDismissRequest={folderMenu=false}){
         SheetTitle("笔记库与上级页面",{folderMenu=false})
         val encrypted=repo.isEncrypted(n)
-        if(!encrypted)ListItem(headlineContent={Text("未分类")},modifier=Modifier.clickable{updateNote(n.copy(folderId=null,folderName="未分类",parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));folderMenu=false})
-        LazyColumn(Modifier.heightIn(max=320.dp)){items(folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"},key={it.id}){folder->ListItem(headlineContent={Text(folder.name)},leadingContent={LibraryCover(libraryColor(folder.color),Modifier.size(44.dp,38.dp),encrypted)},modifier=Modifier.clickable{if(encrypted)repo.moveEncrypted(n.id,folder.id);updateNote(n.copy(folderId=folder.id,folderName=folder.name,parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));folderMenu=false})}}
+        if(!encrypted)ListItem(headlineContent={Text("未分类")},modifier=Modifier.clickable{updateNote(n.copy(folderId=null,folderName="未分类",parentPageId=null,treeUpdatedAt=maxOf(System.currentTimeMillis(),n.treeUpdatedAt.coerceAtMost(Long.MAX_VALUE-1)+1)));folderMenu=false})
+        LazyColumn(Modifier.heightIn(max=320.dp)){items(folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"},key={it.id}){folder->ListItem(headlineContent={Text(folder.name)},leadingContent={LibraryCover(libraryColor(folder.color),Modifier.size(44.dp,38.dp),encrypted)},modifier=Modifier.clickable{if(encrypted)repo.moveEncrypted(n.id,folder.id);updateNote(n.copy(folderId=folder.id,folderName=folder.name,parentPageId=null,treeUpdatedAt=maxOf(System.currentTimeMillis(),n.treeUpdatedAt.coerceAtMost(Long.MAX_VALUE-1)+1)));folderMenu=false})}}
         if(n.itemType=="note")TextButton({folderMenu=false;pageMove=true}){Icon(Icons.Default.AccountTree,null);Text("移动到上级页面…")};Spacer(Modifier.height(24.dp))
     }
     if(pageMove)allNotes.firstOrNull{it.id==n.id}?.let{summary->MovePageDialog(summary,allNotes.filter{repo.isEncrypted(it)==repo.isEncrypted(n)},{pageMove=false}){parent->pageMove=false;scope.launch{repo.flushDraft(n).join();runCatching{repo.movePage(n.id,parent)}.onSuccess{latestDraft.value=it;n=it}.onFailure{editorMessage=it.localizedMessage}}}}

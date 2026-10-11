@@ -152,6 +152,42 @@ class DebugUiStudyActivity : Activity() {
                     )
                 prefs.edit().putBoolean("seeded", true).commit()
             }
+            if (
+                intent.getBooleanExtra("seedHierarchySamples", false) &&
+                    !prefs.getBoolean("hierarchy-seeded", false)
+            ) {
+                val library = studyId("hierarchy-study-library")
+                repo.saveFolder("项目与知识", id = library, color = "#C2DFC1")
+                val samples =
+                    listOf(
+                        Triple("app", "Android 界面改版", null),
+                        Triple("home", "首页布局", "app"),
+                        Triple("navigation", "层级导航", "app"),
+                        Triple("quick", "快速定位", "navigation"),
+                        Triple("map", "结构可视化", "navigation"),
+                        Triple("app-check", "验收记录", "app"),
+                        Triple("travel", "旅行准备", null),
+                        Triple("transport", "交通安排", "travel"),
+                        Triple("alternative", "备选方案", "transport"),
+                        Triple("travel-check", "验收记录", "travel"),
+                    )
+                samples.forEachIndexed { i, (key, title, parent) ->
+                    repo.save(
+                        NoteEntity(
+                            studyId("hierarchy-study-$key"),
+                            title = title,
+                            body =
+                                "## $title\n\n这是用于层级导航验收的独立演示笔记。主笔记和子笔记都可以保存正文。\n\n- 保留 Markdown 与同步关系\n- 从路径与结构树快速定位\n",
+                            folderId = library,
+                            folderName = "项目与知识",
+                            parentPageId = parent?.let { studyId("hierarchy-study-$it") },
+                            sortOrder = (i + 1) * 1000.0,
+                            viewMode = "preview",
+                        )
+                    )
+                }
+                prefs.edit().putBoolean("hierarchy-seeded", true).commit()
+            }
             withContext(Dispatchers.Main) {
                 startActivity(Intent(this@DebugUiStudyActivity, MainActivity::class.java))
                 finish()

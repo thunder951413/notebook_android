@@ -397,8 +397,11 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             dao.deleteDraft(draft.id)
             return@withLock current
         }
-        if(current!=null&&sameEditableContent(current,draft)){dao.deleteDraft(draft.id);return@withLock current}
-        val base=current?:draft;val saved=base.copy(title=draft.title,body=draft.body,previewText=previewText(draft.body),folderId=draft.folderId,folderName=draft.folderName,icon=draft.icon,parentPageId=draft.parentPageId,sortOrder=draft.sortOrder,treeUpdatedAt=draft.treeUpdatedAt,reminderAt=draft.reminderAt,recurrence=draft.recurrence,tagIds=draft.tagIds,deletedAt=draft.deletedAt,itemType=draft.itemType,dueAt=draft.dueAt,completedAt=draft.completedAt,important=draft.important,viewMode=draft.viewMode,updatedAt=System.currentTimeMillis(),version=(current?.version?:draft.version)+1,dirty=true)
+        // A reader/editor draft may predate a completed move. Its text remains
+        // editable, but the newer structural timestamp owns the tree position.
+        val structuralDraft=if(current!=null&&current.treeUpdatedAt>draft.treeUpdatedAt)draft.copy(folderId=current.folderId,folderName=current.folderName,parentPageId=current.parentPageId,sortOrder=current.sortOrder,treeUpdatedAt=current.treeUpdatedAt)else draft
+        if(current!=null&&sameEditableContent(current,structuralDraft)){dao.deleteDraft(draft.id);return@withLock current}
+        val base=current?:draft;val saved=base.copy(title=draft.title,body=draft.body,previewText=previewText(draft.body),folderId=structuralDraft.folderId,folderName=structuralDraft.folderName,icon=draft.icon,parentPageId=structuralDraft.parentPageId,sortOrder=structuralDraft.sortOrder,treeUpdatedAt=structuralDraft.treeUpdatedAt,reminderAt=draft.reminderAt,recurrence=draft.recurrence,tagIds=draft.tagIds,deletedAt=draft.deletedAt,itemType=draft.itemType,dueAt=draft.dueAt,completedAt=draft.completedAt,important=draft.important,viewMode=draft.viewMode,updatedAt=System.currentTimeMillis(),version=(current?.version?:draft.version)+1,dirty=true)
         if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);dao.deleteDraft(draft.id);if(syncBackend()!=SyncBackend.SSH){val workspace=syncWorkspaceId();apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.icon==b.icon&&a.parentPageId==b.parentPageId&&a.sortOrder==b.sortOrder&&a.treeUpdatedAt==b.treeUpdatedAt&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important&&a.viewMode==b.viewMode
@@ -419,7 +422,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         trashedNoteIds.remove(note.id)
         save(note.copy(deletedAt=null),restoring=true)
     }}
-    suspend fun movePage(id:String,parentId:String?):NoteEntity=syncMutex.withLock{
+    suspend fun movePage(id:String,parentId:String?):NoteEntity=withContext(NonCancellable){syncMutex.withLock{
         flushAll()
         val page=loadEditable(id)?:error("页面不存在")
         require(parentId!=id){"不能把页面移动到自身下面"}
@@ -433,15 +436,17 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val targetFolder=if(parent==null)page.folderId else parent.folderId
         val targetName=if(parent==null)page.folderName else parent.folderName
         val privateFolder=if(parent==null)encryptedFolderId(page) else encryptedFolderId(parent)
-        val now=System.currentTimeMillis()
+        val moveTargets=subtree(id)
+        val previousTreeTime=moveTargets.maxOfOrNull{it.treeUpdatedAt}?:page.treeUpdatedAt
+        val now=maxOf(System.currentTimeMillis(),previousTreeTime.coerceAtMost(Long.MAX_VALUE-1)+1)
         val siblings=all.filter{it.parentPageId==parentId&&it.id!=id&&it.deletedAt==null}
         val result=save(page.copy(parentPageId=parentId,folderId=targetFolder,folderName=targetName,sortOrder=(siblings.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,treeUpdatedAt=now))
-        subtree(id).forEach{note->
+        moveTargets.forEach{note->
             if(privateFolder!=null)moveEncrypted(note.id,privateFolder)
             if(note.id!=id)save(note.copy(folderId=targetFolder,folderName=targetName,treeUpdatedAt=now))
         }
         result
-    }
+    }}
     suspend fun deletePermanently(id:String)=withContext(NonCancellable){syncMutex.withLock{
         val targets=subtree(id)
         targets.forEach{permanentlyDeletedNoteIds.add(it.id);pendingDrafts.remove(it.id)}
