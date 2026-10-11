@@ -64,6 +64,30 @@ class WebdavSyncInstrumentedTest {
 
     @After fun closeFixture(){fixture?.database?.close()}
 
+    @Test fun permanentDeletionResolvesRealPeerConflictAndCannotBeRestoredByFreshReplica()=runBlocking{
+        val (settings,local)=fixtureArguments("_permanent_delete")
+        local.repository.saveWebdavSettings(settings)
+        val id=UUID.randomUUID().toString()
+        local.repository.save(NoteEntity(id,title="共同标题",body="共同正文"));local.repository.sync()
+        val peer=FixtureContext(InstrumentationRegistry.getInstrumentation().targetContext)
+        try{
+            peer.repository.saveWebdavSettings(settings);peer.repository.sync()
+            peer.repository.save(peer.database.dao().get(id)!!.copy(title="服务器修改",body="服务器正文"));peer.repository.sync()
+            local.repository.save(local.database.dao().get(id)!!.copy(title="本机修改",body="本机正文"));local.repository.sync()
+            assertTrue("必须先生成双端冲突",local.database.dao().get(id)!!.conflict)
+            local.repository.moveToTrash(id)
+            val stale=local.database.dao().get(id)!!.copy(viewMode="text")
+            local.repository.deletePermanently(id)
+            local.repository.flushDraft(stale).join()
+            local.repository.sync();local.repository.sync()
+            assertNull(local.database.dao().get(id))
+            assertEquals(0,local.database.dao().apiOutboxCount(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID))
+            peer.database.clearAllTables();peer.prefs.edit().clear().apply()
+            peer.repository.saveWebdavSettings(settings);peer.repository.sync()
+            assertNull("新设备不能重新拉回删除的冲突笔记",peer.database.dao().get(id))
+        }finally{peer.database.close()}
+    }
+
     private fun fixtureArguments(suffix:String=""):Pair<WebdavSettings,FixtureContext> {
         val arguments=InstrumentationRegistry.getArguments()
         val baseUrl=arguments.getString("webdavBaseUrl").orEmpty()

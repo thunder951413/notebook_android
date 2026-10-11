@@ -13,6 +13,30 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class SftpSyncTest {
+    @Test fun permanentDeletionWinsOverConflictedRemoteNoteAndFreshReplica()=runBlocking{
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        val fingerprint=InstrumentationRegistry.getArguments().getString("sftpFingerprint").orEmpty()
+        assumeTrue("SFTP fixture not configured",fingerprint.startsWith("SHA256:"))
+        val context=instrumentation.targetContext
+        val app=context.applicationContext as NotebookApp;val repo=app.repository
+        androidx.work.WorkManager.getInstance(app).cancelAllWork().result.get();repo.flushAll();app.database.clearAllTables()
+        val settings=SshSettings("10.0.2.2",2222,"notebook","test-password","/sync",fingerprint)
+        repo.saveSettings(settings)
+        val id=UUID.randomUUID().toString()
+        repo.save(NoteEntity(id,title="冲突原稿",body="共同正文"));repo.sync()
+        val peerDb=androidx.room.Room.inMemoryDatabaseBuilder(context,io.github.notebook.android.data.NotebookDatabase::class.java).build()
+        try{
+            val peer=io.github.notebook.android.sync.SyncRepository(context,peerDb.dao(),context.getSharedPreferences("sftp-delete-peer-${UUID.randomUUID()}",0))
+            peer.saveSettings(settings);peer.sync()
+            peer.save(peerDb.dao().get(id)!!.copy(title="服务器修改",body="服务器版本"));peer.sync()
+            repo.save(app.database.dao().get(id)!!.copy(title="本机修改",body="本机版本"));repo.sync()
+            assertTrue("必须先复现真实同步冲突",app.database.dao().get(id)!!.conflict)
+            repo.moveToTrash(id);repo.deletePermanently(id);repo.sync();repo.sync()
+            assertNull(app.database.dao().get(id))
+            peerDb.clearAllTables();peer.sync()
+            assertNull("全新副本不能拉回已彻底删除的冲突笔记",peerDb.dao().get(id))
+        }finally{peerDb.close()}
+    }
     @Test fun existingRepositoryWithLegacyInvalidTombstonesSynchronizesTwice()=runBlocking {
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         val arguments=InstrumentationRegistry.getArguments()

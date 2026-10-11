@@ -146,6 +146,49 @@ class LibraryOperationsTest {
     }
 
     @Test
+    fun permanentDeletionRejectsLateTrashedDraftAndRestartRecovery() = runBlocking {
+        val id = UUID.randomUUID().toString()
+        repo.save(NoteEntity(id, title = "冲突笔记", body = "本机正文", conflict = true))
+        repo.moveToTrash(id)
+        val stale = db.dao().get(id)!!.copy(viewMode = "text")
+        repo.deletePermanently(id)
+        assertNull(db.dao().get(id))
+        // The editor's disposal/background save can arrive after the deletion.
+        repo.flushDraft(stale).join()
+        assertNull("迟到的已删除草稿不能复活笔记", db.dao().get(id))
+        db.dao().putDraft(DraftEntity(id, com.google.gson.Gson().toJson(stale)))
+        val restarted = SyncRepository(context, db.dao(), context.getSharedPreferences(UUID.randomUUID().toString(), 0))
+        restarted.recoverDrafts()
+        assertNull("进程重启后的草稿恢复不能复活笔记", db.dao().get(id))
+        assertNull(db.dao().draftUpdatedAt(id))
+        assertTrue(db.dao().apiOutboxHeaders("00000000-0000-4000-8000-000000000001").filter { it.entityId == id }.all { it.operation == "delete" })
+    }
+
+    @Test
+    fun permanentDeletionClearsChildDraftsAndDependentUpsertsWithoutTouchingOtherNotes() = runBlocking {
+        val root=UUID.randomUUID().toString();val child=UUID.randomUUID().toString();val other=UUID.randomUUID().toString()
+        repo.save(NoteEntity(root,title="冲突父页",conflict=true,tagIds="tag"))
+        repo.save(NoteEntity(child,title="子页",parentPageId=root))
+        repo.save(NoteEntity(other,title="保留页",body="不应受影响"))
+        val asset=UUID.randomUUID().toString();val step=UUID.randomUUID().toString()
+        db.dao().putAssets(listOf(AssetEntity(asset,root,"image","图.png","image/png","$root/$asset.png",dirty=true)))
+        db.dao().putStep(TodoStepEntity(step,root,"步骤"))
+        repo.save(db.dao().get(root)!!)
+        repo.queueDraft(db.dao().get(child)!!.copy(body="待保存的子页正文"))
+        repo.deletePermanently(root)
+        repo.flushAll()
+        assertNull(db.dao().get(root));assertNull(db.dao().get(child))
+        assertNull(db.dao().draftUpdatedAt(root));assertNull(db.dao().draftUpdatedAt(child))
+        assertTrue(db.dao().assets(root).isEmpty());assertTrue(db.dao().steps(root).isEmpty())
+        assertNull(db.dao().apiPage(root));assertNull(db.dao().apiDocument(root))
+        assertEquals("不应受影响",db.dao().get(other)!!.body)
+        val workspace="00000000-0000-4000-8000-000000000001"
+        val operations=db.dao().apiOutbox(workspace)
+        assertTrue(operations.filter{it.entityId in setOf(root,child,asset,step,"$root:tag")}.all{it.operation=="delete"})
+        assertEquals(setOf("page","document"),operations.filter{it.entityId==other&&it.operation=="upsert"}.map{it.entityType}.toSet())
+    }
+
+    @Test
     fun fullBodySnippetFindsHitBeyondPreviewWithoutLoadingSnapshot() = runBlocking {
         repo.save(
             NoteEntity(

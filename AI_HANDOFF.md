@@ -31,6 +31,7 @@ SSH/SFTP Markdown v3 与 Notebook Next HTTP API 只承担既有部署的迁移�
 - 正常输入通过 600 ms 防抖自动保存；输入面按 Markdown 块呈现原生文本、图片、代码与表格，文本使用可逆 Markdown 显示映射，源码模式与格式面板共用正文源。超过 150,000 UTF-16 单位时分段编辑，不能把全文交给单个原生布局。`EditorSurfaceState` 在文档容器之外保存展示状态；全屏表格放在文档层，不能在 LazyColumn 的可见项内声明弹窗。
 - SQLite `length/substr` 按 Unicode 码点计数，读取分块必须按请求的码点数推进，不能按 Kotlin `String.length` 推进。
 - 主动恢复有明确的 `restoring` 路径；普通旧草稿仍不能把已删除内容复活。
+- 彻底删除使用持久 tombstone 拦截迟到保存与进程重启草稿，并在同一 Room 事务中删除正文、草稿、同步投影和提交删除 outbox。WebDAV/API 重放已删除页时只推进版本与删除基线，不导入旧内容；SFTP 拉取不得重新导入本机 tombstone 对应页。
 - 返回、Activity 停止、切换预览、删除和同步边界必须刷新最新编辑状态。
 - 保存失败时保留 Room draft 并展示错误；不要因为旧保存任务完成就删除更新的草稿。
 - Android 没有可靠的“应用退出”回调。`onStop` 只负责安排持久化与后续 worker，正确性不能依赖进程继续存活。

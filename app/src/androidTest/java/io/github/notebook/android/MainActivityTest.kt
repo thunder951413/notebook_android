@@ -142,6 +142,38 @@ class MainActivityTest {
         createNote();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
     }
 
+    @Test fun permanentDeleteFromConflictDetailClosesAndSurvivesRecreation(){
+        val app=rule.activity.application as NotebookApp
+        val id="deleted-conflict-${System.nanoTime()}";val title="待彻底删除的冲突笔记"
+        runBlocking{app.database.dao().put(NoteEntity(id,title=title,body="冲突正文",deletedAt=System.currentTimeMillis(),conflict=true,conflictSnapshotJson="{}"))}
+        openNavigation();rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("同步冲突"));rule.onNodeWithText("同步冲突").performClick()
+        rule.onNodeWithText(title).performClick()
+        rule.onNodeWithText("彻底删除").performClick()
+        rule.onNodeWithText("彻底删除笔记？").assertIsDisplayed()
+        rule.onAllNodesWithText("彻底删除").onLast().performClick()
+        rule.waitUntil(5_000){runBlocking{app.database.dao().get(id)==null}}
+        rule.waitUntil(5_000){rule.onAllNodesWithText(title).fetchSemanticsNodes().isEmpty()}
+        rule.activityRule.scenario.recreate()
+        runBlocking{app.repository.flushAll();app.repository.recoverDrafts()}
+        assertTrue(runBlocking{app.database.dao().get(id)==null})
+        rule.onAllNodesWithText(title).assertCountEquals(0)
+    }
+
+    @Test fun permanentDeleteFromTrashSelectionRemovesConflictAndKeepsOtherNotes(){
+        val app=rule.activity.application as NotebookApp
+        val id="trash-conflict-${System.nanoTime()}"
+        runBlocking{
+            app.database.dao().put(NoteEntity(id,title="回收站冲突笔记",deletedAt=System.currentTimeMillis(),conflict=true))
+            app.database.dao().put(NoteEntity("untouched-note",title="保留笔记",body="保留正文"))
+        }
+        rule.onNodeWithContentDescription("更多").performClick();rule.onNodeWithText("最近删除").performClick()
+        rule.onNodeWithTag("note-card-$id").performTouchInput{longClick()}
+        rule.onNodeWithText("彻底删除").performClick()
+        rule.onNodeWithText("彻底删除 1 篇笔记？").assertIsDisplayed();rule.onNodeWithText("删除").performClick()
+        rule.waitUntil(5_000){runBlocking{app.database.dao().get(id)==null}}
+        assertEquals("保留正文",runBlocking{app.database.dao().get("untouched-note")!!.body})
+    }
+
     @Test fun privateFoldersAreShownLockedAndNotesStayOutOfAllNotes(){
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("encrypted-test","私人资料",0,"encryptedFolder"));app.database.dao().put(NoteEntity("encrypted-note-test",title="不能公开显示",folderId="encrypted-test",folderName="私人资料"))};app.repository.markEncrypted("encrypted-note-test","encrypted-test");rule.activityRule.scenario.recreate()
         rule.onAllNodesWithText("不能公开显示").assertCountEquals(0)

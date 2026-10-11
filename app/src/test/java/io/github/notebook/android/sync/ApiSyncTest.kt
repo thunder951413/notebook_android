@@ -78,6 +78,28 @@ class ApiSyncTest {
         assertTrue(conflicts.has("page"));assertTrue(conflicts.has("document"));assertTrue(database.dao().apiOutbox(workspace).isEmpty())
     }
 
+    @Test fun `server version conflict retains permanent deletion for retry`()=runBlocking {
+        val id="deleted-conflict"
+        val client=ApiSyncClient(ApplicationProvider.getApplicationContext(),database.dao(),allowInsecureHttp=true)
+        database.dao().putTombstone(io.github.notebook.android.data.TombstoneEntity("note|$id",id,"note",System.currentTimeMillis(),"device"))
+        database.dao().putApiOutbox(client.noteDeletionOperation(workspace,"page",id,id))
+        var pushes=0
+        server.dispatcher=object:okhttp3.mockwebserver.Dispatcher(){override fun dispatch(request:okhttp3.mockwebserver.RecordedRequest):MockResponse{
+            if(request.path?.startsWith("/v1/sync/pull")==true)return json("""{"cursor":1,"has_more":false,"changes":[]}""")
+            val c=JsonParser.parseString(request.body.clone().readUtf8()).asJsonObject["changes"].asJsonArray.single().asJsonObject
+            assertEquals("delete",c["operation"].asString)
+            pushes++
+            return if(pushes==1)json("""{"applied":[],"conflicts":[{"operation_id":"${c["operation_id"].asString}","entity_type":"page","entity_id":"$id","current_version":7,"current_payload":{"id":"$id","title":"服务器冲突笔记"}}]}""")
+            else {assertEquals(7L,c["expected_version"].asLong);json("""{"applied":[{"operation_id":"${c["operation_id"].asString}","entity_type":"page","entity_id":"$id","version":8,"cursor":2}],"conflicts":[]}""")}
+        }}
+        client.sync(settings())
+        assertEquals("delete",database.dao().apiOutbox(workspace).single().operation)
+        assertNull(database.dao().get(id))
+        client.sync(settings())
+        assertTrue(database.dao().apiOutbox(workspace).isEmpty())
+        assertEquals(2,pushes)
+    }
+
     @Test fun `asset pull verifies checksum and removes partial download`()=runBlocking {
         database.dao().put(NoteEntity(id="page",dirty=false))
         server.enqueue(json("""{"cursor":1,"has_more":false,"changes":[

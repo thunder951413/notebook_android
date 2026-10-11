@@ -241,6 +241,26 @@ class ApiSyncClient(
     suspend fun queueStep(workspaceId:String,step:TodoStepEntity)=enqueue(workspaceId,"task_step",step.id,"upsert",stepPayload(step))
     suspend fun queueAsset(workspaceId:String,asset:AssetEntity)=enqueue(workspaceId,"asset",asset.id,"upsert",assetPayload(asset))
     suspend fun queueDelete(workspaceId:String,type:String,id:String)=enqueue(workspaceId,type,id,"delete",JsonObject())
+    internal suspend fun noteDeletionOperation(workspaceId:String,type:String,id:String,pageId:String):ApiSyncOutboxEntity{
+        val expected=maxOf(dao.apiOutboxHeader(type,id)?.expectedVersion?:0L,dao.apiVersion(versionKey(workspaceId,type,id))?.version?:0L)
+        val payload=JsonObject().apply{addProperty(if(type=="page_link")"sourcePageId" else "pageId",pageId)}
+        return ApiSyncOutboxEntity(UUID.randomUUID().toString(),workspaceId,type,id,expected,"delete",gson.toJson(payload))
+    }
+    /** Consume old remote state after an explicit permanent deletion. Advance
+     * its baseline so the queued delete resolves, rather than reopens, a conflict. */
+    internal suspend fun consumeChangeForDeletedPage(workspaceId:String,type:String,id:String,payload:JsonObject,version:Long):Boolean{
+        val pending=dao.apiOutboxItem(type,id)
+        val pageId=(if(type=="page"||type=="document")id else payload.optionalString(if(type=="page_link")"sourcePageId" else "pageId"))
+            ?: pending?.payloadJson?.let{pageIdFor(type,id,JsonParser.parseString(it).asJsonObject)}
+            ?: pageIdFor(type,id,payload) ?: return false
+        if(dao.tombstone("note|$pageId")==null)return false
+        val newest=maxOf(dao.apiVersion(versionKey(workspaceId,type,id))?.version?:0L,version)
+        dao.putApiVersion(ApiSyncVersionEntity(versionKey(workspaceId,type,id),newest))
+        if(pending!=null&&pending.workspaceId==workspaceId){
+            dao.putApiOutbox(pending.copy(expectedVersion=maxOf(pending.expectedVersion,newest),operation="delete",payloadJson=gson.toJson(JsonObject().apply{addProperty(if(type=="page_link")"sourcePageId" else "pageId",pageId)})))
+        }
+        return true
+    }
     suspend fun queueReadingPosition(workspaceId:String,p:ReadingPositionEntity)=enqueue(workspaceId,"reading_position",p.noteId,"upsert",JsonObject().apply{
         addProperty("id",p.noteId);addProperty("pageId",p.noteId);addProperty("anchorUtf16Offset",p.anchorUtf16Offset);addProperty("viewportOffsetFraction",p.viewportOffsetFraction);addProperty("updatedAt",iso(p.updatedAt));addProperty("deviceId",p.deviceId)
     })
@@ -279,7 +299,21 @@ class ApiSyncClient(
         val root=response.use{JsonParser.parseString(it.body?.string().orEmpty()).asJsonObject}
         val sentById=outgoing.associateBy{it.id}
         root["applied"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val operationId=item.string("operation_id");val type=item.string("entity_type");val id=SyncEntityIdentityContract.requireEntityId(type,item.string("entity_id"));val version=item["version"].asLong;dao.deleteApiOutboxById(operationId);dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),version));if(type=="page")dao.get(id)?.let{dao.put(it.copy(dirty=false,lastSyncedVersion=version))};if(type=="asset")dao.getAsset(id)?.let{dao.putAssets(listOf(it.copy(dirty=false)))};if(type=="reading_position"){val payload=sentById[operationId]?.payloadJson?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()};val noteId=payload?.optionalString("pageId");val updatedAt=payload?.optionalMillis("updatedAt");if(noteId!=null&&updatedAt!=null)dao.markReadingPositionSynced(noteId,updatedAt)}}
-        root["conflicts"]?.asJsonArray?.forEach{raw->val item=raw.asJsonObject;val type=item.string("entity_type");val id=SyncEntityIdentityContract.requireEntityId(type,item.string("entity_id"));val currentVersion=item["current_version"].asLong;dao.deleteApiOutboxById(item.string("operation_id"));dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),currentVersion));pageIdFor(type,id,item["current_payload"]?.asJsonObject)?.let{pageId->recordConflict(pageId,type,item["current_payload"]?.asJsonObject?:JsonObject())}}
+        root["conflicts"]?.asJsonArray?.forEach{raw->
+            val item=raw.asJsonObject
+            val type=item.string("entity_type");val id=SyncEntityIdentityContract.requireEntityId(type,item.string("entity_id"))
+            val currentVersion=item["current_version"].asLong
+            val sent=sentById[item.string("operation_id")]
+            val payload=item["current_payload"]?.asJsonObject?:JsonObject()
+            val owner=sent?.payloadJson?.let{pageIdFor(type,id,JsonParser.parseString(it).asJsonObject)}
+            dao.deleteApiOutboxById(item.string("operation_id"))
+            dao.putApiVersion(ApiSyncVersionEntity(versionKey(s.workspaceId,type,id),currentVersion))
+            if(sent?.operation=="delete"&&owner!=null&&dao.tombstone("note|$owner")!=null){
+                // An optimistic-lock rejection must leave the deletion durable.
+                // A new operation id retries against the server's current version.
+                if(dao.apiOutboxHeader(type,id)==null)dao.putApiOutbox(noteDeletionOperation(s.workspaceId,type,id,owner))
+            }else pageIdFor(type,id,payload)?.let{pageId->recordConflict(pageId,type,payload)}
+        }
     }
 
     private suspend fun pullAll(s:ApiSyncSettings,downloadBudget:RemoteTransferLimits.Budget) {
@@ -299,6 +333,7 @@ class ApiSyncClient(
         // Delete rows from older peers may have no payload at all. Their ID is
         // still validated, while upserts validate relation fields as well.
         if(operation=="delete")SyncEntityIdentityContract.requireEntityId(type,id) else SyncEntityIdentityContract.requireChange(type,id,payload)
+        if(consumeChangeForDeletedPage(s.workspaceId,type,id,payload,version))return
         val pending=dao.apiOutboxItem(type,id);val affectedPage=pageIdFor(type,id,payload);val locallyDirty=affectedPage?.let{dao.get(it)?.dirty}==true
         if((pending!=null&&version>pending.expectedVersion)||locallyDirty){
             affectedPage?.let{recordConflict(it,type,payload)}
@@ -399,7 +434,11 @@ class ApiSyncClient(
 
     internal suspend fun applyDelete(type:String,id:String,p:JsonObject){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);deleteNoteAndAssets(id)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->deleteAssetAndFile(id);"page_link"->dao.deletePageLink(id);"revision"->dao.deleteRemoteRevision(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
     internal suspend fun deleteAssetAndFile(id:String){dao.getAsset(id)?.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)};dao.deleteAsset(id)}
-    internal suspend fun deleteNoteAndAssets(noteId:String){dao.assets(noteId).forEach{asset->asset.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)}};dao.deleteRemoteRevisionsForNote(noteId);dao.deleteNotePermanently(noteId)}
+    internal suspend fun deleteNoteAndAssets(noteId:String){
+        val assets=dao.assets(noteId)
+        dao.permanentlyDeleteNote(TombstoneEntity("note|$noteId",noteId,"note",System.currentTimeMillis(),"00000000-0000-4000-8000-000000000000"),emptyList())
+        assets.forEach{asset->asset.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)}}
+    }
 
     internal fun stepPayload(s:TodoStepEntity)=JsonObject().apply{addProperty("id",s.id);addProperty("pageId",s.noteId);addProperty("text",s.text);addProperty("checked",s.checked);addProperty("sortOrder",s.sortOrder);addProperty("createdAt",iso(s.createdAt))}
     internal fun assetPayload(a:AssetEntity)=JsonObject().apply{addProperty("id",a.id);addProperty("pageId",a.noteId);addProperty("kind",a.kind);addProperty("filename",a.filename);addProperty("mimeType",a.mimeType);addProperty("byteSize",a.size);addProperty("checksum",a.contentHash);addProperty("createdAt",iso(File(a.localPath?:"").takeIf(File::exists)?.lastModified()?:System.currentTimeMillis()))}

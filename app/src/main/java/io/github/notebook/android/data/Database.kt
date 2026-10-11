@@ -224,7 +224,26 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putAssets(items:List<AssetEntity>)
     @Query("DELETE FROM assets WHERE id=:id") suspend fun deleteAsset(id:String)
     @Query("SELECT * FROM tombstones") suspend fun tombstones():List<TombstoneEntity>
+    @Query("SELECT * FROM tombstones WHERE itemKey=:itemKey") suspend fun tombstone(itemKey:String):TombstoneEntity?
     @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putTombstone(item:TombstoneEntity)
+    /** Commit the user's irreversible deletion and its outgoing operations together. */
+    @Transaction suspend fun permanentlyDeleteNote(tombstone:TombstoneEntity,operations:List<ApiSyncOutboxEntity>){
+        val id=tombstone.itemId
+        assets(id).forEach{deleteApiOutbox("asset",it.id)}
+        steps(id).forEach{deleteApiOutbox("task_step",it.id)}
+        pageLinks(id).forEach{deleteApiOutbox("page_link",it.id)}
+        remoteRevisionHeaders(id).forEach{deleteApiOutbox("revision",it.id)}
+        getNoteHeader(id)?.tagIds?.split(',')?.filter(String::isNotBlank)?.forEach{deleteApiOutbox("page_tag","$id:$it")}
+        listOf("page","document","reading_position").forEach{deleteApiOutbox(it,id)}
+        operations.forEach{deleteApiOutbox(it.entityType,it.entityId);putApiOutbox(it)}
+        putTombstone(tombstone)
+        deleteDraft(id)
+        deleteApiDocument(id)
+        deleteApiPage(id)
+        deleteReadingPosition(id)
+        deleteRemoteRevisionsForNote(id)
+        deleteNotePermanently(id)
+    }
     @Upsert suspend fun putDraft(draft:DraftEntity)
     @Query("SELECT * FROM drafts") suspend fun allDrafts():List<DraftEntity>
     @Query("SELECT noteId FROM drafts ORDER BY updatedAt") suspend fun draftNoteIds():List<String>

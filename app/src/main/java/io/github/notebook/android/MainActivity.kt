@@ -572,7 +572,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     if(tagsSheet)NoteTagsSheet(tags,n.tagIds,{tagsSheet=false},{updateNote(n.copy(tagIds=it))}){name->scope.launch{val id=UUID.randomUUID().toString();repo.saveTag(name,id=id);updateNote(n.copy(tagIds=(n.tagIds.split(',').filter(String::isNotBlank)+id).joinToString(",")))}}
     if(exportSheet)ExportSheet(n,{exportSheet=false}){repo.flushDraft(latestDraft.value).join();check(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){"请先重试保存笔记"}}
     if(editorOutline)ModalBottomSheet(onDismissRequest={editorOutline=false}){SheetTitle("目录",{editorOutline=false});val headings=editorDocument?.headings.orEmpty();if(headings.isEmpty())Text("添加标题后，这里会出现目录",Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.heightIn(max=440.dp)){items(headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title)},modifier=Modifier.padding(start=((heading.level-1)*14).dp).clickable{bodyValue=bodyValue.copy(selection=TextRange(heading.sourceOffsetUtf16));editorOutline=false})}};Spacer(Modifier.height(24.dp))}
-    if(permanentConfirm)AlertDialog(onDismissRequest={permanentConfirm=false},title={Text("彻底删除笔记？")},text={Text("此操作无法恢复。")},confirmButton={Button({permanentConfirm=false;scope.launch{repo.deletePermanently(n.id);onDone(n)}},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("彻底删除")}},dismissButton={TextButton({permanentConfirm=false}){Text("取消")}})
+    if(permanentConfirm)AlertDialog(onDismissRequest={permanentConfirm=false},title={Text("彻底删除笔记？")},text={Text("此操作无法恢复。")},confirmButton={Button({permanentConfirm=false;scope.launch{runCatching{repo.deletePermanently(n.id)}.onSuccess{onDone(n)}.onFailure{editorMessage="彻底删除失败：${it.localizedMessage?:"请重试"}"}}},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("彻底删除")}},dismissButton={TextButton({permanentConfirm=false}){Text("取消")}})
     if(referencePicker)ReferencePickerDialog(
         notes=visibleReferenceNotes(allNotes,n.id,encryptedUnlocked,repo::isEncrypted),
         onDismiss={referencePicker=false},
@@ -879,7 +879,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 }
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                     OutlinedButton({testWebdavNow()},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在检测…" else "检测连接")}
-                    Button({repo.saveWebdavSettings(w);backend=SyncBackend.WEBDAV;scope.launch{syncNow()}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
+                    Button({runCatching{repo.saveWebdavSettings(w)}.onSuccess{backend=SyncBackend.WEBDAV;scope.launch{syncNow()}}.onFailure{message=it.localizedMessage?:"同步配置保存失败，请重试";isError=true}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
                 }
             }
             OutlinedCard(onClick={showLegacySync=!showLegacySync},modifier=Modifier.fillMaxWidth()){

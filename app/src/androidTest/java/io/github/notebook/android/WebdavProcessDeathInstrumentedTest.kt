@@ -12,6 +12,7 @@ import io.github.notebook.android.sync.WebdavJournalProtocol
 import io.github.notebook.android.sync.WebdavSettings
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -44,6 +45,7 @@ class WebdavProcessDeathInstrumentedTest {
         WorkManager.getInstance(app).cancelAllWork().result.get()
         app.repository.flushAll();app.database.clearAllTables()
         app.repository.saveWebdavSettings(settings())
+        assertEquals(io.github.notebook.android.sync.SyncBackend.WEBDAV,app.repository.syncBackend())
         val id=UUID.randomUUID().toString()
         val marker="PROCESS-DEATH-${UUID.randomUUID()}"
         val note=NoteEntity(id=id,title=marker,body="$marker-body",dirty=true)
@@ -56,6 +58,7 @@ class WebdavProcessDeathInstrumentedTest {
     @Test fun offlineRestartKeepsPendingChange()=runBlocking {
         assumeTrue("Requires host-driven offline phase",InstrumentationRegistry.getArguments().getString("processDeathPhase")=="offline")
         val app=app()
+        assertEquals(io.github.notebook.android.sync.SyncBackend.WEBDAV,app.repository.syncBackend())
         WorkManager.getInstance(app).cancelAllWork()
         val id=app.getSharedPreferences(stateName,0).getString("noteId",null)!!
         val failed=runCatching{app.repository.sync()}
@@ -67,6 +70,7 @@ class WebdavProcessDeathInstrumentedTest {
     @Test fun restoredNetworkPublishesPendingChange()=runBlocking {
         assumeTrue("Requires host-driven restored phase",InstrumentationRegistry.getArguments().getString("processDeathPhase")=="restored")
         val app=app()
+        assertEquals(io.github.notebook.android.sync.SyncBackend.WEBDAV,app.repository.syncBackend())
         WorkManager.getInstance(app).cancelAllWork()
         val state=app.getSharedPreferences(stateName,0)
         val id=state.getString("noteId",null)!!

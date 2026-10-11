@@ -37,7 +37,7 @@
 ## 可安装构建与复现
 
 ```bash
-VERSION_CODE=10042 VERSION_NAME=0.4.0-ui.1 \
+VERSION_CODE=10043 VERSION_NAME=0.4.0-ui.2 \
 JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
 ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
 ./gradlew testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
@@ -61,3 +61,15 @@ adb -s emulator-5554 shell am start -W \
 - 普通录音使用原生录音与资源链路，不包含转写。媒体通过应用图片呈现或系统兼容查看器打开。
 
 最终验收报告、截图、录屏与 APK 位于桌面工作区 `docs/audits/2026-10-11/android-ui-implementation-report.md` 和 `output/android-ui-implementation-2026-10-11/`；这些本地取证文件不随独立 Android 仓库发布。
+
+## 2026-10-11 冲突笔记彻底删除修复
+
+用户报告旧版笔记同步冲突后移入回收站，冲突详情的“彻底删除”看似没有反应。旧版详情按钮只调用 repository，不关闭详情；当前界面已在成功后退出，并补充删除失败提示。共享数据层的两条复活路径也已复现：退出编辑器的迟到草稿重新插入已删记录，WebDAV pull-first 重放远端冲突内容后丢失删除结果；SFTP 同样缺少本地 tombstone 拉取保护。
+
+`0.4.0-ui.2-debug` 的永久删除与同步/保存互斥，取消待保存草稿，在 Room 事务中提交 tombstone、删除 outbox，并清理笔记、草稿、API 投影及关联数据。附件/步骤等待发送 upsert 被替换为归属明确的 delete，避免先删正文却残留上传任务。持久 tombstone 阻止退出保存、重启恢复、WebDAV/API 旧记录重放与 SFTP pull 复活同一个 ID；HTTP API 乐观锁拒绝删除时保留新版本基线上的重试操作。
+
+进程恢复验收另复现 WebDAV 配置异步写入后立即终止进程会读回旧 SFTP 配置。`saveWebdavSettings` 改为确认落盘，配置保存失败由设置页面显示；主机阶段加入后端断言，避免“断网失败”实际走错后端仍被计为通过。
+
+聚焦回归覆盖冲突详情、回收站多选、迟到已删草稿、重启恢复、子页面及关联 outbox、不相关笔记保留、WebDAV 双端真实冲突、新设备恢复、SFTP 双端冲突与 HTTP API 删除重试。最终单元测试 178 项通过；设备回归 47 项通过。完整设备运行的 5 项条件跳过包括 3 个需主机按顺序驱动的进程死亡阶段，另行执行且通过；其余 2 项依赖未配置外部 API 和旧 SFTP 服务。
+
+本轮本地取证与新版 APK 位于桌面工作区 `output/android-conflict-delete-2026-10-11/`；设备为隔离 API 35 模拟器 `emulator-5554`，测试服务仅使用本机 2222/2223 端口。实际手机旧安装和生产同步目录未在本轮修改。

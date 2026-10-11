@@ -295,7 +295,7 @@ class WebdavSyncClient(
                         blockedEntities.add(entity);continue
                     }
                     val parent=requiredParentPage(entry)
-                    if(parent!=null && dao.getNoteHeader(parent)==null) {
+                    if(parent!=null && dao.getNoteHeader(parent)==null && dao.tombstone("note|$parent")==null) {
                         blockedEntities.add(entity)
                         continue
                     }
@@ -383,6 +383,7 @@ class WebdavSyncClient(
         } catch (error: IllegalArgumentException) {
             throw IllegalArgumentException("云端 $type 记录（序号 ${entry.seq}）：${error.message}", error)
         }
+        if(api.consumeChangeForDeletedPage(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,type,id,payload,version+1))return true
         // Compare the actual document, rather than an external-object marker,
         // when a retained cursor causes an already applied record to replay.
         if (type == "document" && operation == "upsert") {

@@ -157,6 +157,45 @@ class WebdavSyncTest {
         addProperty("createdAt","2026-08-04T00:00:00Z");addProperty("updatedAt","2026-08-04T00:00:00Z")
     }
 
+    @Test fun `permanent deletion consumes conflicted remote edits and publishes deletes without resurrection`() = runBlocking {
+        database.dao().put(note())
+        client.sync(settings())
+        val peer = "30000000-0000-4000-8000-000000000002"
+        val document = JsonObject().apply {
+            addProperty("pageId", noteId); addProperty("markdown", "服务器冲突正文")
+            add("tiptapJson", TipTapCodec.encode("服务器冲突正文")); addProperty("updatedAt", "2026-08-04T00:00:00Z")
+        }
+        webdav.putJournal(peer, listOf(
+            remoteEntry(1, "page", noteId, remotePage().apply { addProperty("title", "服务器冲突标题") }, version = 1),
+            remoteEntry(2, "document", noteId, document, version = 1),
+            remoteEntry(3, "tag", "after-deletion", JsonObject().apply { addProperty("id", "after-deletion"); addProperty("name", "后续记录") }),
+        ))
+        val edited = database.dao().get(noteId)!!.copy(title = "本机冲突标题", dirty = true)
+        database.dao().put(edited); api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, edited)
+        client.sync(settings())
+        assertTrue(database.dao().get(noteId)!!.conflict)
+        database.dao().putTombstone(io.github.notebook.android.data.TombstoneEntity("note|$noteId", noteId, "note", System.currentTimeMillis(), deviceId))
+        api.queueDelete(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "document", noteId)
+        api.queueDelete(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "page", noteId)
+        database.dao().deleteApiDocument(noteId); database.dao().deleteApiPage(noteId)
+        database.dao().deleteNotePermanently(noteId)
+        client.sync(settings())
+        client.sync(settings())
+        assertNull("远端冲突版本不能复活已彻底删除的笔记", database.dao().get(noteId))
+        assertNotNull("已解决的删除不能继续阻挡后面的日志", database.dao().getTag("after-deletion"))
+        assertTrue(database.dao().apiOutbox(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID).isEmpty())
+        val deletes = webdav.journalText(deviceId)!!.lineSequence().filter(String::isNotBlank).map { JsonParser.parseString(it).asJsonObject }.filter { it["op"].asString == "delete" }.toList()
+        assertEquals(setOf("page", "document"), deletes.map { it["type"].asString }.toSet())
+        assertTrue(deletes.all { it["ver"].asLong == 2L })
+        val fresh = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), NotebookDatabase::class.java).allowMainThreadQueries().build()
+        try {
+            val freshPrefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences(UUID.randomUUID().toString(), 0)
+            val freshClient = WebdavSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), freshPrefs, ApiSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), allowInsecureHttp = true), allowInsecureHttp = true)
+            freshClient.sync(settings())
+            assertNull("新设备只应恢复删除结果", fresh.dao().get(noteId))
+        } finally { fresh.close() }
+    }
+
     @Test fun `empty replica adopts compacted successors before old peer snapshots without conflicts`() = runBlocking {
         val old=remotePage().apply{addProperty("title","old bootstrap")}
         val latest=remotePage().apply{addProperty("title","current desktop")}
