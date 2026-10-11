@@ -115,6 +115,8 @@ class DatabaseTest {
         val moved=repository.movePage("page","parent")
         assertEquals("parent",moved.parentPageId)
         assertEquals("folder-b",moved.folderId)
+        assertEquals("folder-b",dao.get("child")!!.folderId)
+        assertEquals("page",dao.get("child")!!.parentPageId)
         val error=runCatching{repository.movePage("page","child")}.exceptionOrNull()
         assertNotNull(error)
     }

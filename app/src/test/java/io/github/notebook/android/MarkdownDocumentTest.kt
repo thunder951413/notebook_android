@@ -64,4 +64,11 @@ class MarkdownDocumentTest {
         assertEquals(source.length, document.blocks.last().endUtf16)
         assertTrue(document.blocks.map { it.id }.toSet().size == document.blocks.size)
     }
+    @Test fun `paragraph block boundaries never split an emoji surrogate pair`() {
+        val source = "a" + "😀".repeat(5000)
+        val blocks = MarkdownDocumentParser.parse(source, preferredBlockChars=1024).blocks
+        assertEquals(source,blocks.joinToString(""){it.text})
+        assertTrue(blocks.all { !Character.isLowSurrogate(it.text.first()) && !Character.isHighSurrogate(it.text.last()) })
+    }
+
 }

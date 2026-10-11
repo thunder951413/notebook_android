@@ -197,6 +197,9 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("UPDATE notes SET dirty=0,lastSyncedVersion=:version,conflict=0,conflictSnapshotJson=NULL,snapshotJson=COALESCE(:snapshotJson,snapshotJson) WHERE id=:id AND version=:version") suspend fun markSynced(id:String,version:Long,snapshotJson:String?=null)
     @Query("DELETE FROM notes WHERE id=:id") suspend fun deleteNotePermanently(id:String)
     @Query("SELECT * FROM folders ORDER BY sortOrder") fun observeFolders():Flow<List<FolderEntity>>
+    @Query("SELECT * FROM assets ORDER BY noteId") fun observeAllAssets():Flow<List<AssetEntity>>
+    @Query("SELECT id FROM notes WHERE deletedAt IS NULL AND (body LIKE '%https://%' OR body LIKE '%http://%' OR body LIKE '%[[page:%')") fun observeLinkNoteIds():Flow<List<String>>
+    @Query("SELECT substr(body, max(1,instr(lower(body),lower(:query))-32),180) FROM notes WHERE id=:id") suspend fun searchSnippet(id:String,query:String):String?
     @Query("SELECT * FROM folders") suspend fun allFolders():List<FolderEntity>
     @Query("SELECT * FROM folders WHERE id=:id") suspend fun getFolder(id:String):FolderEntity?
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putFolders(items:List<FolderEntity>)

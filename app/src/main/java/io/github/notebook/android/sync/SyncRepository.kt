@@ -1,5 +1,7 @@
 package io.github.notebook.android.sync
 
+import kotlinx.coroutines.flow.first
+
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -13,6 +15,9 @@ import io.github.notebook.android.data.*
 import io.github.notebook.android.NotebookReference
 import io.github.notebook.android.NotebookReferenceSyntax
 import io.github.notebook.android.reminder.Reminders
+import io.github.notebook.android.diagnostics.DiagnosticEvent
+import io.github.notebook.android.diagnostics.DiagnosticLevel
+import io.github.notebook.android.diagnostics.DiagnosticLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
@@ -231,6 +236,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     val noteSaveStates=_noteSaveStates.asStateFlow()
     private data class RemoteRepositoryWriteLock(val path:String,val ownerID:String){val ownerPath="$path/${RemoteRepositoryLockContract.OWNER_FILE_NAME}"}
     private fun setSaveState(noteId:String,state:NoteSaveState){_noteSaveStates.update{it+mapOf(noteId to state)}}
+    suspend fun hasStoredNote(noteId:String)=withContext(Dispatchers.IO){dao.getNoteHeader(noteId)!=null}
+    fun discardUnsavedMarker(noteId:String){_noteSaveStates.update{it-noteId}}
     fun markUnsaved(noteId:String){setSaveState(noteId,NoteSaveState.Pending)}
     fun acknowledgeSaved(noteId:String){_noteSaveStates.update{states->if(states[noteId]==NoteSaveState.Saved)states-noteId else states}}
     fun clearSaveError(){_saveError.value=null}
@@ -331,13 +338,13 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun moveEncrypted(noteId:String,folderId:String)=markEncrypted(noteId,folderId)
     private fun encryptedNoteIds():Set<String> = runCatching{gson.fromJson(prefs.getString("encryptedNoteIds","[]"),Array<String>::class.java).toSet()}.getOrDefault(emptySet())
     private fun encryptedMappings():Map<String,String> = runCatching{gson.fromJson(prefs.getString("encryptedMappings","{}"),JsonObject::class.java).entrySet().associate{it.key to it.value.asString}}.getOrDefault(emptyMap())
-    suspend fun save(n:NoteEntity):NoteEntity{setSaveState(n.id,NoteSaveState.Saving);return try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));persistDraft(n).also{setSaveState(n.id,NoteSaveState.Saved)}}catch(error:Throwable){setSaveState(n.id,NoteSaveState.Failed);throw error}}
-    fun queueDraft(n:NoteEntity){if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return;setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
-    fun flushDraft(n:NoteEntity):Job{if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return appScope.launch{};setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
+    suspend fun save(n:NoteEntity,restoring:Boolean=false):NoteEntity{setSaveState(n.id,NoteSaveState.Saving);return try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));persistDraft(n,restoring).also{setSaveState(n.id,NoteSaveState.Saved)}}catch(error:Throwable){setSaveState(n.id,NoteSaveState.Failed);throw error}}
+    fun queueDraft(n:NoteEntity){if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return;setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=DiagnosticLogger.operationId(),resourceId=n.id,error=error);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
+    fun flushDraft(n:NoteEntity):Job{if(n.deletedAt==null&&trashedNoteIds.contains(n.id))return appScope.launch{};val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=operationId,resourceId=n.id,error=error,durationMs=System.currentTimeMillis()-startedAt);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
     fun flushAllAsync(){pendingDrafts.values.toList().forEach(::flushDraft)}
-    suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);throw error}}}
-    suspend fun recoverDrafts(){dao.draftNoteIds().forEach{id->readLargeText(dao.draftPayloadLength(id)){start,length->dao.draftPayloadChunk(id,start,length)}?.let{payload->runCatching{gson.fromJson(payload,NoteEntity::class.java)}.getOrNull()?.let{persistDraft(it)}}}}
-    fun recoverDraftsAsync(){appScope.launch{runCatching{recoverDrafts()}.onFailure{_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
+    suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=operationId,resourceId=draft.id,error=error,durationMs=System.currentTimeMillis()-startedAt);throw error}}}
+    suspend fun recoverDrafts():Int{var recovered=0;dao.draftNoteIds().forEach{id->val payload=readLargeText(dao.draftPayloadLength(id)){start,length->dao.draftPayloadChunk(id,start,length)}?:return@forEach;val draft=runCatching{gson.fromJson(payload,NoteEntity::class.java)}.onFailure{DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_RECOVERY_FAILURE,operationId=DiagnosticLogger.operationId(),resourceId=id,error=it)}.getOrNull()?:return@forEach;persistDraft(draft);recovered++};return recovered}
+    fun recoverDraftsAsync(){val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.DRAFT_RECOVERY_START,operationId=operationId);appScope.launch{runCatching{recoverDrafts()}.onSuccess{DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.DRAFT_RECOVERY_SUCCESS,operationId=operationId,durationMs=System.currentTimeMillis()-startedAt,counts=mapOf("recovered" to it.toLong()))}.onFailure{DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_RECOVERY_FAILURE,operationId=operationId,error=it,durationMs=System.currentTimeMillis()-startedAt);_saveError.value="恢复本地草稿失败：${it.localizedMessage}"}}}
     fun rebuildReferenceIndexAsync(){appScope.launch{runCatching{dao.allNoteIds().forEach{id->loadEditable(id)?.let{indexReferences(it)}}}.onFailure{_saveError.value="重建双链索引失败：${it.localizedMessage}"}}}
 
     suspend fun readingPosition(noteId:String)=withContext(Dispatchers.IO){dao.readingPosition(noteId)}
@@ -379,9 +386,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         }
     }
 
-    private suspend fun persistDraft(draft:NoteEntity):NoteEntity=saveMutex.withLock{
+    private suspend fun persistDraft(draft:NoteEntity,restoring:Boolean=false):NoteEntity=saveMutex.withLock{
         val current=loadEditable(draft.id)
-        if(current?.deletedAt!=null&&draft.deletedAt==null){
+        if(!restoring&&current?.deletedAt!=null&&draft.deletedAt==null){
             trashedNoteIds.add(draft.id)
             dao.deleteDraft(draft.id)
             return@withLock current
@@ -392,8 +399,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.icon==b.icon&&a.parentPageId==b.parentPageId&&a.sortOrder==b.sortOrder&&a.treeUpdatedAt==b.treeUpdatedAt&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important&&a.viewMode==b.viewMode
     private suspend fun subtree(id:String):List<NoteEntity>{
-        val notes=dao.allNotes();val result=mutableListOf<NoteEntity>();val queue=ArrayDeque<String>().apply{add(id)};val seen=mutableSetOf<String>()
-        while(queue.isNotEmpty()){val current=queue.removeFirst();if(!seen.add(current))continue;notes.firstOrNull{it.id==current}?.let(result::add);notes.filter{it.parentPageId==current}.forEach{queue.add(it.id)}}
+        val notes=dao.observeNoteSummaries().first();val result=mutableListOf<NoteEntity>();val queue=ArrayDeque<String>().apply{add(id)};val seen=mutableSetOf<String>()
+        while(queue.isNotEmpty()){val current=queue.removeFirst();if(!seen.add(current))continue;loadEditable(current)?.let(result::add);notes.filter{it.parentPageId==current}.forEach{queue.add(it.id)}}
         return result
     }
     suspend fun moveToTrash(id:String){
@@ -403,29 +410,106 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             targets.forEach{target->val pending=pendingDrafts.remove(target.id);draftJobs.remove(target.id)?.cancelAndJoin();save((pending?:target).copy(deletedAt=deletedAt))}
         }catch(error:Throwable){targets.forEach{trashedNoteIds.remove(it.id)};throw error}
     }
-    suspend fun restore(id:String){subtree(id).forEach{note->trashedNoteIds.remove(note.id);save(note.copy(deletedAt=null))}}
-    suspend fun movePage(id:String,parentId:String?):NoteEntity{
+    suspend fun restore(id:String){subtree(id).forEach{note->
+        draftJobs.remove(note.id)?.cancelAndJoin();pendingDrafts.remove(note.id)
+        trashedNoteIds.remove(note.id)
+        save(note.copy(deletedAt=null),restoring=true)
+    }}
+    suspend fun movePage(id:String,parentId:String?):NoteEntity=syncMutex.withLock{
+        flushAll()
         val page=loadEditable(id)?:error("页面不存在")
         require(parentId!=id){"不能把页面移动到自身下面"}
-        val all=dao.allNotes()
+        val all=dao.observeNoteSummaries().first()
         val descendants=mutableSetOf(id)
         var changed=true
         while(changed){changed=false;all.filter{it.parentPageId in descendants}.forEach{if(descendants.add(it.id))changed=true}}
         require(parentId !in descendants){"不能把页面移动到自己的子页面下面"}
         val parent=parentId?.let{target->all.firstOrNull{it.id==target&&it.deletedAt==null&&it.itemType=="note"}?:error("目标页面不存在")}
+        require(parent==null||isEncrypted(parent)==isEncrypted(page)){"私密页面与普通页面不能互相移动"}
+        val targetFolder=if(parent==null)page.folderId else parent.folderId
+        val targetName=if(parent==null)page.folderName else parent.folderName
+        val privateFolder=if(parent==null)encryptedFolderId(page) else encryptedFolderId(parent)
+        val now=System.currentTimeMillis()
         val siblings=all.filter{it.parentPageId==parentId&&it.id!=id&&it.deletedAt==null}
-        return save(page.copy(
-            parentPageId=parentId,
-            folderId=parent?.folderId?:page.folderId,
-            folderName=parent?.folderName?:page.folderName,
-            sortOrder=(siblings.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,
-            treeUpdatedAt=System.currentTimeMillis()
-        ))
+        val result=save(page.copy(parentPageId=parentId,folderId=targetFolder,folderName=targetName,sortOrder=(siblings.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,treeUpdatedAt=now))
+        subtree(id).forEach{note->
+            if(privateFolder!=null)moveEncrypted(note.id,privateFolder)
+            if(note.id!=id)save(note.copy(folderId=targetFolder,folderName=targetName,treeUpdatedAt=now))
+        }
+        result
     }
     suspend fun deletePermanently(id:String){subtree(id).forEach{note->Reminders.cancel(appContext,note.id);dao.putTombstone(TombstoneEntity("note|${note.id}",note.id,"note",System.currentTimeMillis(),deviceId()));if(syncBackend()!=SyncBackend.SSH){val w=syncWorkspaceId();apiSync.queueDelete(w,"document",note.id);apiSync.queueDelete(w,"page",note.id)};dao.assets(note.id).forEach{asset->asset.localPath?.let{path->java.io.File(path)}?.let{file->AttachmentStorageContract.deleteIfContained(appContext,file)}};dao.deleteReadingPosition(note.id);dao.deleteRemoteRevisionsForNote(note.id);dao.deleteNotePermanently(note.id)};requestSyncIfConfigured()}
     suspend fun keepLocal(id:String){loadEditable(id)?.let{local->if(syncBackend()!=SyncBackend.SSH){val kept=local.copy(updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null);dao.put(kept);apiSync.queueNote(syncWorkspaceId(),kept);requestSyncIfConfigured()}else{val remoteVersion=loadConflictSnapshot(id)?.let{payload->runCatching{val remote=JsonParser.parseString(payload).asJsonObject;if(remote["schemaVersion"]?.asInt==3)remote["metadata"].asJsonObject["legacyVersion"]?.asLong?:remote["metadata"].asJsonObject.isoMs("updatedAt") else remote["metadata"].asJsonObject["version"].asLong}.getOrNull()}?:0;dao.put(local.copy(snapshotJson=loadSnapshot(id),version=maxOf(local.version,remoteVersion)+1,updatedAt=System.currentTimeMillis(),dirty=true,conflict=false,conflictSnapshotJson=null))}}}
     suspend fun acceptRemote(id:String){val local=loadEditable(id)?:return;val snapshot=loadConflictSnapshot(id)?.let{runCatching{JsonParser.parseString(it).asJsonObject}.getOrNull()}?:return;if(syncBackend()!=SyncBackend.SSH&&snapshot.has("apiConflicts")){snapshot["apiConflicts"].asJsonObject.entrySet().forEach{(type,payload)->apiSync.acceptConflict(syncWorkspaceId(),type,id,payload.asJsonObject)}}else if(syncBackend()!=SyncBackend.SSH&&snapshot.has("apiEntityType")){apiSync.acceptConflict(syncWorkspaceId(),snapshot["apiEntityType"].asString,id,snapshot["payload"].asJsonObject)}else{val remote=if(snapshot["schemaVersion"]?.asInt==3)fromMarkdownEnvelope(snapshot)else fromEnvelope(JsonObject().apply{addProperty("noteID",id);add("currentSnapshot",snapshot)});val accepted=remote.copy(version=maxOf(local.version,remote.version)+1,dirty=true,conflict=false,conflictSnapshotJson=null,lastSyncedVersion=local.lastSyncedVersion);dao.put(accepted);indexReferences(accepted)}}
-    suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString()){val folder=FolderEntity(id,name,dao.allFolders().size,type);dao.putFolder(folder);if(syncBackend()!=SyncBackend.SSH)apiSync.queueFolder(syncWorkspaceId(),folder);requestSyncIfConfigured()}
+    suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString(),color:String?=null){
+        require(name.isNotBlank()) { "笔记库名称不能为空" }
+        val existing=dao.getFolder(id)
+        val folder=(existing?:FolderEntity(id,name,dao.allFolders().size,type)).copy(name=name.trim(),color=color?:existing?.color,updatedAt=System.currentTimeMillis())
+        dao.putFolder(folder)
+        if(syncBackend()!=SyncBackend.SSH)apiSync.queueFolder(syncWorkspaceId(),folder)
+        requestSyncIfConfigured()
+    }
+    val allAssets=dao.observeAllAssets()
+    val linkNoteIds=dao.observeLinkNoteIds()
+    suspend fun searchSnippet(id:String,query:String):String=dao.searchSnippet(id,query).orEmpty()
+
+    /** Moving a page carries its descendants, retaining the document tree inside one library. */
+    suspend fun moveToLibrary(id:String,folder:FolderEntity?){
+        val root=loadEditable(id)?:error("笔记不存在")
+        require(folder==null||folder.type==if(isEncrypted(root))"encryptedFolder" else if(root.itemType=="todo")"todoList" else "noteFolder") { "目标笔记库类型不匹配" }
+        val isPrivate=isEncrypted(root)
+        require(!isPrivate || folder?.type=="encryptedFolder") { "私密笔记必须留在私密笔记库中" }
+        flushAll()
+        subtree(id).forEach{note->if(isPrivate)moveEncrypted(note.id,folder!!.id);save(note.copy(folderId=folder?.id,folderName=folder?.name?:"未分类",parentPageId=if(note.id==id)null else note.parentPageId,treeUpdatedAt=System.currentTimeMillis()))}
+    }
+    suspend fun dissolveLibrary(id:String,deleteNotes:Boolean){
+        val folder=dao.getFolder(id)?:return
+        require(folder.type=="noteFolder") { "请在原有管理界面处理此文件夹" }
+        flushAll()
+        val targets=dao.observeNoteSummaries().first().filter{it.folderId==id}
+        if(deleteNotes)targets.filter{it.deletedAt==null}.forEach{moveToTrash(it.id)}
+        targets.forEach{target->loadEditable(target.id)?.let{save(it.copy(folderId=null,folderName="未分类",treeUpdatedAt=System.currentTimeMillis()))}}
+        deleteFolder(id)
+    }
+    suspend fun duplicateNote(id:String):NoteEntity=syncMutex.withLock{withContext(Dispatchers.IO){
+        flushAll()
+        val source=(loadEditable(id)?:error("笔记不存在")).copy(snapshotJson=loadSnapshot(id))
+        require(source.deletedAt==null) { "请先恢复笔记" }
+        val copyId=UUID.randomUUID().toString()
+        val assetCopies=dao.assets(id).map{asset->
+            val file=asset.localPath?.let{java.io.File(it)}
+            require(file?.isFile==true) { "附件尚未下载，请同步后再创建副本" }
+            val assetId=UUID.randomUUID().toString()
+            val relative="$copyId/$assetId-${asset.filename}"
+            val target=java.io.File(appContext.filesDir,"attachments/$relative")
+            target.parentFile?.mkdirs();file!!.copyTo(target)
+            asset to asset.copy(id=assetId,noteId=copyId,relativePath=relative,localPath=target.absolutePath,dirty=true)
+        }
+        val assetIds=assetCopies.associate{(old,new)->old.id to new.id}
+        fun remapUris(text:String)=Regex("notebook-asset:([A-Za-z0-9._:-]+)").replace(text){match->assetIds[match.groupValues[1]]?.let{"notebook-asset:$it"}?:match.value}
+        val body=remapUris(source.body)
+        val now=System.currentTimeMillis()
+        if(isEncrypted(source))encryptedFolderId(source)?.let{markEncrypted(copyId,it)}
+        fun remapAssets(json:String?):String?{
+            if(json==null||assetIds.keys.none{json.contains(it)})return json
+            val descriptiveKeys=setOf("filename","title","caption","contenthash","sha256","hash","mimetype")
+            fun walk(value:JsonElement,key:String=""):JsonElement=when{
+                key.lowercase() in descriptiveKeys->value.deepCopy()
+                value.isJsonObject->JsonObject().apply{value.asJsonObject.entrySet().forEach{(name,child)->add(assetIds[name]?:name,walk(child,name))}}
+                value.isJsonArray->JsonArray().apply{value.asJsonArray.forEach{add(walk(it))}}
+                value.isJsonPrimitive&&value.asJsonPrimitive.isString->JsonPrimitive(assetIds[value.asString]?:remapUris(value.asString))
+                else->value.deepCopy()
+            }
+            return walk(JsonParser.parseString(json)).toString()
+        }
+        dao.apiDocument(id)?.let{dao.putApiDocument(it.copy(pageId=copyId,tiptapJson=remapAssets(it.tiptapJson)!!,updatedAt=now))}
+        dao.apiPage(id)?.let{dao.putApiPage(it.copy(pageId=copyId,updatedAt=now))}
+        val copy=save(source.copy(snapshotJson=remapAssets(source.snapshotJson),id=copyId,title="副本 ${source.title}",body=body,createdAt=now,updatedAt=now,parentPageId=null,treeUpdatedAt=now,reminderAt=null,recurrence="none",version=1,lastSyncedVersion=0,conflict=false,conflictSnapshotJson=null,viewMode="preview"))
+        assetCopies.forEach{(_,asset)->dao.putAssets(listOf(asset));if(syncBackend()!=SyncBackend.SSH)apiSync.queueAsset(syncWorkspaceId(),asset)}
+        dao.steps(id).forEach{saveStep(it.copy(id=UUID.randomUUID().toString(),noteId=copyId))}
+        requestSyncIfConfigured()
+        copy
+    }}
     suspend fun deleteFolder(id:String){if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"section",id);dao.deleteFolder(id);dao.putTombstone(TombstoneEntity("folder|$id",id,"folder",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
     suspend fun saveTag(name:String,color:String="gray",id:String=UUID.randomUUID().toString()){val tag=TagEntity(id,name,color);dao.putTag(tag);if(syncBackend()!=SyncBackend.SSH)apiSync.queueTag(syncWorkspaceId(),tag);requestSyncIfConfigured()}
     suspend fun deleteTag(id:String){if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"tag",id);dao.deleteTag(id);dao.putTombstone(TombstoneEntity("tag|$id",id,"tag",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
@@ -439,6 +523,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         var name="attachment";resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use{if(it.moveToFirst())name=it.getString(0)?:name}
         name=name.replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_");val relative="$noteId/$id-$name";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();resolver.openInputStream(uri).use{input->requireNotNull(input){"无法读取附件"}.copyTo(target.outputStream())}
         val kind=when{mime.startsWith("image/")->"image";mime.startsWith("audio/")->"audio";else->"file"};AssetEntity(id,noteId,kind,name,mime,relative,target.absolutePath,target.inputStream().use(::sha),target.length(),true).also{dao.putAssets(listOf(it));if(syncBackend()!=SyncBackend.SSH)apiSync.queueAsset(syncWorkspaceId(),it);loadEditable(noteId)?.let{n->save(n)};requestSyncIfConfigured()}
+    }
+    fun commitRecordedAudioAsync(noteId:String,file:java.io.File):Job=appScope.launch{
+        runCatching{addRecordedAudio(noteId,file)}.onFailure{_saveError.value="保存录音失败，录音文件仍保留：${it.localizedMessage}"}
     }
     fun recordingFile(noteId:String)=java.io.File(appContext.filesDir,"recordings/$noteId/${System.currentTimeMillis()}.m4a")
     suspend fun addRecordedAudio(noteId:String,file:java.io.File):AssetEntity=withContext(Dispatchers.IO){require(file.isFile&&file.length()>0){"录音文件为空"};val id=UUID.randomUUID().toString();val relative="$noteId/$id-${file.name}";val target=java.io.File(appContext.filesDir,"attachments/$relative");target.parentFile?.mkdirs();file.copyTo(target,true);file.delete();AssetEntity(id,noteId,"audio",target.name,"audio/mp4",relative,target.absolutePath,target.inputStream().use(::sha),target.length(),true).also{dao.putAssets(listOf(it));if(syncBackend()!=SyncBackend.SSH)apiSync.queueAsset(syncWorkspaceId(),it);loadEditable(noteId)?.let{n->save(n)};requestSyncIfConfigured()}}
@@ -469,7 +556,26 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     fun clearPrivateKey(){saveSettings(settings().copy(privateKeyPath="",privateKeyPassphrase=""))}
 
-    suspend fun sync(onProgress:(String)->Unit={}):Unit {
+    suspend fun sync(onProgress:(String)->Unit={}){
+        val operationId=DiagnosticLogger.operationId()
+        val startedAt=System.currentTimeMillis()
+        DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_START,operationId=operationId,counts=diagnosticSyncCounts())
+        try{
+            performSync(onProgress)
+            DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_SUCCESS,operationId=operationId,durationMs=System.currentTimeMillis()-startedAt,counts=diagnosticSyncCounts())
+        }catch(error:Throwable){
+            if(error is CancellationException)throw error
+            DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.SYNC_FAILURE,operationId=operationId,error=error,durationMs=System.currentTimeMillis()-startedAt,counts=diagnosticSyncCounts())
+            throw error
+        }
+    }
+
+    private suspend fun diagnosticSyncCounts():Map<String,Long> = runCatching{
+        val workspace=if(syncBackend()==SyncBackend.SSH)null else syncWorkspaceId()
+        mapOf("outbox" to (workspace?.let{dao.apiOutboxCount(it)}?:0).toLong(),"dirtyNotes" to dao.dirtyNoteCount().toLong(),"dirtyAssets" to dao.dirtyAssetCount().toLong())
+    }.getOrDefault(emptyMap())
+
+    private suspend fun performSync(onProgress:(String)->Unit):Unit {
         onProgress("正在等待其他同步任务…")
         syncMutex.withLock{withContext(Dispatchers.IO){
         onProgress("正在保存本地更改…")
@@ -901,7 +1007,17 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private suspend fun loadEditable(id:String):NoteEntity?{val header=dao.getNoteHeader(id)?:return null;val body=readLargeText(dao.bodyLength(id)){start,length->dao.bodyChunk(id,start,length)}.orEmpty();return header.copy(body=body,previewText=header.previewText.ifBlank{previewText(body)})}
     private suspend fun loadSnapshot(id:String)=readLargeText(dao.snapshotLength(id)){start,length->dao.snapshotChunk(id,start,length)}
     private suspend fun loadConflictSnapshot(id:String)=readLargeText(dao.conflictSnapshotLength(id)){start,length->dao.conflictSnapshotChunk(id,start,length)}
-    private suspend fun readLargeText(totalLength:Int?,read:suspend(Int,Int)->String?):String?{if(totalLength==null)return null;if(totalLength==0)return "";val result=StringBuilder(totalLength);var start=1;while(start<=totalLength){val chunk=read(start,minOf(64*1024,totalLength-start+1)).orEmpty();if(chunk.isEmpty())break;result.append(chunk);start+=chunk.length};return result.toString()}
+    private suspend fun readLargeText(totalLength:Int?,read:suspend(Int,Int)->String?):String?{
+        if(totalLength==null)return null
+        val result=StringBuilder(totalLength);var start=1
+        while(start<=totalLength){
+            val count=minOf(64*1024,totalLength-start+1)
+            result.append(read(start,count)?:error("大文本记录读取失败"))
+            // SQLite substr/length count Unicode code points, not Kotlin UTF-16 units.
+            start+=count
+        }
+        return result.toString()
+    }
     // Never delete encrypted settings automatically. A transient Keystore or
     // device-unlock failure must not erase credentials, cursors or privacy maps.
     private fun encryptedPrefs(context:Context)=createEncryptedPrefs(context)

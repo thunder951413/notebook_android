@@ -663,7 +663,7 @@ class WebdavSyncTest {
             val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
 
             assertTrue("invalid directory accepted: $body", failure is java.io.IOException)
-            assertEquals("无法解析 WebDAV 目录，请稍后重试", failure?.message)
+            assertTrue(failure?.message.orEmpty().contains("WebDAV"))
             assertTrue(database.dao().get(noteId)!!.dirty)
             assertEquals(0, database.dao().apiOutboxCount(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID))
         }

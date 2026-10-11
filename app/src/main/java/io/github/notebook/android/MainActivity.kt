@@ -25,8 +25,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.animation.core.animate
+import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -72,6 +75,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
 import java.text.DateFormat
 import java.util.*
@@ -89,6 +93,7 @@ import io.noties.markwon.ext.tables.TablePlugin
 import io.github.notebook.android.update.AppUpdateViewModel
 import io.github.notebook.android.update.DownloadProgress
 import io.github.notebook.android.update.UpdatePhase
+import io.github.notebook.android.diagnostics.DiagnosticLogger
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository:SyncRepository
@@ -145,17 +150,41 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     val tags by repo.tags.collectAsState(initial=emptyList())
     val saveError by repo.saveError.collectAsState()
     val scope=rememberCoroutineScope(); val context=LocalContext.current
+    val focusManager=androidx.compose.ui.platform.LocalFocusManager.current
+    val keyboardController=androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val drawer=rememberDrawerState(DrawerValue.Closed)
-    var destination by remember{mutableStateOf(Destination.All)}
-    var folderId by remember{mutableStateOf<String?>(null)}
-    var tagId by remember{mutableStateOf<String?>(null)};var manage by remember{mutableStateOf<String?>(null)}
-    var query by remember{mutableStateOf("")};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by remember{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
+    var destination by rememberSaveable{mutableStateOf(Destination.All)}
+    var folderId by rememberSaveable{mutableStateOf<String?>(null)}
+    var tagId by rememberSaveable{mutableStateOf<String?>(null)};var manage by remember{mutableStateOf<String?>(null)}
+    var query by rememberSaveable{mutableStateOf("")};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by rememberSaveable{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
+    val homeHolder=androidx.compose.runtime.saveable.rememberSaveableStateHolder()
+    var activeDocumentId by rememberSaveable{mutableStateOf<String?>(null)}
+    LaunchedEffect(Unit){if(activeDocumentId!=null&&editing==null){repo.flushAll();val restored=repo.loadNote(activeDocumentId!!);if(restored!=null&&!repo.isEncrypted(restored))editing=restored else{activeDocumentId=null;folderId=null;startInEditMode=false}}}
+    LaunchedEffect(editing?.id){editing?.let{activeDocumentId=it.id}}
+    var encryptedUnlocked by remember{mutableStateOf(false)}
+    var cardOrigin by remember{mutableStateOf<androidx.compose.ui.geometry.Rect?>(null)}
+    var predictiveProgress by remember{mutableFloatStateOf(0f)}
+    val documentStack=remember{mutableListOf<Pair<String,Boolean>>()}
+    val editorSurfaces=rememberSaveable(saver=EditorSurfaceStatesSaver){mutableMapOf<String,EditorSurfaceState>()}
+    fun surfaceFor(id:String)=editorSurfaces.getOrPut(id){EditorSurfaceState()}
+    fun closeDocument(){
+        if(android.os.Looper.myLooper()!=android.os.Looper.getMainLooper()){android.os.Handler(android.os.Looper.getMainLooper()).post{closeDocument()};return}
+        editing?.id?.let{editorSurfaces.remove(it)}
+        focusManager.clearFocus();keyboardController?.hide()
+        predictiveProgress=0f
+        if(documentStack.isEmpty()){editing=null;activeDocumentId=null;startInEditMode=false}
+        else {val previous=documentStack.removeAt(documentStack.lastIndex);scope.launch{val note=repo.loadNote(previous.first);editing=note?.takeIf{!repo.isEncrypted(it)||encryptedUnlocked};startInEditMode=previous.second}}
+    }
     var showSettings by remember{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
     var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)}
     var showAllFolders by remember{mutableStateOf(false)};var showAllTags by remember{mutableStateOf(false)}
-    var encryptedUnlocked by remember{mutableStateOf(false)};var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)};var pendingPrivateNoteId by remember{mutableStateOf<String?>(null)};var pendingPrivateStartInEditMode by remember{mutableStateOf(false)};var deviceCredentialInProgress by remember{mutableStateOf(false)}
+    var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)};var pendingPrivateNoteId by remember{mutableStateOf<String?>(null)};var pendingPrivateStartInEditMode by remember{mutableStateOf(false)};var deviceCredentialInProgress by remember{mutableStateOf(false)}
     val encryptedUnlocker=rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()){result->deviceCredentialInProgress=false;if(result.resultCode==android.app.Activity.RESULT_OK){encryptedUnlocked=true;pendingEncryptedFolder?.let{folderId=it;tagId=null;destination=Destination.All};pendingEncryptedFolder=null;scope.launch{drawer.close()}}else{pendingEncryptedFolder=null;pendingPrivateNoteId=null;pendingPrivateStartInEditMode=false;status="需要验证设备凭据才能查看私密内容"}}
-    val isTablet=LocalConfiguration.current.screenWidthDp>=840
+    LaunchedEffect(folders,encryptedUnlocked){if(!encryptedUnlocked&&folders.firstOrNull{it.id==folderId}?.type=="encryptedFolder")folderId=null}
+    val configuredTablet=LocalConfiguration.current.screenWidthDp>=840
+    var documentTabletMode by rememberSaveable{mutableStateOf<Boolean?>(null)}
+    val isTablet=if(editing!=null||activeDocumentId!=null)documentTabletMode?:configuredTablet else configuredTablet
+    LaunchedEffect(editing?.id,activeDocumentId){if(editing!=null&&documentTabletMode==null)documentTabletMode=configuredTablet else if(editing==null&&activeDocumentId==null)documentTabletMode=null}
     val drawerScroll=androidx.compose.foundation.rememberScrollState()
     val appUpdate:AppUpdateViewModel=viewModel()
     val updateLifecycleOwner=LocalLifecycleOwner.current
@@ -164,11 +193,12 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     val textImporter=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{val target=folders.firstOrNull{it.id==folderId};runCatching{repo.importText(source,target)}.onSuccess{note->startInEditMode=false;editing=note;status="已导入 ${note.title}"}.onFailure{status="导入失败：${it.localizedMessage}"}}}}
     fun lockPrivateContent(){
         encryptedUnlocked=false
+        documentStack.clear()
         pendingEncryptedFolder=null
         pendingPrivateNoteId=null
         pendingPrivateStartInEditMode=false
         deviceCredentialInProgress=false
-        if(editing?.let(repo::isEncrypted)==true){editing=null;startInEditMode=false}
+        if(editing?.let(repo::isEncrypted)==true){editing=null;activeDocumentId=null;startInEditMode=false}
         if(folders.firstOrNull{it.id==folderId}?.type=="encryptedFolder"){folderId=null;tagId=null;destination=Destination.All}
     }
     fun requestPrivateUnlock(folder:String?=null,noteId:String?=null,startEditing:Boolean=false){
@@ -181,6 +211,8 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         encryptedUnlocker.launch(manager.createConfirmDeviceCredentialIntent("解锁私密笔记","验证手机锁屏密码或指纹后查看锁定内容"))
     }
     fun openNote(id:String,startEditing:Boolean=false){
+        if(android.os.Looper.myLooper()!=android.os.Looper.getMainLooper()){android.os.Handler(android.os.Looper.getMainLooper()).post{openNote(id,startEditing)};return}
+        focusManager.clearFocus()
         if(loadingNoteId!=null)return
         val summary=all.firstOrNull{it.id==id}
         if(summary==null){status="笔记不存在或已被删除";return}
@@ -190,10 +222,15 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         }
         loadingNoteId=id
         scope.launch{runCatching{repo.loadNote(id)}.onSuccess{note->
-            if(note!=null&&(!repo.isEncrypted(note)||encryptedUnlocked)){startInEditMode=startEditing;editing=note}
+            if(note!=null&&(!repo.isEncrypted(note)||encryptedUnlocked)){editing?.takeIf{it.id!=note.id}?.let{documentStack.add(it.id to startInEditMode)};startInEditMode=startEditing;editing=note}
             else if(note!=null)requestPrivateUnlock(repo.encryptedFolderId(note),id,startEditing)
             else status="笔记不存在或已被删除"
         }.onFailure{status="无法加载笔记：${it.localizedMessage}"};loadingNoteId=null}
+    }
+    fun createChild(parent:NoteEntity){
+        val draft=NoteEntity(UUID.randomUUID().toString(),folderId=parent.folderId,folderName=parent.folderName,parentPageId=parent.id,sortOrder=(all.filter{it.parentPageId==parent.id}.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,viewMode="text")
+        if(repo.isEncrypted(parent))repo.encryptedFolderId(parent)?.let{repo.markEncrypted(draft.id,it)}
+        repo.markUnsaved(draft.id);documentStack.add(parent.id to false);editing=draft;startInEditMode=true
     }
     LaunchedEffect(encryptedUnlocked,pendingPrivateNoteId){
         if(encryptedUnlocked){
@@ -204,7 +241,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             openNote(id,startEditing)
         }
     }
-    LaunchedEffect(query){if(query.isBlank())matchingNoteIds=null else{delay(180);matchingNoteIds=runCatching{repo.searchNoteIds(query.trim())}.getOrElse{status="搜索失败：${it.localizedMessage}";emptySet()}}}
+    LaunchedEffect(query){matchingNoteIds=null;if(query.isNotBlank()){delay(180);matchingNoteIds=runCatching{repo.searchNoteIds(query.trim())}.getOrElse{status="搜索失败：${it.localizedMessage}";emptySet()}}}
     LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->
         all.firstOrNull{it.id==id}?.let{target->
             destination=if(target.itemType=="todo")Destination.Today else Destination.All
@@ -244,8 +281,8 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         privacyLifecycleOwner.lifecycle.addObserver(observer)
         onDispose{privacyLifecycleOwner.lifecycle.removeObserver(observer)}
     }
-    if(!isTablet) editing?.let { note -> Editor(note,repo,startInEditMode,encryptedUnlocked,{id->openNote(id)}){editing=null};return }
-    if(showSettings){ServerSettings(repo){showSettings=false};return}
+
+    if(showSettings){ReferenceSettings(repo,{showSettings=false},{back->ServerSettings(repo,back)},{manage=it;showSettings=false});return}
     manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
 
     fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;scope.launch{drawer.close()}}
@@ -296,37 +333,32 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
-        Scaffold(topBar={TopAppBar(title={Text(tagId?.let{id->tags.firstOrNull{it.id==id}?.name}?:folderId?.let{id->folders.firstOrNull{it.id==id}?.name}?:destination.title)},navigationIcon={if(!isTablet)IconButton({scope.launch{drawer.open()}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Menu,"导航")}},actions={UpdateAction(appUpdate);IconButton({runSync()},Modifier.minimumInteractiveComponentSize(),enabled=!syncing){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp) else Icon(Icons.Default.Sync,"立即同步")}})},floatingActionButton={if(destination.newItemType!=null)FloatingActionButton({val folder=folders.firstOrNull{it.id==folderId};val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday);if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id);repo.markUnsaved(draft.id);startInEditMode=true;editing=draft},Modifier.testTag("new-item")){Icon(Icons.Default.Add,if(destination.newItemType=="todo"||folders.firstOrNull{it.id==folderId}?.type=="todoList")"新建计划" else "新建笔记")}}){pad->
-            Column(Modifier.padding(pad).fillMaxSize().background(MaterialTheme.colorScheme.background)){
-                OutlinedTextField(query,{query=it},Modifier.fillMaxWidth().padding(12.dp),singleLine=true,shape=MaterialTheme.shapes.large,placeholder={Text("搜索全部笔记")},leadingIcon={Icon(Icons.Default.Search,null)})
-                SyncStatusCard(status,syncing,{runSync()})
-                loadingNoteId?.let{LinearProgressIndicator(Modifier.fillMaxWidth())}
-                saveError?.let{Text(it,Modifier.padding(horizontal=16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
-                Row(Modifier.fillMaxSize()){
-                    Box(Modifier.weight(1f).fillMaxHeight().background(MaterialTheme.colorScheme.surface)){if(visible.isEmpty())Box(Modifier.fillMaxSize().padding(32.dp)){Text("这里还没有内容",color=MaterialTheme.colorScheme.onSurfaceVariant)}else VirtualNoteList(
-                        notes=visible,
-                        loadingNoteId=loadingNoteId,
-                        repo=repo,
-                        treeMode=visible.all{it.itemType=="note"}&&destination!=Destination.Trash,
-                        onOpen={openNote(it)},
-                        onNewChild={parent->
-                            val folder=folders.firstOrNull{it.id==parent.folderId}
-                            val nextOrder=(all.filter{it.parentPageId==parent.id}.maxOfOrNull{it.sortOrder}?:0.0)+1000.0
-                            val now=System.currentTimeMillis()
-                            val draft=newItemDraft(Destination.All,folder,parent.folderId,null,endOfToday).copy(parentPageId=parent.id,sortOrder=nextOrder,treeUpdatedAt=now)
-                            repo.markUnsaved(draft.id);startInEditMode=true;editing=draft
-                        },
-                        onPromote={page->scope.launch{repo.loadNote(page.id)?.let{repo.save(it.copy(parentPageId=null,treeUpdatedAt=System.currentTimeMillis()))};status="已提升为顶层页面"}},
-                        onDeleted={deletedID->if(editing?.id==deletedID)editing=null},
-                        onStatus={message->status=message}
-                    )}
-                    if(isTablet){VerticalDivider();Box(Modifier.weight(1.65f).fillMaxHeight().background(MaterialTheme.colorScheme.background)){editing?.let{note->EditorPane(note,repo,initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={id->openNote(id)},onDone={editing=null})}?:Box(Modifier.fillMaxSize().padding(40.dp)){Text("选择一篇笔记开始阅读",color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
-                }
-            }
-        }
+        homeHolder.SaveableStateProvider("home"){ReferenceHome(
+            notes=visible,all=all,folders=folders,tags=tags,repo=repo,destination=destination,folderId=folderId,tagId=tagId,
+            query=query,onQuery={query=it},loadingId=loadingNoteId,status=status?.takeIf(String::isNotBlank),syncing=syncing,error=saveError,
+            onOpen={openNote(it)},onCreate={
+                val folder=folders.firstOrNull{it.id==folderId}
+                val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday)
+                if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id)
+                repo.markUnsaved(draft.id);cardOrigin=null;startInEditMode=true;editing=draft
+            },onSelect={d,f,t->select(d,f,t)},onNavigation={scope.launch{drawer.open()}},onSettings={showSettings=true},onSync={runSync()},
+            onImport={textImporter.launch(arrayOf("text/plain","text/markdown","text/x-markdown"))},onStatus={status=it},onCardBounds={cardOrigin=it},
+            tabletEditor=if(isTablet){{editing?.let{note->key(note.id){EditorPane(note,repo,surfaceFor(note.id),initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={openNote(it)},onNewChild={createChild(it)},onEditModeChanged={startInEditMode=it},onDone={closeDocument()})}}?:EmptyNotes("选择一篇笔记","在左侧打开笔记开始阅读")}}else null
+        )}
     }
     if(isTablet)PermanentNavigationDrawer(drawerContent={PermanentDrawerSheet(Modifier.width(280.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
-    else ModalNavigationDrawer(drawerState=drawer,drawerContent={ModalDrawerSheet(Modifier.width(300.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
+    else {
+        var displayed by remember{mutableStateOf<Pair<NoteEntity,Boolean>?>(null)}
+        if(!encryptedUnlocked&&displayed?.first?.let(repo::isEncrypted)==true)displayed=null
+        editing?.let{displayed=it to startInEditMode}
+        Box(Modifier.fillMaxSize()){
+            Box(Modifier.fillMaxSize().then(if(editing!=null)Modifier.clearAndSetSemantics{}else Modifier)){
+                ModalNavigationDrawer(drawerState=drawer,drawerContent={ModalDrawerSheet(Modifier.width(300.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
+            }
+            DocumentContainer(editing!=null,cardOrigin,predictiveProgress){displayed?.let{(note,edit)->key(note.id){Editor(note,repo,surfaceFor(note.id),edit,encryptedUnlocked,{openNote(it)},{closeDocument()},{predictiveProgress=it},{createChild(it)},{startInEditMode=it})}}}
+        }
+    }
+
 }
 
 @Composable private fun DrawerRow(label:String,icon:androidx.compose.ui.graphics.vector.ImageVector,selected:Boolean,count:Int?=null,onClick:()->Unit){NavigationDrawerItem(label={Row{Text(label);Spacer(Modifier.weight(1f));count?.let{Text(it.toString(),style=MaterialTheme.typography.labelMedium)}}},icon={Icon(icon,null)},selected=selected,onClick=onClick,modifier=Modifier.padding(horizontal=8.dp,vertical=1.dp))}
@@ -354,149 +386,36 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     visit(null,0);return result
 }
 
-@Composable private fun VirtualNoteList(notes:List<NoteSummary>,loadingNoteId:String?,repo:SyncRepository,treeMode:Boolean,onOpen:(String)->Unit,onNewChild:(NoteSummary)->Unit,onPromote:(NoteSummary)->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
-    val state=rememberLazyListState()
-    val expanded=remember{mutableStateMapOf<String,Boolean>()}
-    val rows=if(treeMode)flattenNoteTree(notes,expanded)else notes.map{VisibleNoteTreeRow(it,0,false)}
-    val scrollMetrics by remember(state,rows.size){derivedStateOf{Triple(state.layoutInfo.visibleItemsInfo.size,rows.size,state.firstVisibleItemIndex)}}
-    BoxWithConstraints(Modifier.fillMaxSize()){
-        LazyColumn(Modifier.fillMaxSize(),state=state){items(rows,key={it.note.id}){row->SwipeDeleteNoteRow(row.note,notes,loadingNoteId==row.note.id,repo,row.depth,row.hasChildren,expanded[row.note.id]!=false,{expanded[row.note.id]=!(expanded[row.note.id]!=false)},{onOpen(row.note.id)},{onNewChild(row.note)},{onPromote(row.note)},onDeleted,onStatus)}}
-        val (visibleCount,totalCount,firstVisible)=scrollMetrics
-        if(rows.size>visibleCount&&visibleCount>0){
-            val thumbFraction=(visibleCount.toFloat()/totalCount).coerceIn(.08f,1f)
-            val progress=(firstVisible.toFloat()/(totalCount-visibleCount).coerceAtLeast(1)).coerceIn(0f,1f)
-            val thumbHeight=maxHeight*thumbFraction
-            Box(Modifier.align(androidx.compose.ui.Alignment.TopEnd).padding(end=2.dp).width(4.dp).height(thumbHeight).offset{IntOffset(0,((maxHeight-thumbHeight).toPx()*progress).roundToInt())}.background(MaterialTheme.colorScheme.primary.copy(alpha=.45f),MaterialTheme.shapes.small))
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun SwipeDeleteNoteRow(note:NoteSummary,allNotes:List<NoteSummary>,loading:Boolean,repo:SyncRepository,depth:Int,hasChildren:Boolean,expanded:Boolean,onToggle:()->Unit,onClick:()->Unit,onNewChild:()->Unit,onPromote:()->Unit,onDeleted:(String)->Unit,onStatus:(String)->Unit){
-    var deleteDialog by remember(note.id){mutableStateOf(false)}
-    var moveDialog by remember(note.id){mutableStateOf(false)}
-    var deleting by remember(note.id){mutableStateOf(false)}
-    var offsetPx by remember(note.id){mutableFloatStateOf(0f)}
-    var settleJob by remember(note.id){mutableStateOf<kotlinx.coroutines.Job?>(null)}
-    val scope=rememberCoroutineScope()
-    val itemLabel=if(note.itemType=="todo")"计划" else "笔记"
-    val swipeEnabled=note.deletedAt==null&&!loading&&!deleting
-    val actionWidth=96.dp
-    val actionWidthPx=with(LocalDensity.current){actionWidth.toPx()}
-    fun settle(target:Float){
-        settleJob?.cancel()
-        settleJob=scope.launch{animate(offsetPx,target){value,_->offsetPx=value}}
-    }
-    val dragState=rememberDraggableState{delta->
-        settleJob?.cancel()
-        offsetPx=(offsetPx+delta).coerceIn(-actionWidthPx,0f)
-    }
-    LaunchedEffect(swipeEnabled){if(!swipeEnabled&&offsetPx!=0f)settle(0f)}
-    Box(Modifier.fillMaxWidth().testTag("swipe-delete-${note.id}")){
-        if(offsetPx<-.5f){
-            Box(
-                Modifier.matchParentSize().background(MaterialTheme.colorScheme.errorContainer),
-                contentAlignment=androidx.compose.ui.Alignment.CenterEnd
-            ){
-                Button(
-                    onClick={deleteDialog=true;settle(0f)},
-                    modifier=Modifier.width(actionWidth).fillMaxHeight().testTag("delete-action-${note.id}"),
-                    enabled=swipeEnabled,
-                    shape=androidx.compose.ui.graphics.RectangleShape,
-                    colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error),
-                    contentPadding=PaddingValues(0.dp)
-                ){
-                    Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(4.dp)){
-                        Icon(Icons.Default.Delete,"删除$itemLabel")
-                        Text("删除",fontWeight=FontWeight.SemiBold)
-                    }
-                }
-            }
-        }
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .offset{IntOffset(offsetPx.roundToInt(),0)}
-                .background(MaterialTheme.colorScheme.surface)
-                .draggable(
-                    state=dragState,
-                    orientation=Orientation.Horizontal,
-                    enabled=swipeEnabled,
-                    onDragStopped={velocity->
-                        settle(swipeDeleteTargetOffset(offsetPx,actionWidthPx,velocity))
-                    }
-                )
-        ){NoteRow(note,loading,depth,hasChildren,expanded,onToggle,{if(offsetPx<-.5f)settle(0f)else onClick()},onNewChild,onPromote,{moveDialog=true}){icon->
-            scope.launch{
-                runCatching{repo.loadNote(note.id)?.let{repo.save(it.copy(icon=icon))}}
-                    .onSuccess{onStatus(if(icon==null)"已恢复默认图标" else "页面图标已更新")}
-                    .onFailure{onStatus("更新图标失败：${it.localizedMessage}")}
-            }
-        }}
-    }
-    if(deleteDialog)AlertDialog(
-        onDismissRequest={deleteDialog=false;settle(0f)},
-        icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},
-        title={Text("删除$itemLabel？")},
-        text={Text(if(hasChildren)"此页面及全部子页面会一起移入回收站，可以稍后恢复。" else "删除后会移入回收站，可以稍后恢复。")},
-        confirmButton={Button(
-            onClick={
-                deleteDialog=false
-                deleting=true
-                scope.launch{
-                    runCatching{repo.moveToTrash(note.id)}
-                        .onSuccess{onDeleted(note.id);onStatus("已移入回收站")}
-                        .onFailure{onStatus("删除失败：${it.localizedMessage}")}
-                    deleting=false
-                }
-            },
-            colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)
-        ){Text("删除")}},
-        dismissButton={TextButton({deleteDialog=false;settle(0f)}){Text("取消")}}
-    )
-    if(moveDialog)MovePageDialog(note,allNotes.filter{candidate->repo.isEncrypted(candidate)==repo.isEncrypted(note)},{moveDialog=false}){parentId->
-        moveDialog=false
-        scope.launch{
-            runCatching{repo.movePage(note.id,parentId)}
-                .onSuccess{onStatus(if(parentId==null)"已移动到顶层" else "已移动到所选页面下")}
-                .onFailure{onStatus("移动失败：${it.localizedMessage}")}
-        }
-    }
-}
-
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
-@Composable private fun NoteRow(note:NoteSummary,loading:Boolean,depth:Int,hasChildren:Boolean,expanded:Boolean,onToggle:()->Unit,onClick:()->Unit,onNewChild:()->Unit,onPromote:()->Unit,onMove:()->Unit,onIconChange:(String?)->Unit){
-    var menu by remember(note.id){mutableStateOf(false)}
-    Row(Modifier.fillMaxWidth().padding(start=(depth*18).dp)){
-        if(note.itemType=="note")IconButton(onToggle,enabled=hasChildren,modifier=Modifier.size(40.dp)){if(hasChildren)Icon(if(expanded)Icons.Default.ExpandMore else Icons.Default.ChevronRight,if(expanded)"收起子页面" else "展开子页面",Modifier.size(20.dp))else Spacer(Modifier.size(20.dp))}
-        Box(Modifier.weight(1f)){
-            ListItem(headlineContent={Row{Text(note.title.ifBlank{"无标题"},fontWeight=FontWeight.Medium,maxLines=1);Spacer(Modifier.weight(1f));if(loading)CircularProgressIndicator(Modifier.size(15.dp),strokeWidth=2.dp)else if(note.reminderAt!=null)Icon(Icons.Default.Notifications,null,Modifier.size(15.dp),tint=MaterialTheme.colorScheme.primary)}},supportingContent={Column{Text(note.preview,maxLines=2);Spacer(Modifier.height(5.dp));Text("${DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt))}  ·  ${note.folderName}",style=MaterialTheme.typography.labelSmall)}},leadingContent={if(note.itemType=="todo")Icon(Icons.Default.CheckCircle,null,tint=if(note.completedAt==null)MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary)else if(note.icon!=null)Text(note.icon,fontSize=20.sp)else Icon(if(hasChildren)Icons.Default.Folder else Icons.Default.Description,null,tint=MaterialTheme.colorScheme.primary)},trailingContent={if(note.itemType=="note")IconButton({menu=true}){Icon(Icons.Default.MoreVert,"页面菜单")}},modifier=Modifier.combinedClickable(enabled=!loading,onClick=onClick,onLongClick={if(note.itemType=="note")menu=true}).padding(horizontal=4.dp))
-            DropdownMenu(menu,{menu=false}){
-                DropdownMenuItem({Text("新建子页面")},{menu=false;onNewChild()})
-                DropdownMenuItem({Text("移动到…")},{menu=false;onMove()})
-                if(note.parentPageId!=null)DropdownMenuItem({Text("提升为顶层页面")},{menu=false;onPromote()})
-                HorizontalDivider()
-                listOf("📄","📝","📒","📌","✅","📅","💡","🚀","🎯","🔐").forEach{icon->DropdownMenuItem({Text(icon)},{menu=false;onIconChange(icon)})}
-                if(note.icon!=null)DropdownMenuItem({Text("恢复默认图标")},{menu=false;onIconChange(null)})
-            }
-        }
-    }
-    HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant)
-}
-
 @Composable private fun MovePageDialog(page:NoteSummary,notes:List<NoteSummary>,onDismiss:()->Unit,onMove:(String?)->Unit){
-    var query by remember{mutableStateOf("")}
+    var query by rememberSaveable{mutableStateOf("")}
     val descendants=remember(page.id,notes){buildSet{add(page.id);var changed=true;while(changed){changed=false;notes.filter{it.parentPageId in this}.forEach{if(add(it.id))changed=true}}}}
     val targets=remember(notes,query,descendants){notes.filter{it.itemType=="note"&&it.deletedAt==null&&it.id !in descendants&&(query.isBlank()||it.title.contains(query,true)||it.folderName.contains(query,true))}.sortedWith(compareBy<NoteSummary>{it.folderName}.thenBy{it.title}).take(200)}
     AlertDialog(onDismissRequest=onDismiss,title={Text("移动页面")},text={Column(Modifier.fillMaxWidth().heightIn(max=540.dp)){OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索目标页面")});LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){item{ListItem(headlineContent={Text("当前分区的顶层")},leadingContent={Icon(Icons.Default.Home,null)},modifier=Modifier.clickable{onMove(null)})};items(targets,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"})},supportingContent={Text(target.folderName)},leadingContent={Icon(if(notes.any{it.parentPageId==target.id})Icons.Default.Folder else Icons.Default.Description,null)},modifier=Modifier.clickable{onMove(target.id)})}}}},confirmButton={},dismissButton={TextButton(onDismiss){Text("取消")}})
 }
 
-@Composable private fun Editor(original:NoteEntity,repo:SyncRepository,initiallyEditing:Boolean,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,onBack:()->Unit){Scaffold(containerColor=MaterialTheme.colorScheme.background){p->Box(Modifier.padding(p)){EditorPane(original,repo,showBack=true,initiallyEditing=initiallyEditing,encryptedUnlocked=encryptedUnlocked,onOpenNote=onOpenNote,onDone={onBack()})}}}
+@Composable private fun Editor(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,initiallyEditing:Boolean,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,onBack:()->Unit,onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={}){EditorPane(original,repo,surface,showBack=true,initiallyEditing=initiallyEditing,encryptedUnlocked=encryptedUnlocked,onOpenNote=onOpenNote,onBackProgress=onBackProgress,onNewChild=onNewChild,onEditModeChanged=onEditModeChanged,onDone={onBack()})}
 
 @OptIn(ExperimentalMaterial3Api::class,ExperimentalLayoutApi::class)
-@Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,showBack:Boolean=false,initiallyEditing:Boolean=false,encryptedUnlocked:Boolean=false,onOpenNote:(String)->Unit={},onDone:(NoteEntity)->Unit){
+@Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,showBack:Boolean=false,initiallyEditing:Boolean=false,encryptedUnlocked:Boolean=false,onOpenNote:(String)->Unit={},onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={},onDone:(NoteEntity)->Unit){
     var n by remember(original.id,original.version){mutableStateOf(original)}
-    var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body))}
+    val latestDraft=remember(original.id,original.version){mutableStateOf(original)}
+    var caretStart by surface.caretStart
+    var caretEnd by surface.caretEnd
+    var bodyValue by remember(original.id,original.version){mutableStateOf(TextFieldValue(original.body,TextRange(caretStart.coerceIn(0,original.body.length),caretEnd.coerceIn(0,original.body.length))))}
+    LaunchedEffect(bodyValue.selection){caretStart=bodyValue.selection.start;caretEnd=bodyValue.selection.end}
+    val undoHistory=remember(original.id){EditorUndoHistory()}
+    var historyTick by remember{mutableIntStateOf(0)}
+    var moreMenu by remember{mutableStateOf(false)}
+    var tagsSheet by remember{mutableStateOf(false)}
+    var exportSheet by rememberSaveable{mutableStateOf(false)}
+    var libraryMove by remember{mutableStateOf(false)}
+    var pageMove by remember{mutableStateOf(false)}
+    var editorOutline by remember{mutableStateOf(false)}
+    var permanentConfirm by remember{mutableStateOf(false)}
+    var editorMessage by remember{mutableStateOf<String?>(null)}
+    var readerAction by remember{mutableStateOf<String?>(null)}
+    var editorDocument by remember(original.id,n.body){mutableStateOf<ParsedMarkdownDocument?>(null)}
+    LaunchedEffect(n.body){delay(120);editorDocument=withContext(Dispatchers.Default){MarkdownDocumentParser.parse(n.body)}}
     val attachments by repo.assets(n.id).collectAsState(initial=emptyList());val scope=rememberCoroutineScope()
     val allNotes by repo.notes.collectAsState(initial=emptyList())
     val saveError by repo.saveError.collectAsState()
@@ -505,66 +424,155 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)};var parentMenu by remember{mutableStateOf(false)}
     val steps by repo.steps(n.id).collectAsState(initial=emptyList());var newStep by remember{mutableStateOf("")}
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.GetContent()){uri->uri?.let{source->scope.launch{
-        runCatching{repo.attach(n.id,source)}.onSuccess{asset->
+        runCatching{repo.flushDraft(latestDraft.value).join();check(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){"请先保存笔记"};repo.attach(n.id,source)}.onSuccess{asset->
             if(asset.kind=="image"){
                 val syntax="\n\n${NotebookAssetSyntax.imageMarkdown(asset.id,asset.filename)}\n\n"
                 val start=bodyValue.selection.min
                 val end=bodyValue.selection.max
                 val next=bodyValue.text.substring(0,start)+syntax+bodyValue.text.substring(end)
+                undoHistory.record(EditorSnapshot(n.title,bodyValue));historyTick++
                 bodyValue=TextFieldValue(next,TextRange(start+syntax.length))
                 val updated=n.copy(body=next)
+                latestDraft.value=updated
                 n=updated
                 repo.queueDraft(updated)
             }
-        }
+        }.onFailure{editorMessage="添加附件失败：${it.localizedMessage}"}
     }}}
-    val microphonePermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->if(granted){runCatching{repo.recordingFile(n.id).also{recordingFile=it;audioRecorder.start(it);recording=true}}}}
+    val microphonePermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){granted->
+        if(granted)scope.launch{runCatching{repo.flushDraft(latestDraft.value).join();check(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){"请先保存笔记"};repo.recordingFile(n.id).also{recordingFile=it;audioRecorder.start(it);recording=true}}.onFailure{editorMessage="无法开始录音：${it.localizedMessage}"}}
+        else editorMessage="未获得麦克风权限，录音未开始"
+    }
     val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){}
-    DisposableEffect(Unit){onDispose{audioRecorder.release()}}
+
     var reminderDialog by remember{mutableStateOf(false)};var deleteDialog by remember{mutableStateOf(false)};var historyDialog by remember{mutableStateOf(false)};var historyRevisions by remember(original.id){mutableStateOf<List<NoteRevisionSummary>>(emptyList())};var showSavedCheck by remember(original.id){mutableStateOf(false)}
     var referencePicker by remember(original.id){mutableStateOf(false)}
-    var editMode by remember(original.id){mutableStateOf(initiallyEditing || original.viewMode == "text")}
+    var editMode by remember(original.id){mutableStateOf(initiallyEditing)}
+    LaunchedEffect(editMode){onEditModeChanged(editMode)}
     val initialEditableKey=remember(original.id,original.version){editableKey(original)}
-    var hasEdited by remember(original.id,original.version){mutableStateOf(false)}
-    val currentEditableKey=editableKey(n)
-    val latestNote by rememberUpdatedState(n)
-    LaunchedEffect(saveState){if(saveState==NoteSaveState.Saved){showSavedCheck=true;delay(200);showSavedCheck=false;repo.acknowledgeSaved(n.id)}else showSavedCheck=false}
-    fun updateNote(next:NoteEntity){n=next;repo.queueDraft(next)}
-    LaunchedEffect(currentEditableKey){
-        if(currentEditableKey!=initialEditableKey)hasEdited=true
-        if(hasEdited)repo.queueDraft(n)
+    LaunchedEffect(saveState){if(saveState==NoteSaveState.Saved){showSavedCheck=true;delay(600);showSavedCheck=false;repo.acknowledgeSaved(n.id)}else showSavedCheck=false}
+    fun updateNote(next:NoteEntity){latestDraft.value=next;n=next;repo.queueDraft(next)}
+    fun changeBody(next:TextFieldValue,typing:Boolean=false){
+        if(next.text!=bodyValue.text){undoHistory.record(EditorSnapshot(n.title,bodyValue),typing);historyTick++}
+        bodyValue=next
+        if(next.text!=n.body)updateNote(n.copy(body=next.text))
     }
+    fun changeTitle(next:String){if(next!=n.title){undoHistory.record(EditorSnapshot(n.title,bodyValue),true,field="title");historyTick++;updateNote(n.copy(title=next))}}
+    fun restoreEditor(snapshot:EditorSnapshot?){snapshot?.let{bodyValue=it.value;updateNote(n.copy(title=it.title,body=it.value.text));historyTick++}}
+    fun stopRecording():kotlinx.coroutines.Job?{
+        if(!recording)return null
+        val ok=audioRecorder.stop();recording=false
+        return if(ok)recordingFile?.let{repo.commitRecordedAudioAsync(n.id,it)}else{recordingFile?.delete();editorMessage="录音时间太短，未生成附件";null}
+    }
+    val editorKeyboard=androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    fun finishEditing(){scope.launch{
+        stopRecording()?.join();withContext(Dispatchers.Main.immediate){editorKeyboard?.hide()}
+        if(n.title.isBlank()&&n.body.isBlank()&&attachments.isEmpty()&&steps.isEmpty()&&!repo.hasStoredNote(n.id)){repo.discardUnsavedMarker(n.id);onDone(n);return@launch}
+        repo.flushDraft(latestDraft.value).join();if(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed)editMode=false
+    }}
+    DisposableEffect(audioRecorder){onDispose{stopRecording();audioRecorder.release()}}
     DisposableEffect(lifecycleOwner,original.id,original.version){
         val observer=LifecycleEventObserver{_,event->
-            if(event==Lifecycle.Event.ON_STOP&&editableKey(latestNote)!=initialEditableKey)repo.flushDraft(latestNote)
+            val latest=latestDraft.value
+            if(event==Lifecycle.Event.ON_STOP){stopRecording();if(editableKey(latest)!=initialEditableKey)repo.flushDraft(latest)}
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose{
             lifecycleOwner.lifecycle.removeObserver(observer)
-            if(editableKey(latestNote)!=initialEditableKey)repo.flushDraft(latestNote)
+            val latest=latestDraft.value
+            if(editableKey(latest)!=initialEditableKey)repo.flushDraft(latest)
         }
     }
-    BackHandler{scope.launch{repo.flushDraft(n).join();onDone(n)}}
-    Column(Modifier.fillMaxSize().padding(horizontal=20.dp,vertical=12.dp)){
-        saveError?.let{Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Row(Modifier.padding(10.dp)){Text(it,Modifier.weight(1f));TextButton({repo.clearSaveError()}){Text("知道了")}}};Spacer(Modifier.height(6.dp))}
-        if(n.conflict){Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.errorContainer)){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改",fontWeight=FontWeight.SemiBold);Row{TextButton({scope.launch{repo.keepLocal(n.id)}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id)}}){Text("采用服务器版本")}}}};Spacer(Modifier.height(8.dp))}
-        if(n.deletedAt!=null){Card{Row(Modifier.padding(12.dp)){Text("此项目位于回收站",Modifier.weight(1f));TextButton({scope.launch{repo.restore(n.id)}}){Text("恢复")};TextButton({scope.launch{repo.deletePermanently(n.id)}}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}};Spacer(Modifier.height(8.dp))}
-        Row{if(showBack)IconButton({scope.launch{repo.flushDraft(n).join();onDone(n)}}){Icon(Icons.Default.ArrowBack,"返回")};val itemLabel=if(n.itemType=="todo")"计划" else "笔记";Text(if(editMode)"编辑$itemLabel" else "阅读$itemLabel",Modifier.padding(top=12.dp),style=MaterialTheme.typography.titleMedium);Spacer(Modifier.weight(1f));SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(n)};IconButton({scope.launch{historyRevisions=repo.revisions(n.id);historyDialog=true}}){Icon(Icons.Default.History,"版本历史")};if(n.deletedAt==null)IconButton({deleteDialog=true},modifier=Modifier.testTag("delete-item")){Icon(Icons.Default.Delete,"删除$itemLabel",tint=MaterialTheme.colorScheme.error)};IconButton({if(editMode)repo.flushDraft(n);val next=!editMode;editMode=next;updateNote(n.copy(viewMode=if(next)"text" else "preview"))},Modifier.testTag(if(editMode)"preview-mode" else "edit-mode")){Icon(if(editMode)Icons.Default.Visibility else Icons.Default.Edit,if(editMode)"预览 Markdown" else "编辑")}}
+    var leaving by remember(original.id){mutableStateOf(false)}
+    fun flushLatestAndFinish(){
+        if(leaving)return
+        leaving=true
+        scope.launch{
+            stopRecording()?.join()
+            val latest=latestDraft.value
+            repo.flushDraft(latest).join()
+            if(repo.noteSaveStates.value[latest.id]==NoteSaveState.Failed){leaving=false;return@launch}
+            onDone(latest)
+        }
+    }
+    BackHandler{if(editMode)finishEditing()else flushLatestAndFinish()}
+    androidx.activity.compose.PredictiveBackHandler(enabled=showBack&&!editMode){events->
+        try{events.collect{onBackProgress(it.progress)};flushLatestAndFinish()}
+        catch(cancelled:kotlinx.coroutines.CancellationException){onBackProgress(0f);throw cancelled}
+    }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).statusBarsPadding().navigationBarsPadding()){
+        saveError?.let{Text(it,Modifier.padding(16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
+        editorMessage?.let{Text(it,Modifier.padding(16.dp).clickable{editorMessage=null},color=MaterialTheme.colorScheme.error)}
+        if(n.conflict){Surface(color=MaterialTheme.colorScheme.errorContainer){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改");Row{TextButton({scope.launch{repo.keepLocal(n.id);repo.loadNote(n.id)?.let{updateNote(it)}}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it;bodyValue=TextFieldValue(it.body)}}}){Text("采用服务器版本")}}}}}
+        Row(Modifier.fillMaxWidth().padding(horizontal=12.dp,vertical=8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
+            if(showBack)RoundTool(Icons.Default.ArrowBack,"返回",{if(editMode)finishEditing()else flushLatestAndFinish()},filled=false,enabled=!leaving)
+            if(editMode){
+                RoundTool(Icons.Default.Toc,"目录",{editorOutline=true},filled=false)
+                Spacer(Modifier.weight(1f))
+                SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(latestDraft.value)}
+                val tick=historyTick
+                RoundTool(Icons.Default.Undo,"撤销",{restoreEditor(undoHistory.undo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canUndo&&tick>=0,filled=false)
+                RoundTool(Icons.Default.Redo,"重做",{restoreEditor(undoHistory.redo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canRedo&&tick>=0,filled=false)
+                RoundTool(Icons.Default.Check,"完成",{stopRecording();finishEditing()},Modifier.testTag("preview-mode"),filled=false)
+            }else{
+                Text(if(n.deletedAt!=null)"最近删除" else java.text.SimpleDateFormat("M月d日 HH:mm",Locale.CHINA).format(Date(n.updatedAt)),Modifier.weight(1f).padding(start=8.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                RoundTool(Icons.Default.Toc,"目录",{readerAction="outline"},filled=false)
+                RoundTool(Icons.Default.IosShare,"分享与导出",{exportSheet=true},filled=false)
+                Box{RoundTool(Icons.Default.MoreHoriz,"笔记更多",{moreMenu=true},filled=false);DropdownMenu(moreMenu,{moreMenu=false}){
+                    DropdownMenuItem({Text("文档内查找")},{moreMenu=false;readerAction="find"})
+                    DropdownMenuItem({Text("版本历史")},{moreMenu=false;scope.launch{repo.flushDraft(n).join();historyRevisions=repo.revisions(n.id);historyDialog=true}},leadingIcon={Icon(Icons.Default.History,"版本历史")})
+                    if(n.deletedAt==null){
+                        if(!repo.isEncrypted(n))DropdownMenuItem({Text("标签")},{moreMenu=false;tagsSheet=true})
+                        DropdownMenuItem({Text("笔记库与上级页面")},{moreMenu=false;folderMenu=true})
+                        if(n.itemType=="note")DropdownMenuItem({Text("新建子页面")},{moreMenu=false;scope.launch{repo.flushDraft(n).join();onNewChild(n)}})
+                        DropdownMenuItem({Text("创建副本")},{moreMenu=false;scope.launch{runCatching{repo.duplicateNote(n.id)}.onSuccess{onOpenNote(it.id)}.onFailure{editorMessage=it.localizedMessage}}})
+                        DropdownMenuItem({Text("删除笔记")},{moreMenu=false;deleteDialog=true},modifier=Modifier.testTag("delete-item"),leadingIcon={Icon(Icons.Default.DeleteOutline,null)})
+                    }
+                }}
+            }
+        }
         if(!editMode){
-            ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).testTag("markdown-view"))
-        }else{
-        OutlinedTextField(n.title,{updateNote(n.copy(title=it))},Modifier.fillMaxWidth().testTag("title-field"),textStyle=MaterialTheme.typography.headlineSmall,label={Text("标题")})
-        val encrypted=repo.isEncrypted(n)
-        FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){Box{AssistChip(onClick={folderMenu=true},label={Text(n.folderName)},leadingIcon={Icon(if(encrypted)Icons.Default.Lock else Icons.Default.Folder,null)});DropdownMenu(folderMenu,{folderMenu=false}){if(!encrypted)DropdownMenuItem({Text("未分类")},{updateNote(n.copy(folderId=null,folderName="未分类",parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));folderMenu=false});folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"}.forEach{f->DropdownMenuItem({Text(f.name)},{if(encrypted)repo.moveEncrypted(n.id,f.id);updateNote(n.copy(folderId=f.id,folderName=f.name,parentPageId=null,treeUpdatedAt=System.currentTimeMillis(),tagIds=if(encrypted)"" else n.tagIds));folderMenu=false})}}};if(n.itemType=="note"){Box{val parentTitle=allNotes.firstOrNull{it.id==n.parentPageId}?.title?:"顶层页面";AssistChip(onClick={parentMenu=true},label={Text("上级：$parentTitle")},leadingIcon={Icon(Icons.Default.AccountTree,null)});DropdownMenu(parentMenu,{parentMenu=false}){DropdownMenuItem({Text("顶层页面")},{updateNote(n.copy(parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));parentMenu=false});val descendants=run{val result=mutableSetOf(n.id);var changed=true;while(changed){changed=false;allNotes.filter{it.parentPageId in result}.forEach{if(result.add(it.id))changed=true}};result};allNotes.filter{it.itemType=="note"&&it.deletedAt==null&&it.folderId==n.folderId&&it.id !in descendants}.sortedBy{it.title}.forEach{candidate->DropdownMenuItem({Text(candidate.title.ifBlank{"无标题"})},{updateNote(n.copy(parentPageId=candidate.id,sortOrder=(allNotes.filter{it.parentPageId==candidate.id}.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,treeUpdatedAt=System.currentTimeMillis()));parentMenu=false})}}}};if(!encrypted)tags.forEach{tag->val selected=n.tagIds.split(',').contains(tag.id);FilterChip(selected,{val ids=n.tagIds.split(',').filter{it.isNotBlank()}.toMutableSet();if(selected)ids.remove(tag.id)else ids.add(tag.id);updateNote(n.copy(tagIds=ids.joinToString(",")))},{Text(tag.name)})}}
-        Spacer(Modifier.height(8.dp))
-        fun wrap(before:String,after:String=before){val start=bodyValue.selection.min;val end=bodyValue.selection.max;val next=bodyValue.text.substring(0,start)+before+bodyValue.text.substring(start,end)+after+bodyValue.text.substring(end);bodyValue=TextFieldValue(next,TextRange(end+before.length+after.length));updateNote(n.copy(body=next))}
-        Row(horizontalArrangement=Arrangement.spacedBy(2.dp)){IconButton({wrap("**")}){Text("B",fontWeight=FontWeight.Bold)};IconButton({wrap("_")}){Text("I")};IconButton({wrap("# ","")}){Text("H")};IconButton({wrap("- ","")}){Icon(Icons.Default.FormatListBulleted,"列表")};IconButton({wrap("- [ ] ","")}){Icon(Icons.Default.CheckBox,"清单")};IconButton({referencePicker=true}){Icon(Icons.Default.Link,"插入双链")}}
-        OutlinedTextField(bodyValue,{bodyValue=it;updateNote(n.copy(body=it.text))},Modifier.fillMaxWidth().weight(1f).testTag("body-field"),label={Text("开始记录…")})
-        if(n.itemType=="todo"){Row{Checkbox(n.completedAt!=null,{updateNote(n.copy(completedAt=if(it)System.currentTimeMillis() else null))});Text("已完成",Modifier.padding(top=12.dp));Checkbox(n.important,{updateNote(n.copy(important=it))});Text("重要",Modifier.padding(top=12.dp))};LazyColumn(Modifier.heightIn(max=180.dp)){items(steps,key={it.id}){step->Row{Checkbox(step.checked,{checked->scope.launch{repo.saveStep(step.copy(checked=checked))}});Text(step.text,Modifier.weight(1f).padding(top=12.dp));IconButton({scope.launch{repo.deleteStep(step.id)}}){Icon(Icons.Default.Close,"删除步骤")}}}};Row{OutlinedTextField(newStep,{newStep=it},Modifier.weight(1f),singleLine=true,label={Text("添加步骤")});IconButton({if(newStep.isNotBlank()){scope.launch{repo.saveStep(TodoStepEntity(UUID.randomUUID().toString(),n.id,newStep.trim(),sortOrder=steps.size))};newStep=""}}){Icon(Icons.Default.Add,"添加")}}}
-        if(attachments.isNotEmpty())LazyColumn(Modifier.heightIn(max=220.dp)){items(attachments,key={it.id}){a->AttachmentView(a)}}
-        FlowRow{TextButton({picker.launch("*/*")}){Icon(Icons.Default.AttachFile,null);Text("附件")};TextButton({if(recording){val ok=audioRecorder.stop();recording=false;if(ok)recordingFile?.let{file->scope.launch{repo.addRecordedAudio(n.id,file)}}}else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)}){Icon(if(recording)Icons.Default.Stop else Icons.Default.Mic,null,tint=if(recording)MaterialTheme.colorScheme.error else LocalContentColor.current);Text(if(recording)"停止录音" else "录音")};TextButton({reminderDialog=true}){Icon(Icons.Default.Notifications,null);Text(if(n.reminderAt==null)"提醒" else DateFormat.getDateTimeInstance(DateFormat.SHORT,DateFormat.SHORT).format(Date(n.reminderAt!!)))}}
+            ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
+            FloatingPill(Modifier.align(androidx.compose.ui.Alignment.CenterHorizontally).padding(horizontal=24.dp,vertical=16.dp)){
+                if(n.deletedAt==null){TextButton({editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.testTag("edit-mode")){Icon(Icons.Default.Edit,null);Text(if(n.itemType=="todo")"编辑计划" else "编辑笔记",Modifier.padding(horizontal=16.dp))}}
+                else {TextButton({scope.launch{runCatching{repo.restore(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it}}.onFailure{editorMessage=it.localizedMessage}}}){Text("恢复")};TextButton({permanentConfirm=true}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}
+            }
+        }else Box(Modifier.weight(1f)){
+            ReferenceEditorBody(n.title,::changeTitle,bodyValue,{changeBody(it,true)},{referencePicker=true},{picker.launch("image/*")},{picker.launch("*/*")},{if(recording)stopRecording()else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)},recording,surface=surface,onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},onCommand={changeBody(it,false)},assets=attachments,titles=allNotes.filter{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}.associate{it.id to it.title},onCaret={at->bodyValue=bodyValue.copy(selection=TextRange(at.coerceIn(0,bodyValue.text.length)),composition=null)}){
+                if(n.itemType=="todo"){
+                    Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(n.completedAt!=null,{updateNote(n.copy(completedAt=if(it)System.currentTimeMillis()else null))});Text("已完成");Checkbox(n.important,{updateNote(n.copy(important=it))});Text("重要")}
+                    steps.forEach{step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(step.checked,{checked->scope.launch{repo.saveStep(step.copy(checked=checked))}});Text(step.text,Modifier.weight(1f));IconButton({scope.launch{repo.deleteStep(step.id)}}){Icon(Icons.Default.Close,"删除步骤")}}}
+                    Row{TextField(newStep,{newStep=it},Modifier.weight(1f),singleLine=true,placeholder={Text("添加步骤")});IconButton({if(newStep.isNotBlank()){val text=newStep.trim();newStep="";scope.launch{repo.saveStep(TodoStepEntity(UUID.randomUUID().toString(),n.id,text,sortOrder=steps.size))}}}){Icon(Icons.Default.Add,"添加步骤")}}
+                }
+                attachments.filter{it.id !in NotebookAssetSyntax.images(n.body).map{image->image.assetId}}.forEach{AttachmentView(it)}
+                FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){
+                    AssistChip({folderMenu=true},{Text(folders.firstOrNull{it.id==n.folderId}?.name?:n.folderName)},leadingIcon={Icon(Icons.Default.Folder,null)})
+                    if(!repo.isEncrypted(n))AssistChip({tagsSheet=true},{Text(if(n.tagIds.isBlank())"添加标签" else "标签")},leadingIcon={Icon(Icons.Default.Label,null)})
+                    AssistChip({reminderDialog=true},{Text(if(n.reminderAt==null)"提醒" else "已设提醒")},leadingIcon={Icon(Icons.Default.NotificationsNone,null)})
+                    if(recording)AssistChip({stopRecording()},{Text("正在录音 · 点击停止")},leadingIcon={Icon(Icons.Default.Mic,null,tint=MaterialTheme.colorScheme.error)})
+                }
+
+            }
         }
     }
+    val tableFrom=surface.tableStart.intValue
+    val tableTo=surface.tableEnd.intValue
+    if(tableFrom>=0&&tableTo in tableFrom..n.body.length)TableEditorDialog(n.body.substring(tableFrom,tableTo),n.deletedAt!=null,{surface.tableStart.intValue=-1}){markdown->
+        surface.tableStart.intValue=-1
+        changeBody(TextFieldValue(n.body.replaceRange(tableFrom,tableTo,markdown),TextRange(tableFrom+markdown.length)),false)
+    }
+    if(folderMenu)ModalBottomSheet(onDismissRequest={folderMenu=false}){
+        SheetTitle("笔记库与上级页面",{folderMenu=false})
+        val encrypted=repo.isEncrypted(n)
+        if(!encrypted)ListItem(headlineContent={Text("未分类")},modifier=Modifier.clickable{updateNote(n.copy(folderId=null,folderName="未分类",parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));folderMenu=false})
+        LazyColumn(Modifier.heightIn(max=320.dp)){items(folders.filter{it.type==if(encrypted)"encryptedFolder" else if(n.itemType=="todo")"todoList" else "noteFolder"},key={it.id}){folder->ListItem(headlineContent={Text(folder.name)},leadingContent={LibraryCover(libraryColor(folder.color),Modifier.size(44.dp,38.dp),encrypted)},modifier=Modifier.clickable{if(encrypted)repo.moveEncrypted(n.id,folder.id);updateNote(n.copy(folderId=folder.id,folderName=folder.name,parentPageId=null,treeUpdatedAt=System.currentTimeMillis()));folderMenu=false})}}
+        if(n.itemType=="note")TextButton({folderMenu=false;pageMove=true}){Icon(Icons.Default.AccountTree,null);Text("移动到上级页面…")};Spacer(Modifier.height(24.dp))
+    }
+    if(pageMove)allNotes.firstOrNull{it.id==n.id}?.let{summary->MovePageDialog(summary,allNotes.filter{repo.isEncrypted(it)==repo.isEncrypted(n)},{pageMove=false}){parent->pageMove=false;scope.launch{repo.flushDraft(n).join();runCatching{repo.movePage(n.id,parent)}.onSuccess{latestDraft.value=it;n=it}.onFailure{editorMessage=it.localizedMessage}}}}
+    if(tagsSheet)NoteTagsSheet(tags,n.tagIds,{tagsSheet=false},{updateNote(n.copy(tagIds=it))}){name->scope.launch{val id=UUID.randomUUID().toString();repo.saveTag(name,id=id);updateNote(n.copy(tagIds=(n.tagIds.split(',').filter(String::isNotBlank)+id).joinToString(",")))}}
+    if(exportSheet)ExportSheet(n,{exportSheet=false}){repo.flushDraft(latestDraft.value).join();check(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){"请先重试保存笔记"}}
+    if(editorOutline)ModalBottomSheet(onDismissRequest={editorOutline=false}){SheetTitle("目录",{editorOutline=false});val headings=editorDocument?.headings.orEmpty();if(headings.isEmpty())Text("添加标题后，这里会出现目录",Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.heightIn(max=440.dp)){items(headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title)},modifier=Modifier.padding(start=((heading.level-1)*14).dp).clickable{bodyValue=bodyValue.copy(selection=TextRange(heading.sourceOffsetUtf16));editorOutline=false})}};Spacer(Modifier.height(24.dp))}
+    if(permanentConfirm)AlertDialog(onDismissRequest={permanentConfirm=false},title={Text("彻底删除笔记？")},text={Text("此操作无法恢复。")},confirmButton={Button({permanentConfirm=false;scope.launch{repo.deletePermanently(n.id);onDone(n)}},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("彻底删除")}},dismissButton={TextButton({permanentConfirm=false}){Text("取消")}})
     if(referencePicker)ReferencePickerDialog(
         notes=visibleReferenceNotes(allNotes,n.id,encryptedUnlocked,repo::isEncrypted),
         onDismiss={referencePicker=false},
@@ -573,8 +581,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
             val start=bodyValue.selection.min
             val end=bodyValue.selection.max
             val next=bodyValue.text.substring(0,start)+syntax+bodyValue.text.substring(end)
-            bodyValue=TextFieldValue(next,TextRange(start+syntax.length))
-            updateNote(n.copy(body=next))
+            changeBody(TextFieldValue(next,TextRange(start+syntax.length)))
             referencePicker=false
         }
     )
@@ -584,6 +591,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         onRestore={revision->
             scope.launch{
                 runCatching{repo.restoreRevision(n.id,revision.id)}.onSuccess{restored->
+                    latestDraft.value=restored
                     n=restored
                     bodyValue=TextFieldValue(restored.body)
                     editMode=false
@@ -617,7 +625,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
 }
 
 @Composable private fun ReferencePickerDialog(notes:List<NoteSummary>,onDismiss:()->Unit,onSelect:(NoteSummary,Boolean)->Unit){
-    var query by remember{mutableStateOf("")}
+    var query by rememberSaveable{mutableStateOf("")}
     var embed by remember{mutableStateOf(false)}
     val visible=remember(notes,query){notes.filter{query.isBlank()||it.title.contains(query,true)||it.preview.contains(query,true)}.take(100)}
     AlertDialog(
@@ -657,8 +665,10 @@ private data class ReaderStyle(val fontSizeSp:Float=17f,val lineHeight:Float=1.2
 private sealed interface ReaderDocumentState { data object Loading:ReaderDocumentState;data class Ready(val document:ParsedMarkdownDocument):ReaderDocumentState;data class Failed(val message:String):ReaderDocumentState }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,modifier:Modifier=Modifier){
+@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,modifier:Modifier=Modifier,onUpdateBody:(String)->Unit={},readerAction:String?=null,onActionConsumed:()->Unit={},onTags:()->Unit={},onTable:(Int,Int)->Unit={_,_->}){
     val allNotes by repo.notes.collectAsState(initial=emptyList())
+    val noteTags by repo.tags.collectAsState(initial=emptyList())
+    val readerFolders by repo.folders.collectAsState(initial=emptyList())
     val backlinks by repo.backlinks(note.id).collectAsState(initial=emptyList())
     val visibleBacklinks=backlinks.filter{link->canExposeNote(allNotes.firstOrNull{it.id==link.sourceNoteId},encryptedUnlocked,repo::isEncrypted)}
     val references=remember(note.body){NotebookReferenceSyntax.parse(note.body)}
@@ -690,6 +700,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     val document=ready.document;val blocks=document.blocks;val state=remember(note.id){androidx.compose.foundation.lazy.LazyListState()};val scope=rememberCoroutineScope();val views=remember(note.id,note.body){mutableMapOf<Int,TextView>()};val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)3 else 2
     val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingBacklinks by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
     val searchMatches=remember(note.body,searchQuery){if(searchQuery.isBlank())emptyList()else buildList{var start=0;while(size<10_000){val found=note.body.indexOf(searchQuery,start,ignoreCase=true);if(found<0)break;add(found);start=found+searchQuery.length.coerceAtLeast(1)}}}
+    LaunchedEffect(readerAction){when(readerAction){"outline"->showingOutline=true;"find"->showingSearch=true};if(readerAction!=null)onActionConsumed()}
     fun navigateSearch(delta:Int){if(searchMatches.isEmpty())return;searchIndex=(searchIndex+delta).mod(searchMatches.size);val offset=searchMatches[searchIndex];val blockIndex=blocks.indexOfLast{it.startUtf16<=offset}.coerceAtLeast(0);launchScroll(scope,state,bodyStart+blockIndex)}
     var restored by remember(note.id){mutableStateOf(false)};val latestRestored by rememberUpdatedState(restored)
     fun capturedPosition():Pair<Int,Double>{
@@ -709,9 +720,9 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     LaunchedEffect(note.id,restored,blocks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
     DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
     Box(modifier){LazyColumn(Modifier.fillMaxSize(),state=state,contentPadding=PaddingValues(top=if(showingSearch)64.dp else 0.dp,bottom=36.dp),horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){
-        item(key="reader-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Text("${blocks.size} 个内容块",style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=14.dp));Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};if(document.headings.isNotEmpty())IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};BadgedBox(badge={if(visibleBacklinks.isNotEmpty())Badge{Text(visibleBacklinks.size.toString())}}){IconButton({showingBacklinks=true}){Icon(Icons.Default.Link,"反向链接")}};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
+        item(key="reader-tools"){Spacer(Modifier.height(4.dp))}
         item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=12.dp).testTag("reader-note-${note.id}"))}
-        if(hasMetadata)item(key="note-folder"){Text(note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp))}
+        if(hasMetadata)item(key="note-folder"){FlowRow(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)){Text(readerFolders.firstOrNull{it.id==note.folderId}?.name?:note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(vertical=8.dp));noteTags.filter{it.id in note.tagIds.split(',')}.forEach{tag->AssistChip(onTags,{Text(tag.name)})}}}
         if(blocks.isEmpty())item(key="empty-note"){Text("暂无正文",Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)}
         items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->
             val block=blocks[index]
@@ -720,7 +731,13 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
                 val imageRefs=NotebookAssetSyntax.images(expandedMarkdown)
                 val displayMarkdown=NotebookAssetSyntax.withoutImages(expandedMarkdown)
                 Column(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=if(index==0)12.dp else 0.dp)){
-                    if(displayMarkdown.isNotBlank())MarkdownView(markdown=displayMarkdown,modifier=Modifier.fillMaxWidth(),style=readerStyle,highlightQuery=searchQuery,onNotebookLink=::openReference,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})
+                    if(block.kind==MarkdownBlockKind.Table){
+                        Surface(shape=MaterialTheme.shapes.medium,color=MaterialTheme.colorScheme.surfaceVariant,modifier=Modifier.fillMaxWidth().clickable{onTable(block.startUtf16,block.endUtf16)}){Column(Modifier.padding(16.dp)){Row{Text("表格",Modifier.weight(1f),fontWeight=FontWeight.SemiBold);IconButton({onTable(block.startUtf16,block.endUtf16)}){Icon(Icons.Default.OpenInFull,"全屏表格")}};MarkdownView(displayMarkdown,Modifier.fillMaxWidth().padding(top=10.dp),style=readerStyle)}}
+
+                    }else if(block.kind==MarkdownBlockKind.List&&block.text.lines().all{it.isBlank()||Regex("^[ \t]*[-+*] \\[[ xX]] .*").matches(it)}){
+                        var lineOffset=block.startUtf16
+                        block.text.lines().filter(String::isNotBlank).forEach{line->val at=lineOffset;lineOffset+=line.length+1;val match=Regex("^[ \t]*[-+*] \\[([ xX])] (.*)").find(line)!!;val checked=match.groupValues[1].equals("x",true);Row(Modifier.fillMaxWidth(),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(checked,{next->val marker=at+line.indexOf('[')+1;onUpdateBody(note.body.replaceRange(marker,marker+1,if(next)"x" else " "))},enabled=note.deletedAt==null);Text(match.groupValues[2],textDecoration=if(checked)androidx.compose.ui.text.style.TextDecoration.LineThrough else null,color=if(checked)MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface)}}
+                    }else if(displayMarkdown.isNotBlank())MarkdownView(markdown=displayMarkdown,modifier=Modifier.fillMaxWidth(),style=readerStyle,highlightQuery=searchQuery,onNotebookLink=::openReference,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)})
                     val blockReferences=references.filter{it.start in block.startUtf16 until block.endUtf16}
                     if(blockReferences.isNotEmpty())FlowRow(Modifier.padding(top=6.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){
                         blockReferences.forEach{reference->
@@ -732,10 +749,11 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
                 }
             }
         }
+        item(key="reader-extra-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};BadgedBox(badge={if(visibleBacklinks.isNotEmpty())Badge{Text(visibleBacklinks.size.toString())}}){IconButton({showingBacklinks=true}){Icon(Icons.Default.Link,"反向链接")}};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
         if(note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider(Modifier.widthIn(max=readerStyle.maxWidthDp.dp))};items(steps,key={"read-step-${it.id}"}){step->Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
         items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
     };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
-    if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
+    if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){if(document.headings.isEmpty())Text("添加标题后，这里会出现目录",Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant);Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
     if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(visibleBacklinks.isEmpty())Text("还没有其他可查看的页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(visibleBacklinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when(link.targetKind){"block"->"引用了内容块";"group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
 }
@@ -762,6 +780,7 @@ internal fun createMarkdownRenderer(context:android.content.Context,onNotebookLi
     .usePlugin(StrikethroughPlugin.create())
     .usePlugin(TablePlugin.create(context))
     .usePlugin(object:io.noties.markwon.AbstractMarkwonPlugin(){
+        override fun configureTheme(builder:io.noties.markwon.core.MarkwonTheme.Builder){builder.headingBreakHeight(0);builder.headingTextSizeMultipliers(floatArrayOf(26f/17f,22f/17f,18f/17f,1f,1f,1f))}
         override fun configureConfiguration(builder:io.noties.markwon.MarkwonConfiguration.Builder){
             val defaultResolver=io.noties.markwon.LinkResolverDef()
             builder.linkResolver{view,link->if(link.startsWith("notebook://page/"))onNotebookLink(link)else defaultResolver.resolve(view,link)}
@@ -783,7 +802,7 @@ internal fun configureMarkdownTextView(view:TextView){
 
 @Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,style:ReaderStyle=ReaderStyle(),highlightQuery:String="",onNotebookLink:(String)->Unit={},onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={}){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val highlight=MaterialTheme.colorScheme.tertiaryContainer.toArgb();val latestNotebookLink by rememberUpdatedState(onNotebookLink);val markwon=remember(context){createMarkdownRenderer(context){latestNotebookLink(it)}};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;configureMarkdownTextView(this)}},update={view->view.setTextColor(color);view.setTextSize(TypedValue.COMPLEX_UNIT_SP,style.fontSizeSp);view.setLineSpacing(0f,style.lineHeight);val renderKey=Triple(markdown,style.fontSizeSp,highlightQuery);if(view.tag!=renderKey){markwon.setMarkdown(view,markdown);if(highlightQuery.isNotBlank()){val highlighted=SpannableString(view.text);var start=0;while(start<highlighted.length){val found=highlighted.toString().indexOf(highlightQuery,start,ignoreCase=true);if(found<0)break;highlighted.setSpan(BackgroundColorSpan(highlight),found,found+highlightQuery.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);start=found+highlightQuery.length.coerceAtLeast(1)};view.text=highlighted};view.tag=renderKey};onViewReady(view)},modifier=modifier)}
 
-@Composable private fun AttachmentView(asset:AssetEntity,caption:String?=asset.caption){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Column(Modifier.fillMaxWidth().padding(vertical=6.dp),horizontalAlignment=when(asset.alignment){"center"->androidx.compose.ui.Alignment.CenterHorizontally;"right"->androidx.compose.ui.Alignment.End;else->androidx.compose.ui.Alignment.Start}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().then(asset.displayWidth?.let{Modifier.widthIn(max=it.coerceIn(80,1200).dp)}?:Modifier).heightIn(max=720.dp).clickable{open()},contentScale=androidx.compose.ui.layout.ContentScale.Fit);caption?.takeIf(String::isNotBlank)?.let{Text(it,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)formatBytes(asset.size) else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
+@Composable internal fun AttachmentView(asset:AssetEntity,caption:String?=asset.caption){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Column(Modifier.fillMaxWidth().padding(vertical=6.dp),horizontalAlignment=when(asset.alignment){"center"->androidx.compose.ui.Alignment.CenterHorizontally;"right"->androidx.compose.ui.Alignment.End;else->androidx.compose.ui.Alignment.Start}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().then(asset.displayWidth?.let{Modifier.widthIn(max=it.coerceIn(80,1200).dp)}?:Modifier).heightIn(max=720.dp).clickable{open()},contentScale=androidx.compose.ui.layout.ContentScale.Fit);caption?.takeIf(String::isNotBlank)?.let{Text(it,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)formatBytes(asset.size) else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
 
 private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024->String.format(Locale.getDefault(),"%.1f KB",bytes/1024.0);else->String.format(Locale.getDefault(),"%.1f MB",bytes/(1024.0*1024.0))}
 
@@ -791,14 +810,17 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 @Composable private fun ReminderDialog(current:Long?,currentRule:String,onDismiss:()->Unit,onConfirm:(Long?,String)->Unit){val base=current?:System.currentTimeMillis()+3_600_000;val cal=remember(base){Calendar.getInstance().apply{timeInMillis=base}};val date=rememberDatePickerState(initialSelectedDateMillis=base);val time=rememberTimePickerState(cal.get(Calendar.HOUR_OF_DAY),cal.get(Calendar.MINUTE),true);var rule by remember{mutableStateOf(currentRule)};AlertDialog(onDismissRequest=onDismiss,title={Text("设置提醒")},text={Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())){DatePicker(date);TimePicker(time);Text("重复",fontWeight=FontWeight.Medium);SingleChoiceSegmentedButtonRow{listOf("none" to "一次","daily" to "每天","weekly" to "每周","monthly" to "每月").forEachIndexed{i,p->SegmentedButton(selected=rule==p.first,onClick={rule=p.first},shape=SegmentedButtonDefaults.itemShape(i,4)){Text(p.second)}}}}},confirmButton={Button({val selected=date.selectedDateMillis;if(selected==null)onConfirm(null,"none")else{val c=Calendar.getInstance().apply{timeInMillis=selected;set(Calendar.HOUR_OF_DAY,time.hour);set(Calendar.MINUTE,time.minute);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0)};onConfirm(c.timeInMillis,rule)}}){Text("确定")}},dismissButton={Row{TextButton({onConfirm(null,"none")}){Text("清除")};TextButton(onDismiss){Text("取消")}}})}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
+@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit){
+    BackHandler(onBack=onBack)
+    val context=LocalContext.current
     var backend by remember{mutableStateOf(repo.syncBackend())}
     var w by remember{mutableStateOf(repo.webdavSettings())}
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
     var showLegacySync by remember{mutableStateOf(backend==SyncBackend.SSH||backend==SyncBackend.API)}
+    var diagnosticMessage by remember{mutableStateOf<String?>(null)}
     suspend fun syncNow(){
         if(syncing)return
         syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null
@@ -887,6 +909,21 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                     }
                 }
             }
+            HorizontalDivider()
+            Text("诊断日志",fontWeight=FontWeight.SemiBold)
+            Text("导出最近约 2 MiB 的结构化运行日志。日志不含笔记标题、正文、密码、令牌、原始网址或服务器响应。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick={scope.launch{
+                runCatching{
+                        val file=withContext(Dispatchers.IO){DiagnosticLogger.exportArchive(context)}
+                        val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file)
+                        val share=Intent(Intent.ACTION_SEND).setType("application/zip").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        context.startActivity(Intent.createChooser(share,"分享 Notebook 诊断日志"))
+                    }.onSuccess{diagnosticMessage=null}.onFailure{error->
+                        if(error is CancellationException)throw error
+                        diagnosticMessage="诊断日志导出失败"
+                    }
+            }},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Share,null);Spacer(Modifier.width(8.dp));Text("导出并分享诊断日志")}
+            diagnosticMessage?.let{Text(it,color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)}
         }
     }
 }

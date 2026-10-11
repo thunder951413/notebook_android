@@ -228,7 +228,8 @@ internal object MarkdownDocumentParser {
         while (end - cursor > limit) {
             val proposed = cursor + limit
             val newline = markdown.lastIndexOf('\n', proposed).takeIf { it >= cursor + limit / 2 }
-            val split = (newline?.plus(1) ?: proposed).coerceIn(cursor + 1, end)
+            var split = (newline?.plus(1) ?: proposed).coerceIn(cursor + 1, end)
+            if (split < end && Character.isLowSurrogate(markdown[split])) split--
             output += RawBlock(cursor, split, MarkdownBlockKind.Paragraph)
             cursor = split
         }

@@ -1,6 +1,7 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <!-- Local adb-reverse/LAN test servers are allowed only in debug builds. -->
-    <application android:usesCleartextTraffic="true">
+    <application android:usesCleartextTraffic="true" android:label="Notebook UI 预览" tools:replace="android:label">
+        <activity android:name=".DebugUiStudyActivity" android:exported="true" />
         <activity android:name=".DebugSyncActivity" android:exported="true" />
     </application>
 </manifest>

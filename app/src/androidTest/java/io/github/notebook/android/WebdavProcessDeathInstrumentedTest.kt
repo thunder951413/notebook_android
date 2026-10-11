@@ -39,8 +39,10 @@ class WebdavProcessDeathInstrumentedTest {
     }
 
     @Test fun prepareDurablePendingChange()=runBlocking {
+        assumeTrue("Requires host-driven prepare phase",InstrumentationRegistry.getArguments().getString("processDeathPhase")=="prepare")
         val app=app()
-        WorkManager.getInstance(app).cancelAllWork()
+        WorkManager.getInstance(app).cancelAllWork().result.get()
+        app.repository.flushAll();app.database.clearAllTables()
         app.repository.saveWebdavSettings(settings())
         val id=UUID.randomUUID().toString()
         val marker="PROCESS-DEATH-${UUID.randomUUID()}"
@@ -52,6 +54,7 @@ class WebdavProcessDeathInstrumentedTest {
     }
 
     @Test fun offlineRestartKeepsPendingChange()=runBlocking {
+        assumeTrue("Requires host-driven offline phase",InstrumentationRegistry.getArguments().getString("processDeathPhase")=="offline")
         val app=app()
         WorkManager.getInstance(app).cancelAllWork()
         val id=app.getSharedPreferences(stateName,0).getString("noteId",null)!!
@@ -62,6 +65,7 @@ class WebdavProcessDeathInstrumentedTest {
     }
 
     @Test fun restoredNetworkPublishesPendingChange()=runBlocking {
+        assumeTrue("Requires host-driven restored phase",InstrumentationRegistry.getArguments().getString("processDeathPhase")=="restored")
         val app=app()
         WorkManager.getInstance(app).cancelAllWork()
         val state=app.getSharedPreferences(stateName,0)

@@ -2,7 +2,7 @@
 
 项目迁移、架构约束、自动保存/提醒说明、完整使用场景审计和 AI 接手步骤见 [`AI_HANDOFF.md`](AI_HANDOFF.md)。后续开发应先阅读该文档。
 
-这是 Notebook 的 Android 移动端子项目。应用离线优先，本地使用 Room 保存数据。**坚果云 WebDAV 是唯一推荐的正式同步方式**；SSH/SFTP Markdown v3 和 Notebook Next HTTP API 仅为已有部署的数据迁移兼容，不用于新的长期同步配置。
+这是 Notebook 的独立 Android 项目。本次 UI 改版在 `codex/coloros-notes-ui` 分支，细节见 [`docs/UI_REFERENCE_IMPLEMENTATION.md`](docs/UI_REFERENCE_IMPLEMENTATION.md)；默认 `main` 可能仍是旧实现，比较行为或发布前请先核对分支与提交。应用离线优先，本地使用 Room 保存数据。**坚果云 WebDAV 是唯一推荐的正式同步方式**；SSH/SFTP Markdown v3 和 Notebook Next HTTP API 仅为已有部署的数据迁移兼容，不用于新的长期同步配置。
 
 旧 SSH/SFTP Markdown v3 仓库的交换文件包括：
 
@@ -19,7 +19,7 @@
 - 笔记和 Todo 的新建、编辑、完成、重要标记、搜索、软删除/回收站
 - 文件夹、标签和 macOS 数据模型的本地存储
 - 一次性、每日、每周、每月本地通知，权限状态提示、重启恢复及点击直达项目
-- 无保存按钮的自动保存、后台/返回强制刷新与崩溃草稿恢复
+- 防抖自动保存、手动保存反馈、后台/返回强制刷新与崩溃草稿恢复
 - 坚果云 WebDAV 正式同步，以及 SSH 旧配置的加密保存与迁移兼容
 - macOS Swift `JSONEncoder` 日期（2001 reference date）兼容
 - `library.json`、gzip 笔记、内容寻址资源和哈希历史的旧 SFTP 仓库读取/迁移兼容
@@ -27,7 +27,9 @@
 - 图片、音频、文件附件的上传、下载、预览和系统打开
 - 原生语音录制和 Todo 步骤
 - 文件夹/标签管理、冲突解决、回收站恢复与彻底删除
-- 手机抽屉式导航和 Pad 常驻三栏布局
+- 手机笔记／笔记库双标签、卡片、多选与彩色库封面；Pad 常驻三栏布局
+- 阅读／编辑切换、Markdown 格式工具、撤销重做、标签与目录、可编辑全屏表格
+- Markdown、TXT、Word、PDF 与四套图片模板导出；分组设置、深色主题及容器转场
 - 远端索引互斥锁、删除墓碑、后台同步与开机提醒恢复
 - Notebook Next 游标同步、幂等 outbox、乐观冲突、附件二进制往返，以及网页 TipTap JSON 与 Android Markdown 的转换
 - Notebook Next 服务地址、工作区 ID 和 Token 的加密保存
@@ -42,7 +44,7 @@
 
 已在本机真实执行并通过 `assembleDebug`，调试 APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
 
-迁出时直接移动整个 `android-app` 目录即可，它不依赖上级 Xcode 项目。
+仓库可独立克隆、构建和测试，不依赖桌面端 Notebook 或 Xcode 工程。
 
 ## 同步设置
 
@@ -64,9 +66,9 @@ Notebook Next HTTP API 同样只保留给已有服务部署的迁移兼容。正
 
 ## 界面设计
 
-手机端沿用 macOS 端暖白背景、琥珀黄强调色、分组导航和摘要列表的设计语言。桌面端三栏结构在手机上转换为“抽屉侧栏 → 摘要列表 → 编辑器”，避免把三栏强行压缩到窄屏；导航分类与 macOS 端保持对应。
+手机采用系统笔记参考的灰白背景、橙色强调、白色圆角卡片和悬浮胶囊。首页在“笔记／笔记库”之间切换，阅读优先，编辑正文直接显示格式、图片、表格和代码块，底部工具在输入法与格式面板之间切换。原有分类、待办、私密库、标签、历史与同步继续可达。
 
-Pad 宽度达到 840dp 后使用“常驻侧栏 + 摘要列表 + 编辑器”三栏布局；手机使用“抽屉侧栏 → 摘要列表 → 全屏编辑器”。两种布局已分别在 API 35 ARM64 手机和平板模拟器上运行和截图检查。
+Pad 宽度达到 840 dp 后使用“常驻侧栏 + 摘要列表 + 编辑器”三栏；手机使用全屏文档容器转场。最新模拟器验收范围和界面证据见 [`docs/UI_REFERENCE_IMPLEMENTATION.md`](docs/UI_REFERENCE_IMPLEMENTATION.md)。
 
 ## 验证
 
@@ -75,7 +77,7 @@ Pad 宽度达到 840dp 后使用“常驻侧栏 + 摘要列表 + 编辑器”三
 ./gradlew connectedDebugAndroidTest
 ```
 
-当前测试覆盖协议日期、索引墓碑合并、OpenSSH 指纹、块文档与富文本往返、Room 持久化/级联删除/并发同步确认、Notebook Next HTTP 契约，以及设备环境下的新建、编辑和保存主流程。
+当前测试覆盖协议日期、索引墓碑合并、OpenSSH 指纹、块文档与富文本往返、Room 持久化/级联删除/并发同步确认、Notebook Next HTTP 契约，以及设备环境下的新建、编辑、保存和 WebDAV XML 安全解析。仅 JVM 测试不能覆盖 Android 平台 XML、生命周期和进程行为；这些变化必须补跑对应的 connected tests。
 
 Notebook Next 真机往返测试要求本机 8787 端口运行隔离服务并执行 `adb reverse tcp:8787 tcp:8787`，随后运行：
 
@@ -132,3 +134,7 @@ git push origin android-v0.3.0
 - 发布前应在隔离的坚果云 WebDAV 目录完成桌面 → Android → 桌面的附件、冲突、取消/重试和私密笔记本地保留演练，并配置正式签名。若仍需兼容旧 SSH 仓库，另行执行一次迁移回归，但不把它作为正式同步验收。
 
 建议先用一个测试用远程目录联调，确认 macOS 往返不会改变原始笔记后，再连接正式数据目录。
+
+## 问题诊断
+
+日志默认只保存在手机本地，自动轮转，合计最多约 2 MiB。设置与同步中可导出并分享；Debug 包可通过 adb 提取。具体字段、容量与命令见 [DIAGNOSTICS.md](DIAGNOSTICS.md)。

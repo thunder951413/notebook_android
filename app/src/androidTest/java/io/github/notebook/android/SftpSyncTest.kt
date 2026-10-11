@@ -39,6 +39,7 @@ class SftpSyncTest {
     @Test fun uploadCreatesRemoteEnvelopeAndCleansCommittedVersion()=runBlocking {
         val instrumentation=InstrumentationRegistry.getInstrumentation();val fingerprint=InstrumentationRegistry.getArguments().getString("sftpFingerprint").orEmpty();assumeTrue("SFTP fixture not configured",fingerprint.startsWith("SHA256:"))
         val app=instrumentation.targetContext.applicationContext as NotebookApp;val repo=app.repository
+        androidx.work.WorkManager.getInstance(app).cancelAllWork().result.get();repo.flushAll();app.database.clearAllTables()
         repo.saveSettings(SshSettings("10.0.2.2",2222,"notebook","test-password","/sync",fingerprint))
         val id=UUID.randomUUID().toString();repo.save(NoteEntity(id,title="SFTP 端到端",body="# 标题\n- [x] 完成"))
         val recording=java.io.File(app.cacheDir,"fixture.m4a").apply{writeBytes(ByteArray(4096){(it%251).toByte()})};val uploadedAsset=repo.addRecordedAudio(id,recording)
