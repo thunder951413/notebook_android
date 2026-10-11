@@ -36,10 +36,12 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import io.github.notebook.android.data.*
 import io.github.notebook.android.sync.SyncRepository
 import java.text.SimpleDateFormat
@@ -138,6 +140,10 @@ internal fun ReferenceHome(
     var filters by remember { mutableStateOf(false) }
     var filterChild by remember { mutableStateOf<String?>(null) }
     var createMenu by remember { mutableStateOf(false) }
+    val createTransition = remember { MutableTransitionState(false) }
+    createTransition.targetState = createMenu
+    val homeBlur by
+        animateDpAsState(if (createMenu) 12.dp else 0.dp, tween(180), label = "create-blur")
     var order by rememberSaveable { mutableStateOf(NoteOrder.Updated) }
     var descending by rememberSaveable { mutableStateOf(true) }
     var content by rememberSaveable { mutableStateOf(ContentFilter.All) }
@@ -297,7 +303,7 @@ internal fun ReferenceHome(
             Column(
                 (if (tabletEditor != null) Modifier.width(homeWidth) else Modifier.weight(1f))
                     .fillMaxHeight()
-                    .then(if (createMenu) Modifier.blur(12.dp) else Modifier)
+                    .then(if (homeBlur > 0.dp) Modifier.blur(homeBlur) else Modifier)
             ) {
                 AnimatedContent(
                     targetState = if (selecting) 2 else if (search) 1 else 0,
@@ -310,7 +316,7 @@ internal fun ReferenceHome(
                     Row(
                         Modifier.fillMaxWidth()
                             .statusBarsPadding()
-                            .padding(horizontal = 12.dp, vertical = 12.dp)
+                            .padding(start = 12.dp, end = 12.dp, top = 0.dp, bottom = 4.dp)
                             .height(48.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -396,13 +402,7 @@ internal fun ReferenceHome(
                                         { onSelect(Destination.All, null, null) },
                                         filled = false,
                                     )
-                                else
-                                    Text(
-                                        "Notebook",
-                                        Modifier.weight(1f).padding(start = 8.dp),
-                                        fontSize = 16.sp,
-                                        fontWeight = FontWeight.Medium,
-                                    )
+                                else Spacer(Modifier.weight(1f))
                                 if (
                                     folder != null ||
                                         destination != Destination.All ||
@@ -518,23 +518,24 @@ internal fun ReferenceHome(
                 error?.let {
                     Text(it, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
                 }
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        if (search) "搜索结果 · ${visible.size}"
-                        else if (librariesVisible) "笔记库" else title,
-                        Modifier.weight(1f),
-                        fontSize = if (search) 18.sp else 32.sp,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    if (!search && !selecting && (tab == 0 || folder != null))
-                        TextButton({ filters = true }) {
-                            Icon(Icons.Default.Tune, "筛选", Modifier.size(19.dp))
-                            Text("${visible.size}", Modifier.padding(start = 6.dp))
-                        }
-                }
+                if (!globalHome || search || librariesVisible || selecting)
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            if (search) "搜索结果 · ${visible.size}"
+                            else if (librariesVisible) "笔记库" else title,
+                            Modifier.weight(1f),
+                            fontSize = if (search) 18.sp else 32.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        if (!search && !selecting && (tab == 0 || folder != null))
+                            TextButton({ filters = true }) {
+                                Icon(Icons.Default.Tune, "筛选", Modifier.size(19.dp))
+                                Text("${visible.size}", Modifier.padding(start = 6.dp))
+                            }
+                    }
                 if (destination == Destination.Trash)
                     Text(
                         "已删除的内容会保留在此，直到你恢复或彻底删除。",
@@ -636,6 +637,40 @@ internal fun ReferenceHome(
                                 ),
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
+                            if (globalHome && !search && !selecting) {
+                                item(key = "spotlight-header") {
+                                    HomeSpotlight(
+                                        notes.firstOrNull { it.important } ?: notes.firstOrNull(),
+                                        onCardBounds,
+                                        onOpen,
+                                    )
+                                    Row(
+                                        Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            "全部 ${visible.size}",
+                                            Modifier.weight(1f),
+                                            fontSize = 16.sp,
+                                            lineHeight = 20.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                        )
+                                        TextButton({ filters = true }, Modifier.height(32.dp)) {
+                                            Text(
+                                                "筛选",
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                            Icon(
+                                                Icons.Default.FilterList,
+                                                "筛选",
+                                                Modifier.padding(start = 4.dp).size(20.dp),
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                }
+                            }
                             if (visible.isEmpty())
                                 item {
                                     EmptyNotes(
@@ -689,7 +724,9 @@ internal fun ReferenceHome(
         }
         AnimatedVisibility(
             !search,
-            Modifier.align(Alignment.BottomStart).width(homeWidth),
+            Modifier.align(Alignment.BottomStart)
+                .width(homeWidth)
+                .zIndex(if (createMenu) 2f else 0f),
             enter = fadeIn() + slideInVertically { it },
             exit = fadeOut() + slideOutVertically { it },
         ) {
@@ -756,7 +793,7 @@ internal fun ReferenceHome(
                 }
             else
                 Row(
-                    Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
+                    Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(20.dp),
                 ) {
@@ -764,37 +801,61 @@ internal fun ReferenceHome(
                         if (tabletEditor == null)
                             FloatingRound {
                                 IconButton({
-                                    tab = 0
-                                    onSelect(Destination.Todos, null, null)
+                                    if (createMenu) {
+                                        createMenu = false
+                                        onSettings()
+                                    } else {
+                                        tab = 0
+                                        onSelect(Destination.Todos, null, null)
+                                    }
                                 }) {
-                                    Icon(Icons.Default.Checklist, "全部待办")
+                                    Icon(
+                                        if (createMenu) Icons.Default.Settings
+                                        else Icons.Default.Checklist,
+                                        if (createMenu) "设置" else "全部待办",
+                                    )
                                 }
                             }
-                        FloatingPill(Modifier.weight(1f)) {
+                        FloatingPill(
+                            Modifier.weight(1f)
+                                .then(if (homeBlur > 0.dp) Modifier.blur(homeBlur) else Modifier)
+                        ) {
                             listOf("笔记", "笔记库").forEachIndexed { index, label ->
                                 Box(
                                     Modifier.weight(1f)
                                         .height(44.dp)
                                         .testTag("home-tab-$index")
                                         .clip(CircleShape)
-                                        .background(
-                                            if (tab == index)
-                                                MaterialTheme.colorScheme.secondaryContainer
-                                            else Color.Transparent
-                                        )
-                                        .clickable {
+                                        .clickable(enabled = !createMenu) {
                                             tab = index
                                             onQuery("")
                                         },
                                     contentAlignment = Alignment.Center,
                                 ) {
-                                    Text(
-                                        label,
-                                        fontSize = 15.sp,
-                                        fontWeight =
-                                            if (tab == index) FontWeight.SemiBold
-                                            else FontWeight.Normal,
-                                    )
+                                    val foreground =
+                                        if (tab == index) MaterialTheme.colorScheme.onSurface
+                                        else MaterialTheme.colorScheme.onSurfaceVariant
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                                    ) {
+                                        Icon(
+                                            if (index == 0) Icons.Default.Description
+                                            else Icons.Default.AutoStories,
+                                            null,
+                                            Modifier.size(24.dp),
+                                            tint = foreground,
+                                        )
+                                        Text(
+                                            label,
+                                            fontSize = 11.sp,
+                                            lineHeight = 14.sp,
+                                            color = foreground,
+                                            fontWeight =
+                                                if (tab == index) FontWeight.SemiBold
+                                                else FontWeight.Normal,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -808,7 +869,7 @@ internal fun ReferenceHome(
                             else Text(title, Modifier.padding(horizontal = 12.dp), fontSize = 14.sp)
                         }
                     if (destination.newItemType != null)
-                        FloatingRound {
+                        FloatingRound(prominent = true) {
                             Box(
                                 Modifier.size(48.dp)
                                     .testTag("new-item")
@@ -835,7 +896,11 @@ internal fun ReferenceHome(
                         }
                 }
         }
-        if (createMenu) {
+        androidx.compose.animation.AnimatedVisibility(
+            visibleState = createTransition,
+            enter = fadeIn(tween(180)) + slideInVertically(tween(220)) { it / 10 },
+            exit = fadeOut(tween(160)) + slideOutVertically(tween(180)) { it / 10 },
+        ) {
             Box(Modifier.width(homeWidth).fillMaxHeight()) {
                 Box(
                     Modifier.fillMaxSize()
@@ -844,40 +909,46 @@ internal fun ReferenceHome(
                 )
                 Column(
                     Modifier.align(Alignment.BottomEnd)
-                        .padding(start = 72.dp, end = 16.dp, bottom = 96.dp),
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 96.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Surface(shape = RoundedCornerShape(24.dp), shadowElevation = 12.dp) {
-                        Column {
-                            ListItem(
-                                headlineContent = { Text(if (isTodo) "新建待办" else "文字笔记") },
-                                leadingContent = { Icon(Icons.Default.EditNote, null) },
-                                modifier =
-                                    Modifier.clickable {
-                                            createMenu = false
-                                            onCreate()
-                                        }
-                                        .testTag("create-text-note"),
-                            )
-                            ListItem(
-                                headlineContent = { Text("导入 Markdown / 文本") },
-                                leadingContent = { Icon(Icons.Default.FileOpen, null) },
-                                modifier =
-                                    Modifier.clickable {
-                                        createMenu = false
-                                        onImport()
-                                    },
-                            )
-                            if (folder != null)
-                                ListItem(
-                                    headlineContent = { Text("添加已有笔记") },
-                                    leadingContent = { Icon(Icons.Default.LibraryAdd, null) },
-                                    modifier =
-                                        Modifier.clickable {
-                                            createMenu = false
-                                            existingPicker = true
-                                        },
-                                )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        CreateSourceCard(
+                            if (isTodo) "新建待办" else "写笔记",
+                            "轻松记录，快捷编辑",
+                            Icons.Default.TextFields,
+                            Modifier.weight(1f).testTag("create-text-note"),
+                        ) {
+                            createMenu = false
+                            onCreate()
+                        }
+                        CreateSourceCard(
+                            "导入笔记",
+                            "Markdown 与文本",
+                            Icons.Default.FileOpen,
+                            Modifier.weight(1f),
+                        ) {
+                            createMenu = false
+                            onImport()
+                        }
+                    }
+                    if (folder != null) {
+                        Surface(
+                            shape = RoundedCornerShape(24.dp),
+                            modifier =
+                                Modifier.fillMaxWidth().clickable {
+                                    createMenu = false
+                                    existingPicker = true
+                                },
+                        ) {
+                            Row(
+                                Modifier.padding(20.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(Icons.Default.LibraryAdd, null)
+                                Text("添加已有笔记", Modifier.padding(start = 12.dp))
+                            }
                         }
                     }
                 }
@@ -1023,6 +1094,90 @@ internal fun ReferenceHome(
 }
 
 @Composable
+private fun HomeSpotlight(note: NoteSummary?, onBounds: (Rect) -> Unit, onOpen: (String) -> Unit) {
+    var bounds by remember { mutableStateOf<Rect?>(null) }
+    Column(
+        Modifier.fillMaxWidth()
+            .padding(start = 4.dp, end = 4.dp, bottom = 12.dp)
+            .onGloballyPositioned { bounds = it.boundsInRoot() }
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                Icons.Default.AutoAwesome,
+                null,
+                Modifier.size(22.dp),
+                tint = MaterialTheme.colorScheme.tertiary,
+            )
+            Text("灵光一刻", fontSize = 16.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                cardPreview(note?.preview.orEmpty()).take(80).ifBlank { "记录当下，随时回来继续" },
+                Modifier.weight(1f),
+                fontSize = 24.sp,
+                lineHeight = 32.sp,
+                fontFamily = FontFamily.Serif,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (note != null)
+                IconButton(
+                    {
+                        bounds?.let(onBounds)
+                        onOpen(note.id)
+                    },
+                    Modifier.testTag("open-spotlight"),
+                ) {
+                    Icon(Icons.Default.ArrowForward, "打开摘录笔记")
+                }
+        }
+        Text(
+            if (note == null) "想法、片段和日常，都可以从这里开始" else "摘自「${note.title.ifBlank { "无标题" }}」",
+            Modifier.padding(top = 6.dp),
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun CreateSourceCard(
+    title: String,
+    description: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier.clickable(onClick = onClick),
+        shape = RoundedCornerShape(26.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+    ) {
+        Column(
+            Modifier.heightIn(min = 126.dp).padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(icon, null, Modifier.size(30.dp), tint = MaterialTheme.colorScheme.tertiary)
+            Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                description,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
 private fun ReferenceNoteCard(
     note: NoteSummary,
     preview: String,
@@ -1046,13 +1201,14 @@ private fun ReferenceNoteCard(
         color = MaterialTheme.colorScheme.surface,
     ) {
         Row(
-            Modifier.padding(start = 16.dp, end = 10.dp, top = 16.dp, bottom = 10.dp),
+            Modifier.padding(start = 16.dp, end = 10.dp, top = 12.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
                     highlighted(note.title.ifBlank { "无标题" }, query, accent),
-                    fontSize = 17.sp,
+                    fontSize = 18.sp,
+                    lineHeight = 22.sp,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -1060,16 +1216,19 @@ private fun ReferenceNoteCard(
                 if (preview.isNotBlank())
                     Text(
                         highlighted(preview.replace('\n', ' '), query, accent),
-                        Modifier.padding(top = 7.dp),
+                        Modifier.padding(top = 4.dp),
                         fontSize = 14.sp,
+                        lineHeight = 18.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                Row(Modifier.padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(note.updatedAt)),
-                        fontSize = 11.sp,
+                        SimpleDateFormat("yyyy/M/d HH:mm '更新'", Locale.CHINA)
+                            .format(Date(note.updatedAt)),
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     if (note.reminderAt != null)
@@ -1087,9 +1246,9 @@ private fun ReferenceNoteCard(
                         )
                     Spacer(Modifier.weight(1f))
                     if (!selecting)
-                        IconButton(onMenu, Modifier.size(28.dp)) {
+                        IconButton(onMenu, Modifier.size(20.dp)) {
                             Icon(
-                                Icons.Default.MoreHoriz,
+                                Icons.Default.MoreVert,
                                 "笔记菜单",
                                 Modifier.size(18.dp),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,

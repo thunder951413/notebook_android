@@ -218,7 +218,7 @@ class MainActivityTest {
         val app=rule.activity.application as NotebookApp
         runBlocking{app.database.dao().put(NoteEntity(targetId,title=targetTitle));app.database.dao().put(NoteEntity(sourceId,title=sourceTitle,body="[[page:$targetId]]"));app.database.dao().replacePageLinks(sourceId,listOf(PageLinkEntity("link-$suffix",sourceId,targetId,"page",null,null,false,0,System.currentTimeMillis())))}
         rule.activityRule.scenario.recreate();rule.onNodeWithText(targetTitle).performClick()
-        rule.onNodeWithContentDescription("反向链接").performClick()
+        rule.onNodeWithContentDescription("笔记更多").performClick();rule.onNodeWithText("反向链接").performClick()
         rule.onNodeWithText(sourceTitle).assertIsDisplayed()
     }
 

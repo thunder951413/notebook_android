@@ -138,6 +138,95 @@ class ReferenceUiTest {
     }
 
     @Test
+    fun editingAndClosingFormatPanelShowKeyboardWithoutTestForcingIt() {
+        val prefs = app.getSharedPreferences("editor_preferences", 0)
+        val original = prefs.getBoolean("autoKeyboard", true)
+        try {
+            prefs.edit().putBoolean("autoKeyboard", true).commit()
+            runBlocking {
+                app.repository.save(
+                    NoteEntity("natural-keyboard", title = "自动键盘样本", body = "保留中文正文")
+                )
+            }
+            rule.onNodeWithText("自动键盘样本").performClick()
+            rule.onNodeWithTag("edit-mode").performClick()
+            rule.waitUntil(5_000) {
+                rule.activity.window.decorView.rootWindowInsets.isVisible(
+                    android.view.WindowInsets.Type.ime()
+                )
+            }
+            rule.onNodeWithTag("format-tools").performSemanticsAction(SemanticsActions.OnClick) {
+                it()
+            }
+            rule.waitUntil(5_000) {
+                !rule.activity.window.decorView.rootWindowInsets.isVisible(
+                    android.view.WindowInsets.Type.ime()
+                )
+            }
+            rule.onNodeWithContentDescription("关闭格式").performClick()
+            rule.waitUntil(5_000) {
+                rule.activity.window.decorView.rootWindowInsets.isVisible(
+                    android.view.WindowInsets.Type.ime()
+                )
+            }
+            assertEquals(
+                "保留中文正文",
+                runBlocking { app.database.dao().get("natural-keyboard")!!.body },
+            )
+        } finally {
+            prefs.edit().putBoolean("autoKeyboard", original).commit()
+        }
+    }
+
+    @Test
+    fun disablingAutoKeyboardAfterPanelUseRemainsEffectiveWhenEditingAgain() {
+        val prefs = app.getSharedPreferences("editor_preferences", 0)
+        val original = prefs.getBoolean("autoKeyboard", true)
+        try {
+            prefs.edit().putBoolean("autoKeyboard", true).commit()
+            runBlocking {
+                app.repository.save(
+                    NoteEntity("keyboard-preference", title = "键盘偏好样本", body = "一段正文")
+                )
+            }
+            rule.onNodeWithText("键盘偏好样本").performClick()
+            rule.onNodeWithTag("edit-mode").performClick()
+            waitForStableEditorTools()
+            rule.onNodeWithContentDescription("添加内容").performSemanticsAction(
+                SemanticsActions.OnClick
+            ) {
+                it()
+            }
+            rule.waitUntil(5_000) {
+                !rule.activity.window.decorView.rootWindowInsets.isVisible(
+                    android.view.WindowInsets.Type.ime()
+                )
+            }
+            rule.onNodeWithContentDescription("关闭添加内容").performClick()
+            waitForStableEditorTools()
+            rule.onNodeWithTag("preview-mode").performClick()
+            rule.waitUntil(5_000) {
+                rule.onAllNodesWithTag("edit-mode").fetchSemanticsNodes().isNotEmpty() &&
+                    !rule.activity.window.decorView.rootWindowInsets.isVisible(
+                        android.view.WindowInsets.Type.ime()
+                    )
+            }
+            prefs.edit().putBoolean("autoKeyboard", false).commit()
+            rule.onNodeWithTag("edit-mode").performClick()
+            rule.waitForIdle()
+            android.os.SystemClock.sleep(400)
+            assertFalse(
+                "此前的面板恢复状态不能覆盖用户的自动键盘偏好",
+                rule.activity.window.decorView.rootWindowInsets.isVisible(
+                    android.view.WindowInsets.Type.ime()
+                ),
+            )
+        } finally {
+            prefs.edit().putBoolean("autoKeyboard", original).commit()
+        }
+    }
+
+    @Test
     fun formattingUndoRedoAndPanelSwitchingSaveActualMarkdown() {
         rule.onNodeWithTag("new-item").performTouchInput { longClick() }
         rule.onNodeWithTag("title-field").performTextInput("格式样本")
@@ -173,7 +262,8 @@ class ReferenceUiTest {
                 NoteEntity(
                     "table-ui",
                     title = "表格样本",
-                    body = "## 上文\n\n第一段\n第二段\n第三段\n第四段\n第五段\n\n| A | B |\n| --- | --- |\n| 中文 | 保留 |\n",
+                    body =
+                        "## 上文\n\n第一段\n第二段\n第三段\n第四段\n第五段\n\n| A | B |\n| --- | --- |\n| 中文 | 保留 |\n",
                 )
             )
         }
@@ -262,6 +352,15 @@ class ReferenceUiTest {
                 ?.text == "val old = 1"
         }
         rule.onNodeWithTag("body-field").performTextReplacement("val updated = 2")
+        rule.onNodeWithContentDescription("添加内容").performSemanticsAction(SemanticsActions.OnClick) {
+            it()
+        }
+        rule.waitUntil(5_000) {
+            rule.onAllNodesWithTag("markdown-source-toggle").fetchSemanticsNodes().isNotEmpty() &&
+                !rule.activity.window.decorView.rootWindowInsets.isVisible(
+                    android.view.WindowInsets.Type.ime()
+                )
+        }
         rule.onNodeWithTag("markdown-source-toggle").performClick()
         val expected = source.replace("val old = 1", "val updated = 2") + "追加"
         rule.onNodeWithTag("body-field").assertTextEquals(expected)

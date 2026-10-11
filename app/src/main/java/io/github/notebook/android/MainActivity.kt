@@ -30,6 +30,8 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -500,26 +502,29 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         try{events.collect{onBackProgress(it.progress)};flushLatestAndFinish()}
         catch(cancelled:kotlinx.coroutines.CancellationException){onBackProgress(0f);throw cancelled}
     }
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).statusBarsPadding().navigationBarsPadding()){
+    Column(Modifier.fillMaxSize().background(notePageBackground()).statusBarsPadding().navigationBarsPadding()){
         saveError?.let{Text(it,Modifier.padding(16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
         editorMessage?.let{Text(it,Modifier.padding(16.dp).clickable{editorMessage=null},color=MaterialTheme.colorScheme.error)}
         if(n.conflict){Surface(color=MaterialTheme.colorScheme.errorContainer){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改");Row{TextButton({scope.launch{repo.keepLocal(n.id);repo.loadNote(n.id)?.let{updateNote(it)}}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it;bodyValue=TextFieldValue(it.body)}}}){Text("采用服务器版本")}}}}}
-        Row(Modifier.fillMaxWidth().padding(horizontal=12.dp,vertical=8.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
-            if(showBack)RoundTool(Icons.Default.ArrowBack,"返回",{if(editMode)finishEditing()else flushLatestAndFinish()},filled=false,enabled=!leaving)
+        Row(Modifier.fillMaxWidth().padding(start=12.dp,end=12.dp,top=0.dp,bottom=4.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
+            if(showBack)RoundTool(Icons.Default.ArrowBack,"返回",{if(editMode)finishEditing()else flushLatestAndFinish()},enabled=!leaving)
             if(editMode){
-                RoundTool(Icons.Default.Toc,"目录",{editorOutline=true},filled=false)
-                Spacer(Modifier.weight(1f))
-                SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(latestDraft.value)}
+                RoundTool(Icons.Default.Toc,"目录",{editorOutline=true})
+                Spacer(Modifier.width(24.dp))
                 val tick=historyTick
-                RoundTool(Icons.Default.Undo,"撤销",{restoreEditor(undoHistory.undo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canUndo&&tick>=0,filled=false)
-                RoundTool(Icons.Default.Redo,"重做",{restoreEditor(undoHistory.redo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canRedo&&tick>=0,filled=false)
-                RoundTool(Icons.Default.Check,"完成",{stopRecording();finishEditing()},Modifier.testTag("preview-mode"),filled=false)
+                RoundTool(Icons.Default.Undo,"撤销",{restoreEditor(undoHistory.undo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canUndo&&tick>=0)
+                RoundTool(Icons.Default.Redo,"重做",{restoreEditor(undoHistory.redo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canRedo&&tick>=0)
+                Spacer(Modifier.weight(1f))
+                if(saveState!=null&&(saveState!=NoteSaveState.Saved||showSavedCheck))SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(latestDraft.value)}
+                TextButton({stopRecording();finishEditing()},Modifier.testTag("preview-mode").semantics{contentDescription="完成"},shape=androidx.compose.foundation.shape.CircleShape,colors=ButtonDefaults.textButtonColors(containerColor=MaterialTheme.colorScheme.surface,contentColor=MaterialTheme.colorScheme.onSurface)){Text("完成")}
             }else{
-                Text(if(n.deletedAt!=null)"最近删除" else java.text.SimpleDateFormat("M月d日 HH:mm",Locale.CHINA).format(Date(n.updatedAt)),Modifier.weight(1f).padding(start=8.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                RoundTool(Icons.Default.Toc,"目录",{readerAction="outline"},filled=false)
-                RoundTool(Icons.Default.IosShare,"分享与导出",{exportSheet=true},filled=false)
-                Box{RoundTool(Icons.Default.MoreHoriz,"笔记更多",{moreMenu=true},filled=false);DropdownMenu(moreMenu,{moreMenu=false}){
+                if(n.deletedAt!=null)Text("最近删除",Modifier.weight(1f).padding(start=8.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)else Spacer(Modifier.weight(1f))
+                RoundTool(Icons.Default.Toc,"目录",{readerAction="outline"})
+                RoundTool(Icons.Default.IosShare,"分享与导出",{exportSheet=true})
+                Box{RoundTool(Icons.Default.MoreVert,"笔记更多",{moreMenu=true});DropdownMenu(moreMenu,{moreMenu=false}){
                     DropdownMenuItem({Text("文档内查找")},{moreMenu=false;readerAction="find"})
+                    DropdownMenuItem({Text("反向链接")},{moreMenu=false;readerAction="backlinks"},leadingIcon={Icon(Icons.Default.Link,null)})
+                    DropdownMenuItem({Text("阅读设置")},{moreMenu=false;readerAction="settings"},leadingIcon={Icon(Icons.Default.TextFields,null)})
                     DropdownMenuItem({Text("版本历史")},{moreMenu=false;scope.launch{repo.flushDraft(n).join();historyRevisions=repo.revisions(n.id);historyDialog=true}},leadingIcon={Icon(Icons.Default.History,"版本历史")})
                     if(n.deletedAt==null){
                         if(!repo.isEncrypted(n))DropdownMenuItem({Text("标签")},{moreMenu=false;tagsSheet=true})
@@ -538,7 +543,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 else {TextButton({scope.launch{runCatching{repo.restore(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it}}.onFailure{editorMessage=it.localizedMessage}}}){Text("恢复")};TextButton({permanentConfirm=true}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}
             }
         }else Box(Modifier.weight(1f)){
-            ReferenceEditorBody(n.title,::changeTitle,bodyValue,{changeBody(it,true)},{referencePicker=true},{picker.launch("image/*")},{picker.launch("*/*")},{if(recording)stopRecording()else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)},recording,surface=surface,onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},onCommand={changeBody(it,false)},assets=attachments,titles=allNotes.filter{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}.associate{it.id to it.title},onCaret={at->bodyValue=bodyValue.copy(selection=TextRange(at.coerceIn(0,bodyValue.text.length)),composition=null)}){
+            ReferenceEditorBody(n.title,::changeTitle,bodyValue,{changeBody(it,true)},{referencePicker=true},{picker.launch("image/*")},{picker.launch("*/*")},{if(recording)stopRecording()else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)},recording,surface=surface,onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},onCommand={changeBody(it,false)},assets=attachments,timestamp=java.text.SimpleDateFormat("yyyy/M/d HH:mm",Locale.CHINA).format(Date(n.createdAt)),afterTitle={if(!repo.isEncrypted(n))ReferenceMetaChip(if(n.tagIds.isBlank())"添加标签" else "标签",Icons.Default.Add){tagsSheet=true}},titles=allNotes.filter{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}.associate{it.id to it.title},onCaret={at->bodyValue=bodyValue.copy(selection=TextRange(at.coerceIn(0,bodyValue.text.length)),composition=null)}){
                 if(n.itemType=="todo"){
                     Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(n.completedAt!=null,{updateNote(n.copy(completedAt=if(it)System.currentTimeMillis()else null))});Text("已完成");Checkbox(n.important,{updateNote(n.copy(important=it))});Text("重要")}
                     steps.forEach{step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(step.checked,{checked->scope.launch{repo.saveStep(step.copy(checked=checked))}});Text(step.text,Modifier.weight(1f));IconButton({scope.launch{repo.deleteStep(step.id)}}){Icon(Icons.Default.Close,"删除步骤")}}}
@@ -546,9 +551,9 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 }
                 attachments.filter{it.id !in NotebookAssetSyntax.images(n.body).map{image->image.assetId}}.forEach{AttachmentView(it)}
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){
-                    AssistChip({folderMenu=true},{Text(folders.firstOrNull{it.id==n.folderId}?.name?:n.folderName)},leadingIcon={Icon(Icons.Default.Folder,null)})
-                    if(!repo.isEncrypted(n))AssistChip({tagsSheet=true},{Text(if(n.tagIds.isBlank())"添加标签" else "标签")},leadingIcon={Icon(Icons.Default.Label,null)})
-                    AssistChip({reminderDialog=true},{Text(if(n.reminderAt==null)"提醒" else "已设提醒")},leadingIcon={Icon(Icons.Default.NotificationsNone,null)})
+                    ReferenceMetaChip(folders.firstOrNull{it.id==n.folderId}?.name?:n.folderName,Icons.Default.Folder){folderMenu=true}
+
+                    ReferenceMetaChip(if(n.reminderAt==null)"提醒" else "已设提醒",Icons.Default.NotificationsNone){reminderDialog=true}
                     if(recording)AssistChip({stopRecording()},{Text("正在录音 · 点击停止")},leadingIcon={Icon(Icons.Default.Mic,null,tint=MaterialTheme.colorScheme.error)})
                 }
 
@@ -700,7 +705,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     val document=ready.document;val blocks=document.blocks;val state=remember(note.id){androidx.compose.foundation.lazy.LazyListState()};val scope=rememberCoroutineScope();val views=remember(note.id,note.body){mutableMapOf<Int,TextView>()};val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)3 else 2
     val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingBacklinks by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
     val searchMatches=remember(note.body,searchQuery){if(searchQuery.isBlank())emptyList()else buildList{var start=0;while(size<10_000){val found=note.body.indexOf(searchQuery,start,ignoreCase=true);if(found<0)break;add(found);start=found+searchQuery.length.coerceAtLeast(1)}}}
-    LaunchedEffect(readerAction){when(readerAction){"outline"->showingOutline=true;"find"->showingSearch=true};if(readerAction!=null)onActionConsumed()}
+    LaunchedEffect(readerAction){when(readerAction){"outline"->showingOutline=true;"find"->showingSearch=true;"backlinks"->showingBacklinks=true;"settings"->showingSettings=true};if(readerAction!=null)onActionConsumed()}
     fun navigateSearch(delta:Int){if(searchMatches.isEmpty())return;searchIndex=(searchIndex+delta).mod(searchMatches.size);val offset=searchMatches[searchIndex];val blockIndex=blocks.indexOfLast{it.startUtf16<=offset}.coerceAtLeast(0);launchScroll(scope,state,bodyStart+blockIndex)}
     var restored by remember(note.id){mutableStateOf(false)};val latestRestored by rememberUpdatedState(restored)
     fun capturedPosition():Pair<Int,Double>{
@@ -720,9 +725,9 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     LaunchedEffect(note.id,restored,blocks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
     DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
     Box(modifier){LazyColumn(Modifier.fillMaxSize(),state=state,contentPadding=PaddingValues(top=if(showingSearch)64.dp else 0.dp,bottom=36.dp),horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){
-        item(key="reader-tools"){Spacer(Modifier.height(4.dp))}
-        item(key="note-title"){Text(note.title.ifBlank{"无标题"},style=MaterialTheme.typography.headlineMedium,fontWeight=FontWeight.SemiBold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=12.dp).testTag("reader-note-${note.id}"))}
-        if(hasMetadata)item(key="note-folder"){FlowRow(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),horizontalArrangement=Arrangement.spacedBy(8.dp)){Text(readerFolders.firstOrNull{it.id==note.folderId}?.name?:note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(vertical=8.dp));noteTags.filter{it.id in note.tagIds.split(',')}.forEach{tag->AssistChip(onTags,{Text(tag.name)})}}}
+        item(key="reader-tools"){Text(java.text.SimpleDateFormat("yyyy/M/d HH:mm",Locale.CHINA).format(Date(note.createdAt)),Modifier.fillMaxWidth().padding(top=8.dp),fontSize=13.sp,lineHeight=18.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}
+        item(key="note-title"){Text(note.title.ifBlank{"无标题"},fontSize=32.sp,lineHeight=42.sp,fontWeight=FontWeight.Bold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(top=8.dp,bottom=4.dp).testTag("reader-note-${note.id}"))}
+        if(hasMetadata)item(key="note-folder"){FlowRow(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),horizontalArrangement=Arrangement.spacedBy(8.dp),verticalArrangement=Arrangement.Center){Text(readerFolders.firstOrNull{it.id==note.folderId}?.name?:note.folderName,style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(vertical=8.dp));noteTags.filter{it.id in note.tagIds.split(',')}.forEach{tag->ReferenceMetaChip(tag.name,null,onTags)};if(note.tagIds.isBlank()&&!repo.isEncrypted(note))ReferenceMetaChip("添加标签",Icons.Default.Add,onTags)}}
         if(blocks.isEmpty())item(key="empty-note"){Text("暂无正文",Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)}
         items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->
             val block=blocks[index]
@@ -749,7 +754,6 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
                 }
             }
         }
-        item(key="reader-extra-tools"){Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){Spacer(Modifier.weight(1f));IconButton({showingSearch=!showingSearch;if(!showingSearch){searchQuery="";searchIndex=0}}){Icon(Icons.Default.Search,"文档内搜索")};IconButton({showingOutline=true}){Icon(Icons.Default.Toc,"目录")};BadgedBox(badge={if(visibleBacklinks.isNotEmpty())Badge{Text(visibleBacklinks.size.toString())}}){IconButton({showingBacklinks=true}){Icon(Icons.Default.Link,"反向链接")}};IconButton({showingSettings=true}){Icon(Icons.Default.TextFields,"阅读设置")}}}
         if(note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider(Modifier.widthIn(max=readerStyle.maxWidthDp.dp))};items(steps,key={"read-step-${it.id}"}){step->Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
         items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
     };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}

@@ -7,6 +7,7 @@
 - Android 产品源码独立维护在 `thunder951413/notebook_android`。
 - 2026-10-11 的系统笔记风格改版在 `codex/coloros-notes-ui`；已收拢 `0c5d76b` 的 10 月数据修复与 `b361308` 的诊断加固。修复和测试结论必须注明具体提交，不要把旧 `next` 或 `main` 的行为外推到当前分支。
 - Debug 包名是 `io.github.notebook.android.nexttest`，可与正式包并存。隔离测试只使用 debug 包、测试服务器和专用远端目录。
+- 用户已授权 OPPO 真机安装和手动 UI 校准，当前预览构建为 `0.4.0-ui.3-debug`（10044）。会清空数据库的 instrumentation 仍仅限专用模拟器；真机只使用独立预览包及其演示数据。完整键盘须以画面／实际触摸输入确认，不能只依据输入法的 shown 状态；详见 `docs/UI_REFERENCE_IMPLEMENTATION.md`。
 - 不要把真实 WebDAV、SSH 或 Notebook Next 凭据写入源码、Gradle 参数文件、测试日志或提交。
 
 ## 架构与数据边界

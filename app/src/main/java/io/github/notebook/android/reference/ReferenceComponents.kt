@@ -2,6 +2,7 @@ package io.github.notebook.android
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -12,8 +13,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -40,6 +45,36 @@ internal fun libraryColor(value: String?): Color =
         .getOrDefault(Color(0xFFAAD6EC))
 
 @Composable
+internal fun notePageBackground(): Color =
+    if (MaterialTheme.colorScheme.background.luminance() < .5f) MaterialTheme.colorScheme.background
+    else MaterialTheme.colorScheme.surface
+
+@Composable
+internal fun ReferenceMetaChip(label: String, icon: ImageVector?, onClick: () -> Unit) {
+    Box(
+        Modifier.heightIn(min = 48.dp).clickable(onClick = onClick),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Row(
+            Modifier.background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(6.dp))
+                .padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            if (icon != null)
+                Icon(icon, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurface)
+            Text(
+                label,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+@Composable
 internal fun RoundTool(
     icon: ImageVector,
     label: String,
@@ -48,32 +83,48 @@ internal fun RoundTool(
     enabled: Boolean = true,
     filled: Boolean = true,
 ) {
-    IconButton(
-        onClick,
-        modifier
-            .size(48.dp)
-            .then(
-                if (filled)
-                    Modifier.padding(4.dp)
-                        .background(MaterialTheme.colorScheme.surface, CircleShape)
-                else Modifier
-            ),
-        enabled = enabled,
-    ) {
-        Icon(icon, label, Modifier.size(22.dp))
+    val dark = MaterialTheme.colorScheme.background.luminance() < .5f
+    val base = MaterialTheme.colorScheme.surface
+    IconButton(onClick, modifier.size(48.dp), enabled = enabled) {
+        Box(
+            Modifier.size(40.dp)
+                .then(
+                    if (filled)
+                        Modifier.shadow(2.dp, CircleShape)
+                            .background(floatingBrush(base, dark), CircleShape)
+                            .border(
+                                1.dp,
+                                if (dark) Color.White.copy(alpha = .08f)
+                                else Color.Black.copy(alpha = .025f),
+                                CircleShape,
+                            )
+                    else Modifier
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, label, Modifier.size(22.dp))
+        }
     }
 }
 
 @Composable
 internal fun FloatingPill(modifier: Modifier = Modifier, content: @Composable RowScope.() -> Unit) {
+    val dark = MaterialTheme.colorScheme.background.luminance() < .5f
     Surface(
         modifier.height(56.dp),
         shape = CircleShape,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = .97f),
+        color = Color.Transparent,
+        contentColor = MaterialTheme.colorScheme.onSurface,
         shadowElevation = 6.dp,
     ) {
         Row(
-            Modifier.padding(horizontal = 8.dp),
+            Modifier.background(floatingBrush(MaterialTheme.colorScheme.surface, dark), CircleShape)
+                .border(
+                    1.dp,
+                    if (dark) Color.White.copy(alpha = .08f) else Color.Black.copy(alpha = .025f),
+                    CircleShape,
+                )
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
             content = content,
@@ -82,16 +133,31 @@ internal fun FloatingPill(modifier: Modifier = Modifier, content: @Composable Ro
 }
 
 @Composable
-internal fun FloatingRound(content: @Composable BoxScope.() -> Unit) {
+internal fun FloatingRound(prominent: Boolean = false, content: @Composable BoxScope.() -> Unit) {
+    val dark = MaterialTheme.colorScheme.background.luminance() < .5f
+    val base =
+        if (prominent) {
+            if (dark) Color(0xFF868686) else Color(0xFF191919)
+        } else MaterialTheme.colorScheme.surface
     Surface(
         Modifier.size(56.dp),
         shape = CircleShape,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = .97f),
+        color = Color.Transparent,
+        contentColor = if (prominent) Color.White else MaterialTheme.colorScheme.onSurface,
         shadowElevation = 6.dp,
     ) {
-        Box(contentAlignment = Alignment.Center, content = content)
+        Box(
+            Modifier.fillMaxSize()
+                .background(floatingBrush(base, dark), CircleShape)
+                .border(1.dp, Color.White.copy(alpha = if (dark) .12f else .05f), CircleShape),
+            contentAlignment = Alignment.Center,
+            content = content,
+        )
     }
 }
+
+private fun floatingBrush(base: Color, dark: Boolean): Brush =
+    Brush.verticalGradient(listOf(lerp(base, Color.White, if (dark) .08f else .02f), base))
 
 @Composable
 internal fun LibraryCover(color: Color, modifier: Modifier = Modifier, locked: Boolean = false) {
@@ -186,7 +252,7 @@ internal fun SheetTitle(
             modifier = Modifier.weight(1f),
         )
         action?.invoke()
-        RoundTool(Icons.Default.Close, "关闭$title", onClose, filled = false)
+        RoundTool(Icons.Default.Close, "关闭$title", onClose)
     }
 }
 
