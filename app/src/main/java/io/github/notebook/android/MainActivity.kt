@@ -508,7 +508,8 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         onDispose{
             lifecycleOwner.lifecycle.removeObserver(observer)
             val latest=latestDraft.value
-            if(editableKey(latest)!=initialEditableKey)repo.flushDraft(latest)
+            // Closing or switching notes is the natural moment to upload.
+            repo.closeNote(latest.takeIf{editableKey(it)!=initialEditableKey})
         }
     }
     var leaving by remember(original.id){mutableStateOf(false)}
@@ -541,7 +542,8 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 RoundTool(Icons.Default.Undo,"撤销",{restoreEditor(undoHistory.undo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canUndo&&tick>=0)
                 RoundTool(Icons.Default.Redo,"重做",{restoreEditor(undoHistory.redo(EditorSnapshot(n.title,bodyValue)))},enabled=undoHistory.canRedo&&tick>=0)
                 Spacer(Modifier.weight(1f))
-                if(saveState!=null&&(saveState!=NoteSaveState.Saved||showSavedCheck))SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(latestDraft.value)}
+                // Saving is continuous and local; only a failure needs attention.
+                if(saveState==NoteSaveState.Failed)SaveStatusAction(saveState,showSavedCheck){repo.flushDraft(latestDraft.value)}
                 TextButton({stopRecording();finishEditing()},Modifier.testTag("preview-mode").semantics{contentDescription="完成"},shape=androidx.compose.foundation.shape.CircleShape,colors=ButtonDefaults.textButtonColors(containerColor=MaterialTheme.colorScheme.surface,contentColor=MaterialTheme.colorScheme.onSurface)){Text("完成")}
             }else{
                 if(n.deletedAt!=null)Text("最近删除",Modifier.weight(1f).padding(start=8.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)else Spacer(Modifier.weight(1f))

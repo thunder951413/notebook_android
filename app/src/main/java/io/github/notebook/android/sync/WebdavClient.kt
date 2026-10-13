@@ -93,6 +93,7 @@ class WebdavClient(
         var lastError: IOException? = null
         repeat(REQUEST_ATTEMPTS) { attempt ->
             try {
+                WebdavRequestLog.record()
                 val response = http.newCall(builder.method(method, body).build()).execute()
                 // 坚果云 throttles bursts with 429/503. A short, bounded wait
                 // (honouring Retry-After) usually succeeds instead of failing

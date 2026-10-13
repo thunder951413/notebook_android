@@ -431,7 +431,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     /** Each real foreground transition is a pull-first normal sync boundary. */
     fun requestForegroundSync(){
         if(!hasRemoteConfiguration())return
-        cancelDelayedSyncRequest()
+        // Returning within a couple of minutes (switching apps, the share
+        // sheet, a permission dialog) does not need another download.
+        if(!SyncPacing.foregroundPullDue(System.currentTimeMillis(),lastSyncSuccessAt()))return
         SyncWorker.enqueueNow(appContext)
     }
 
@@ -445,7 +447,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             // if an unrelated draft could not be flushed in this lifecycle.
             val positionError=runCatching{queueDirtyReadingPositions()}.exceptionOrNull()
             (flushError?:positionError)?.let{_saveError.value="后台保存失败：${it.localizedMessage}"}
-            if(hasRemoteConfiguration())SyncWorker.enqueueNow(appContext)
+            requestBoundarySync()
         }
     }
 
@@ -1093,7 +1095,29 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     /** Local writes are durable immediately; remote publication is deliberately
      * quiet so bursts of edits share one WorkManager run. */
-    private fun requestSyncIfConfigured(){if(!hasRemoteConfiguration())return;synchronized(syncRequestLock){syncRequestJob?.cancel();syncRequestJob=appScope.launch{delay(30_000);SyncWorker.enqueueNow(appContext);synchronized(syncRequestLock){if(syncRequestJob===coroutineContext[Job])syncRequestJob=null}}}}
+    /** A durable edit: upload within [SyncPacing.EDIT_MAX_WAIT_MS] at the latest; later edits do not postpone it. Leaving the note or the app uploads sooner. */
+    private fun requestSyncIfConfigured(){if(!hasRemoteConfiguration())return;synchronized(syncRequestLock){if(syncRequestJob?.isActive==true)return;syncRequestJob=appScope.launch{delay(SyncPacing.EDIT_MAX_WAIT_MS);SyncWorker.enqueueNow(appContext);synchronized(syncRequestLock){if(syncRequestJob===coroutineContext[Job])syncRequestJob=null}}}}
+    private suspend fun hasLocalChanges():Boolean=pendingUploadCount()>0||dao.dirtyNoteCount()>0||dao.dirtyAssetCount()>0||pendingDrafts.isNotEmpty()
+    /** A natural boundary (note closed, app left): upload pending edits, keeping automatic runs a minute apart. */
+    fun requestBoundarySync(){
+        if(!hasRemoteConfiguration())return
+        appScope.launch{
+            if(!hasLocalChanges())return@launch
+            cancelDelayedSyncRequest()
+            val delayMs=SyncPacing.boundaryDelay(System.currentTimeMillis(),prefs.getLong("lastAutoSyncAt",0L))
+            SyncWorker.enqueueNow(appContext,(delayMs+999)/1000)
+        }
+    }
+    /** Called when the editor closes: save the last keystrokes, then upload at this boundary. */
+    fun closeNote(changed:NoteEntity?){appScope.launch{changed?.let{flushDraft(it).join()};requestBoundarySync()}}
+    /** Worker gate: 0 to run now, else how long the request budget needs. Records the run. */
+    fun automaticSyncDelayMs():Long{
+        val now=System.currentTimeMillis()
+        val wait=SyncPacing.budgetDelay(now,WebdavRequestLog.snapshot())
+        if(wait>0){DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_FAILURE,operationId="request-budget-deferred",counts=mapOf("requests30m" to WebdavRequestLog.recentCount(now).toLong(),"deferSeconds" to wait/1000));return wait}
+        prefs.edit().putLong("lastAutoSyncAt",now).apply()
+        return 0
+    }
     private fun cancelDelayedSyncRequest(){synchronized(syncRequestLock){syncRequestJob?.cancel();syncRequestJob=null}}
     private suspend fun scheduleNextOutboxBatch(workspace:String,outboxBefore:Int){
         if(outboxBefore>=200&&dao.apiOutboxCount(workspace)>0)SyncWorker.enqueueNow(appContext)

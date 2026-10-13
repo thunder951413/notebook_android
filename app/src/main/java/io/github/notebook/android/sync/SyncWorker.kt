@@ -13,7 +13,13 @@ class SyncWorker(context:Context,params:WorkerParameters):CoroutineWorker(contex
         // workers back to back. Without local changes, a sync that succeeded
         // seconds ago already has the remote state; skip the duplicate rounds
         // so the 坚果云 request budget is spent on real work.
-        if(!repository.shouldSkipRedundantSync())repository.sync()
+        if(!repository.shouldSkipRedundantSync()){
+            // Stay inside this device's share of the 坚果云 request budget;
+            // the run is postponed, never dropped.
+            val wait=repository.automaticSyncDelayMs()
+            if(wait>0)enqueueNow(applicationContext,wait/1000)
+            else repository.sync()
+        }
         Result.success()
     } catch (error: CancellationException) {
         throw error
