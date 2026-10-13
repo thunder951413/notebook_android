@@ -55,8 +55,13 @@ jobs:
         run: |
           VERSION_NAME="${VERSION_NAME#android-v}"
           VERSION_NAME="${VERSION_NAME#v}"
+          if ! [[ "$VERSION_NAME" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then echo "Invalid version: $VERSION_NAME" >&2; exit 1; fi
           export VERSION_NAME
-          export VERSION_CODE=$((VERSION_CODE_BASE + 10000))
+          # Derived from the version so every newer release installs over any
+          # older build (CI or local): 0.5.2 -> 1000502. Must stay above the
+          # previous run-number scheme (10000 + run).
+          export VERSION_CODE=$((1000000 + BASH_REMATCH[1] * 10000 + BASH_REMATCH[2] * 100 + BASH_REMATCH[3]))
+          echo "versionCode $VERSION_CODE (run $VERSION_CODE_BASE)"
           ./gradlew test lintRelease assembleRelease -PgithubRepository="$GITHUB_REPOSITORY"
           cp app/build/outputs/apk/release/app-release.apk notebook-android.apk
           "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs notebook-android.apk
