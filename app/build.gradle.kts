@@ -19,6 +19,9 @@ android {
     if(releaseStoreFile!=null){signingConfigs.create("release"){storeFile=file(releaseStoreFile);storePassword=System.getenv("RELEASE_STORE_PASSWORD");keyAlias=System.getenv("RELEASE_KEY_ALIAS");keyPassword=System.getenv("RELEASE_KEY_PASSWORD")};buildTypes.getByName("release"){signingConfig=signingConfigs.getByName("release")}}
     // Keep local/ADB validation alongside a signed production installation.
     buildTypes.getByName("debug"){applicationIdSuffix=".nexttest";versionNameSuffix="-debug"}
+    // Release-like performance on the preview package (keeps its data, debug key):
+    // ./gradlew assembleProfile, then adb install -r over the .nexttest app.
+    buildTypes.create("profile"){initWith(buildTypes.getByName("release"));applicationIdSuffix=".nexttest";versionNameSuffix="-profile";signingConfig=signingConfigs.getByName("debug");matchingFallbacks+=listOf("release")}
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
@@ -33,6 +36,7 @@ ksp {
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.activity:activity-compose:1.10.0")
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")

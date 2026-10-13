@@ -91,9 +91,19 @@ class WebdavClient(
         // is idempotent (PUT overwrites, MKCOL tolerates existing), so retrying
         // a failed attempt is always safe.
         var lastError: IOException? = null
-        repeat(REQUEST_ATTEMPTS) {
+        repeat(REQUEST_ATTEMPTS) { attempt ->
             try {
-                return http.newCall(builder.method(method, body).build()).execute()
+                val response = http.newCall(builder.method(method, body).build()).execute()
+                // 坚果云 throttles bursts with 429/503. A short, bounded wait
+                // (honouring Retry-After) usually succeeds instead of failing
+                // the whole sync and waiting for the next worker run.
+                if ((response.code == 429 || response.code == 503) && attempt < REQUEST_ATTEMPTS - 1) {
+                    val wait = response.header("Retry-After")?.trim()?.toLongOrNull()?.coerceIn(1L, 8L)?.times(1000L) ?: (1000L shl attempt)
+                    response.close()
+                    Thread.sleep(wait)
+                    return@repeat
+                }
+                return response
             } catch (error: IOException) {
                 lastError = error
             }
@@ -104,7 +114,10 @@ class WebdavClient(
     private fun fail(response: Response, context: String): IOException {
         val code = response.code
         return when {
-            code == 401 || code == 403 -> IOException("$context（HTTP $code）：WebDAV 认证失败，请检查用户名与应用密码")
+            code == 401 -> IOException("$context（HTTP $code）：坚果云拒绝登录，请检查用户名与应用密码（应用密码需在坚果云网页“安全选项”中生成）")
+            code == 403 -> IOException("$context（HTTP $code）：坚果云拒绝访问，请检查应用密码和远端目录；若刚频繁同步，可能是暂时限流")
+            code == 429 || code == 503 -> IOException("$context（HTTP $code）：坚果云暂时限流，稍后会自动重试")
+            code == 507 -> IOException("$context（HTTP $code）：坚果云空间不足")
             code in 300..399 -> IOException("$context（HTTP $code）：WebDAV 地址发生重定向，请填写最终的 HTTPS 地址")
             else -> IOException("$context（HTTP $code）")
         }

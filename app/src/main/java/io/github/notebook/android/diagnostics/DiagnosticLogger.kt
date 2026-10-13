@@ -30,6 +30,9 @@ enum class DiagnosticEvent(val wireName:String){
     SYNC_START("sync.start"),
     SYNC_SUCCESS("sync.success"),
     SYNC_FAILURE("sync.failure"),
+    SYNC_CONFLICT_RESOLVED("sync.conflict_resolved"),
+    SYNC_REPOSITORY_RESET("sync.repository_reset"),
+    SYNC_REPUBLISH("sync.republish"),
     REPEATED("diagnostic.repeated"),
 }
 

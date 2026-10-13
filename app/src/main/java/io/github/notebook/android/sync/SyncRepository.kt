@@ -13,6 +13,8 @@ import com.jcraft.jsch.HostKeyRepository
 import com.jcraft.jsch.SftpException
 import io.github.notebook.android.data.*
 import io.github.notebook.android.NotebookReference
+import io.github.notebook.android.NoteSearchQuery
+import io.github.notebook.android.rankSearchHits
 import io.github.notebook.android.NotebookReferenceSyntax
 import io.github.notebook.android.reminder.Reminders
 import io.github.notebook.android.diagnostics.DiagnosticEvent
@@ -216,6 +218,9 @@ internal object LegacyHistoryContract {
     }
 }
 
+/** Ranked search hits with body snippets and the words to highlight. */
+data class NoteSearchResult(val ids:List<String>,val snippets:Map<String,String>,val terms:List<String>)
+
 /** Compatible with the macOS SSH JSON store. Swift JSONEncoder dates are seconds since 2001-01-01. */
 class SyncRepository(context:Context, private val dao:NotebookDao,preferences:android.content.SharedPreferences?=null) {
     private val appContext=context.applicationContext
@@ -227,6 +232,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private val privacyIterations=310_000
     private val pendingDrafts=ConcurrentHashMap<String,NoteEntity>()
     private val draftJobs=ConcurrentHashMap<String,Job>()
+    private val lastDraftWriteAt=ConcurrentHashMap<String,Long>()
     private val trashedNoteIds=ConcurrentHashMap.newKeySet<String>()
     private val permanentlyDeletedNoteIds=ConcurrentHashMap.newKeySet<String>()
     private val syncRequestLock=Any()
@@ -243,8 +249,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun acknowledgeSaved(noteId:String){_noteSaveStates.update{states->if(states[noteId]==NoteSaveState.Saved)states-noteId else states}}
     fun clearSaveError(){_saveError.value=null}
     private val prefs=preferences?:encryptedPrefs(context)
+    private val privacy=PrivateNoteIndex(prefs,gson)
     private val apiSync=ApiSyncClient(appContext,dao)
-    private val webdavSync=WebdavSyncClient(appContext,dao,prefs,apiSync)
+    private val webdavSync=WebdavSyncClient(appContext,dao,prefs,apiSync,privacy=privacy)
     val notes=dao.observeNoteSummaries()
     val folders=dao.observeFolders()
     val tags=dao.observeTags()
@@ -255,12 +262,32 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun saveWebdavSettings(s:WebdavSettings){check(prefs.edit().putString("syncBackend",SyncBackend.WEBDAV.name).putString("webdavBaseUrl",s.baseUrl.trim()).putString("webdavUser",s.username.trim()).putString("webdavAppPassword",s.appPassword).putString("webdavPath",s.remotePath.trim()).putString("webdavSyncPassword",s.syncPassword).commit()){ "同步配置保存失败，请重试" }}
     suspend fun testWebdav():WebdavTestResult=webdavSync.test(webdavSettings())
     suspend fun syncCompletionMessage():String {
+        val notices=buildList{
+            if(syncBackend()==SyncBackend.WEBDAV){
+                val copies=webdavSync.lastResolved.count{it.copyNoteId!=null}
+                if(copies>0)add("$copies 篇笔记在多台设备上同时被修改：已保留本机版本，另一版本另存为“冲突副本”")
+                if(webdavSync.lastRepublished>0)add("云端缺少本机记录，已自动重新上传全部内容")
+            }
+        }
         val conflicts=dao.allNotes().count{it.conflict}
-        if(conflicts>0)return "同步仍有 $conflicts 条冲突待处理"
+        if(conflicts>0)return (notices+"同步仍有 $conflicts 条冲突待处理").joinToString("；")
         val pending=dao.apiOutboxCount(syncWorkspaceId())
-        if(pending>0)return "本批同步完成，仍有 $pending 条变更等待上传"
-        return "连接成功，同步已完成"
+        if(pending>0)return (notices+"本批同步完成，仍有 $pending 条变更等待上传").joinToString("；")
+        return (notices.ifEmpty{listOf("同步完成")}).joinToString("；")
     }
+    fun lastSyncSuccessAt():Long?=prefs.getLong("lastSyncSuccessAt",0L).takeIf{it>0}
+    /** True when a sync succeeded moments ago and nothing local is waiting to upload. */
+    suspend fun shouldSkipRedundantSync():Boolean=withContext(Dispatchers.IO){
+        val last=lastSyncSuccessAt()?:return@withContext false
+        val age=System.currentTimeMillis()-last
+        age in 0..20_000&&pendingUploadCount()==0&&dao.dirtyNoteCount()==0&&dao.dirtyAssetCount()==0&&pendingDrafts.isEmpty()
+    }
+    suspend fun pendingUploadCount():Int=withContext(Dispatchers.IO){if(syncBackend()==SyncBackend.SSH)dao.dirtyNoteCount() else dao.apiOutboxCount(syncWorkspaceId())}
+    suspend fun conflictCopyCount():Int=withContext(Dispatchers.IO){dao.allNotes().count{it.deletedAt==null&&it.title.contains("（冲突副本")}}
+    /** Repair: re-read every remote journal from the start (idempotent). */
+    suspend fun resetSyncReadPositions(){syncMutex.withLock{webdavSync.resetReadPositions(webdavSettings())}}
+    /** Repair: queue the whole library for publication again. */
+    suspend fun republishAll():Int=syncMutex.withLock{webdavSync.queueFullRepublish(webdavSettings())}
     /** Content-free local report for comparing restored entity ids and hashes. */
     suspend fun exportSyncDiagnostics():File=withContext(Dispatchers.IO) {
         val notes=dao.allNotes()
@@ -296,10 +323,11 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private fun syncWorkspaceId()=if(syncBackend()==SyncBackend.WEBDAV)WebdavJournalProtocol.DEFAULT_WORKSPACE_ID else apiSettings().workspaceId
     fun hasRemoteConfiguration()=when(syncBackend()){SyncBackend.API->apiSettings().let{it.baseUrl.isNotBlank()&&it.token.isNotBlank()};SyncBackend.WEBDAV->webdavSettings().let{it.username.isNotBlank()&&it.appPassword.isNotBlank()&&it.baseUrl.isNotBlank()};SyncBackend.SSH->settings().let{it.host.isNotBlank()&&it.username.isNotBlank()&&it.path.isNotBlank()}}
     fun trustHostKey(fingerprint:String){saveSettings(settings().copy(fingerprint=fingerprint))}
-    fun isEncrypted(note:NoteEntity)=encryptedNoteIds().contains(note.id)||encryptedFolderId(note)!=null
-    fun encryptedFolderId(note:NoteEntity)=encryptedMappings()[note.id]?:note.folderId?.takeIf{encryptedNoteIds().contains(note.id)}
-    fun isEncrypted(note:NoteSummary)=encryptedNoteIds().contains(note.id)||encryptedFolderId(note)!=null
-    fun encryptedFolderId(note:NoteSummary)=encryptedMappings()[note.id]?:note.folderId?.takeIf{encryptedNoteIds().contains(note.id)}
+    // Cached: called for every note on every recomposition (list rows, editor titles).
+    fun isEncrypted(note:NoteEntity)=privacy.snapshot().isPrivate(note.id)
+    fun encryptedFolderId(note:NoteEntity)=privacy.snapshot().folderOf(note.id,note.folderId)
+    fun isEncrypted(note:NoteSummary)=privacy.snapshot().isPrivate(note.id)
+    fun encryptedFolderId(note:NoteSummary)=privacy.snapshot().folderOf(note.id,note.folderId)
     suspend fun loadNote(id:String)=withContext(Dispatchers.IO){loadEditable(id)}
     internal suspend fun resolveReference(reference:NotebookReference):NoteEntity?=withContext(Dispatchers.IO){loadEditable(reference.pageId)}
     suspend fun revisions(noteId:String):List<NoteRevisionSummary> = withContext(Dispatchers.IO){
@@ -335,12 +363,55 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         return save(current.copy(body=revision.markdown,icon=revision.pageIcon))
     }
     suspend fun searchNoteIds(query:String)=withContext(Dispatchers.IO){dao.searchNoteIds(query).toSet()}
-    fun markEncrypted(noteId:String,folderId:String){val ids=encryptedNoteIds().toMutableSet().apply{add(noteId)};val mappings=encryptedMappings().toMutableMap().apply{put(noteId,folderId)};prefs.edit().putString("encryptedNoteIds",gson.toJson(ids)).putString("encryptedMappings",gson.toJson(mappings)).apply()}
+    /**
+     * Multi-keyword search over title, body, library and tag names.
+     * Every keyword must match somewhere; "phrases" stay together, -word
+     * excludes and #tag filters by tag. Results are ranked (title hits first,
+     * then newest) and carry a body snippet around the first keyword.
+     */
+    suspend fun searchNotes(raw:String,candidates:List<NoteSummary>,tags:List<TagEntity>):NoteSearchResult=withContext(Dispatchers.IO){
+        val query=NoteSearchQuery.parse(raw)
+        if(query.isEmpty)return@withContext NoteSearchResult(emptyList(),emptyMap(),emptyList())
+        val byId=candidates.associateBy{it.id}
+        val tagNames=tags.associate{it.id to it.name}
+        fun metadataMatches(note:NoteSummary,term:String)=note.folderName.contains(term,true)||note.tagIds.split(',').any{id->tagNames[id]?.contains(term,true)==true}||io.github.notebook.android.PinyinMatcher.matches(note.title,term)
+        var matched:Set<String> =byId.keys
+        for(term in query.terms){
+            val hits=dao.searchNoteIds(term).toHashSet()
+            matched=matched.filterTo(HashSet()){id->id in hits||byId[id]?.let{metadataMatches(it,term)}==true}
+            if(matched.isEmpty())break
+        }
+        for(tag in query.tags){
+            val ids=tags.filter{it.name.equals(tag,true)||it.name.contains(tag,true)}.map{it.id}.toSet()
+            matched=matched.filterTo(HashSet()){id->byId[id]?.tagIds?.split(',')?.any{it in ids}==true}
+        }
+        for(term in query.excluded){
+            val hits=dao.searchNoteIds(term).toHashSet()
+            matched=matched.filterTo(HashSet()){id->id !in hits&&byId[id]?.let{metadataMatches(it,term)}!=true}
+        }
+        val ranked=rankSearchHits(matched,byId,query)
+        val snippetTerm=query.terms.firstOrNull()
+        val snippets=if(snippetTerm==null)emptyMap() else ranked.take(80).mapNotNull{id->
+            dao.searchSnippet(id,snippetTerm)?.takeIf{it.contains(snippetTerm,true)}?.let{id to it}
+        }.toMap()
+        NoteSearchResult(ranked,snippets,query.highlights)
+    }
+    private val navigationPrefs by lazy{appContext.getSharedPreferences("note-navigation",Context.MODE_PRIVATE)}
+    fun recentSearches():List<String> = runCatching{gson.fromJson(navigationPrefs.getString("searches","[]"),Array<String>::class.java).toList()}.getOrDefault(emptyList())
+    fun rememberSearch(query:String){val value=query.trim();if(value.length<1)return;navigationPrefs.edit().putString("searches",gson.toJson((listOf(value)+recentSearches().filter{it!=value}).take(12))).apply()}
+    fun clearSearchHistory(){navigationPrefs.edit().remove("searches").apply()}
+    fun markEncrypted(noteId:String,folderId:String){privacy.update{it.copy(noteIds=it.noteIds+noteId,mappings=it.mappings+(noteId to folderId))}}
     fun moveEncrypted(noteId:String,folderId:String)=markEncrypted(noteId,folderId)
-    private fun encryptedNoteIds():Set<String> = runCatching{gson.fromJson(prefs.getString("encryptedNoteIds","[]"),Array<String>::class.java).toSet()}.getOrDefault(emptySet())
-    private fun encryptedMappings():Map<String,String> = runCatching{gson.fromJson(prefs.getString("encryptedMappings","{}"),JsonObject::class.java).entrySet().associate{it.key to it.value.asString}}.getOrDefault(emptyMap())
+    private fun encryptedNoteIds():Set<String> = privacy.snapshot().noteIds
+    private fun encryptedMappings():Map<String,String> = privacy.snapshot().mappings
     suspend fun save(n:NoteEntity,restoring:Boolean=false):NoteEntity{setSaveState(n.id,NoteSaveState.Saving);return try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));persistDraft(n,restoring).also{setSaveState(n.id,NoteSaveState.Saved)}}catch(error:Throwable){setSaveState(n.id,NoteSaveState.Failed);throw error}}
-    fun queueDraft(n:NoteEntity){if(permanentlyDeletedNoteIds.contains(n.id)||(n.deletedAt==null&&trashedNoteIds.contains(n.id)))return;setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));delay(600);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=DiagnosticLogger.operationId(),resourceId=n.id,error=error);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
+    /**
+     * Called on every keystroke. Serializing the whole note into the durable
+     * draft table per keystroke caused visible input lag on long notes, so the
+     * crash-safety snapshot is written after a 250 ms pause, or at least every
+     * 1.5 s during continuous typing. Lifecycle stops still flush immediately.
+     */
+    fun queueDraft(n:NoteEntity){if(permanentlyDeletedNoteIds.contains(n.id)||(n.deletedAt==null&&trashedNoteIds.contains(n.id)))return;if(_noteSaveStates.value[n.id]!=NoteSaveState.Pending)setSaveState(n.id,NoteSaveState.Pending);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{if(System.currentTimeMillis()-(lastDraftWriteAt[n.id]?:0L)<1_500)delay(250);val draft=pendingDrafts[n.id]?:return@launch;dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));lastDraftWriteAt[n.id]=System.currentTimeMillis();delay(350);val latest=pendingDrafts[n.id]?:return@launch;setSaveState(n.id,NoteSaveState.Saving);persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=DiagnosticLogger.operationId(),resourceId=n.id,error=error);_saveError.value="自动保存失败：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)}}
     fun flushDraft(n:NoteEntity):Job{if(permanentlyDeletedNoteIds.contains(n.id)||(n.deletedAt==null&&trashedNoteIds.contains(n.id)))return appScope.launch{};val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();setSaveState(n.id,NoteSaveState.Saving);pendingDrafts[n.id]=n;draftJobs.remove(n.id)?.cancel();val job=appScope.launch{try{dao.putDraft(DraftEntity(n.id,gson.toJson(n)));val latest=pendingDrafts[n.id]?:n;persistDraft(latest);if(pendingDrafts.remove(n.id,latest))setSaveState(n.id,NoteSaveState.Saved)}catch(error:Throwable){if(error is CancellationException)throw error;setSaveState(n.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=operationId,resourceId=n.id,error=error,durationMs=System.currentTimeMillis()-startedAt);_saveError.value="保存失败，草稿仍保留：${error.localizedMessage}"}};draftJobs[n.id]=job;job.invokeOnCompletion{draftJobs.remove(n.id,job)};return job}
     fun flushAllAsync(){pendingDrafts.values.toList().forEach(::flushDraft)}
     suspend fun flushAll(){val drafts=pendingDrafts.values.toList();drafts.forEach{draftJobs.remove(it.id)?.cancel()};drafts.forEach{draft->val operationId=DiagnosticLogger.operationId();val startedAt=System.currentTimeMillis();setSaveState(draft.id,NoteSaveState.Saving);try{dao.putDraft(DraftEntity(draft.id,gson.toJson(draft)));persistDraft(draft);if(pendingDrafts.remove(draft.id,draft))setSaveState(draft.id,NoteSaveState.Saved)}catch(error:Throwable){setSaveState(draft.id,NoteSaveState.Failed);DiagnosticLogger.log(DiagnosticLevel.ERROR,DiagnosticEvent.DRAFT_FLUSH_FAILURE,operationId=operationId,resourceId=draft.id,error=error,durationMs=System.currentTimeMillis()-startedAt);throw error}}}
@@ -598,6 +669,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_START,operationId=operationId,counts=diagnosticSyncCounts())
         try{
             performSync(onProgress)
+            prefs.edit().putLong("lastSyncSuccessAt",System.currentTimeMillis()).apply()
             DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_SUCCESS,operationId=operationId,durationMs=System.currentTimeMillis()-startedAt,counts=diagnosticSyncCounts())
         }catch(error:Throwable){
             if(error is CancellationException)throw error
@@ -681,7 +753,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val folders=root["folders"]?.asJsonArray?.map{j->val o=j.asJsonObject;FolderEntity(o.str("id"),o.str("name"),o.int("sortOrder"),o.str("folderType","noteFolder"),o.optDateMs("updatedAt")?:o.optDateMs("createdAt")?:exportedAt)}.orEmpty()
         val encrypted=root["encryptedData"]?.takeIf{it.isJsonObject}?.asJsonObject
         val encryptedFolders=encrypted?.get("encryptedFolders")?.takeIf{it.isJsonArray}?.asJsonArray?.map{j->val o=j.asJsonObject;FolderEntity(o.str("id"),o.str("name"),o.int("order"),"encryptedFolder",exportedAt)}.orEmpty()
-        encrypted?.let{data->val ids=data["encryptedNoteIDs"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{it.asString}.orEmpty();val mapping=data["noteToFolderMapping"]?.takeIf{it.isJsonObject}?.asJsonObject?.entrySet()?.associate{it.key to it.value.asString}.orEmpty();prefs.edit().putString("encryptedNoteIds",gson.toJson(ids)).putString("encryptedMappings",gson.toJson(mapping)).apply()}
+        encrypted?.let{data->val ids=data["encryptedNoteIDs"]?.takeIf{it.isJsonArray}?.asJsonArray?.map{it.asString}.orEmpty();val mapping=data["noteToFolderMapping"]?.takeIf{it.isJsonObject}?.asJsonObject?.entrySet()?.associate{it.key to it.value.asString}.orEmpty();privacy.update{PrivateNoteIndex.Snapshot(ids.toSet(),mapping)}}
         val tags=root["tags"]?.asJsonArray?.map{j->val o=j.asJsonObject;TagEntity(o.str("id"),o.str("name"),o.str("color","gray"),o.optDateMs("updatedAt")?:o.optDateMs("createdAt")?:exportedAt)}.orEmpty()
         val tombstones=dao.tombstones().associateBy{it.itemKey}
         folders.filter{remote->val deleted=tombstones["folder|${remote.id}"];deleted==null||deleted.deletedAt<remote.updatedAt}.forEach{remote->if((dao.getFolder(remote.id)?.updatedAt?:0)<=remote.updatedAt)dao.putFolder(remote)}

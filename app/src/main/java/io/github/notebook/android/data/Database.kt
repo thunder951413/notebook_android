@@ -290,6 +290,8 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("SELECT id,workspaceId,entityType,entityId,expectedVersion,operation,'' AS payloadJson,createdAt FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId LIMIT 1") suspend fun apiOutboxHeader(entityType:String,entityId:String):ApiSyncOutboxEntity?
     @Transaction suspend fun apiOutboxItem(entityType:String,entityId:String):ApiSyncOutboxEntity? = apiOutboxHeader(entityType,entityId)?.let{outbox->outbox.copy(payloadJson=readStoredText(apiOutboxLength(outbox.id)){start,length->apiOutboxChunk(outbox.id,start,length)}.orEmpty())}
     @Upsert suspend fun putApiOutbox(item:ApiSyncOutboxEntity)
+    /** Rebase a queued edit onto a newer remote parent (automatic conflict resolution). */
+    @Query("UPDATE api_sync_outbox SET expectedVersion=:version WHERE entityType=:entityType AND entityId=:entityId") suspend fun rebaseApiOutbox(entityType:String,entityId:String,version:Long)
     @Query("DELETE FROM api_sync_outbox WHERE entityType=:entityType AND entityId=:entityId") suspend fun deleteApiOutbox(entityType:String,entityId:String)
     @Query("DELETE FROM api_sync_outbox WHERE id=:id") suspend fun deleteApiOutboxById(id:String)
     @Query("SELECT id,noteId,createdAt,reason,'' AS markdown,pageIcon FROM remote_revisions WHERE noteId=:noteId ORDER BY createdAt DESC") suspend fun remoteRevisionHeaders(noteId:String):List<RemoteRevisionEntity>
@@ -303,6 +305,8 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Upsert suspend fun putApiVersion(version:ApiSyncVersionEntity)
     @Query("SELECT cursor FROM api_sync_cursors WHERE workspaceId=:workspaceId") suspend fun apiCursor(workspaceId:String):Long?
     @Upsert suspend fun putApiCursor(cursor:ApiSyncCursorEntity)
+    @Query("SELECT * FROM api_sync_cursors WHERE workspaceId LIKE :prefix || '%'") suspend fun apiCursorsWithPrefix(prefix:String):List<ApiSyncCursorEntity>
+    @Query("DELETE FROM api_sync_cursors WHERE workspaceId LIKE :prefix || '%'") suspend fun deleteApiCursorsWithPrefix(prefix:String)
 }
 
 @Database(entities=[NoteEntity::class,FolderEntity::class,TagEntity::class,TodoStepEntity::class,AssetEntity::class,TombstoneEntity::class,DraftEntity::class,ReadingPositionEntity::class,PageLinkEntity::class,ApiDocumentEntity::class,ApiPageEntity::class,ApiNotebookEntity::class,ApiSyncVersionEntity::class,ApiSyncCursorEntity::class,ApiSyncOutboxEntity::class,RemoteRevisionEntity::class], version=13, exportSchema=true)

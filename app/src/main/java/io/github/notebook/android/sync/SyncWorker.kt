@@ -8,7 +8,12 @@ import kotlinx.coroutines.CancellationException
 
 class SyncWorker(context:Context,params:WorkerParameters):CoroutineWorker(context,params){
     override suspend fun doWork():Result = try {
-        (applicationContext as NotebookApp).repository.sync()
+        val repository=(applicationContext as NotebookApp).repository
+        // Lifecycle events (start/stop/unlock/rotation) can queue several
+        // workers back to back. Without local changes, a sync that succeeded
+        // seconds ago already has the remote state; skip the duplicate rounds
+        // so the 坚果云 request budget is spent on real work.
+        if(!repository.shouldSkipRedundantSync())repository.sync()
         Result.success()
     } catch (error: CancellationException) {
         throw error

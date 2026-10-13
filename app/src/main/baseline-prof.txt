@@ -1,0 +1,11 @@
+# Startup and first-use paths compiled ahead of time (profileinstaller applies
+# this on install). Side-loaded APKs otherwise run these paths interpreted
+# until the device's idle dexopt runs, which made opening notes stutter.
+HSPLio/github/notebook/android/**->**(**)**
+Lio/github/notebook/android/**;
+HSPLio/noties/markwon/**->**(**)**
+Lio/noties/markwon/**;
+HSPLorg/commonmark/**->**(**)**
+Lorg/commonmark/**;
+HSPLcom/google/gson/**->**(**)**
+Lcom/google/gson/**;

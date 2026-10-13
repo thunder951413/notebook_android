@@ -13,12 +13,17 @@ import io.github.notebook.android.data.FolderEntity
 import io.github.notebook.android.data.NotebookDao
 import io.github.notebook.android.data.TagEntity
 import io.github.notebook.android.data.TodoStepEntity
+import io.github.notebook.android.diagnostics.DiagnosticEvent
+import io.github.notebook.android.diagnostics.DiagnosticLevel
+import io.github.notebook.android.diagnostics.DiagnosticLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.InputStream
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlin.math.max
 
@@ -156,17 +161,28 @@ internal fun webdavDeviceId(prefs: SharedPreferences): String =
  * ApiSync outbox/version tables so switching backends never loses queued
  * changes. Payload shapes match the /v1/sync API contract.
  */
+/** A concurrent edit settled during the last sync: local kept, remote body copied when different. */
+data class ResolvedWebdavConflict(val entityType: String, val entityId: String, val pageId: String?, val copyNoteId: String?)
+
 class WebdavSyncClient(
     private val context: Context,
     private val dao: NotebookDao,
     private val prefs: SharedPreferences,
     private val api: ApiSyncClient,
     private val allowInsecureHttp: Boolean = BuildConfig.DEBUG,
+    private val privacy: PrivateNoteIndex = PrivateNoteIndex(prefs),
 ) {
     private val gson = GsonBuilder().disableHtmlEscaping().create()
     /** Entities that conflicted during the latest pull stay queued for the user. */
     private val conflictKeys = mutableSetOf<String>()
     private var privacyCipher=WebdavPrivacyCipher("")
+    /** Conflicts settled automatically in the most recent [sync]. */
+    @Volatile var lastResolved: List<ResolvedWebdavConflict> = emptyList()
+        private set
+    /** Number of records re-queued because the repository lost this device's journal. */
+    @Volatile var lastRepublished: Int = 0
+        private set
+    private val resolved = mutableListOf<ResolvedWebdavConflict>()
 
     fun fingerprint(settings: WebdavSettings) = "${settings.baseUrl.trim()}|${settings.username.trim()}|${settings.remotePath.trim()}"
 
@@ -196,6 +212,9 @@ class WebdavSyncClient(
         validate(settings)
         withContext(Dispatchers.IO) {
             conflictKeys.clear()
+            resolved.clear()
+            lastResolved = emptyList()
+            lastRepublished = 0
             privacyCipher=WebdavPrivacyCipher(settings.syncPassword)
             if(settings.syncPassword.isNotEmpty()) queuePrivateSnapshot(settings)
             val budget = RemoteTransferLimits.Budget()
@@ -206,19 +225,57 @@ class WebdavSyncClient(
             onProgress("正在读取云端更改…")
             val deviceIds = pull(settings, client, budget)
             val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
-            if (deviceIds.isEmpty()) queueInitialSnapshot()
+            val ownId = webdavDeviceId(prefs)
+            val ownSeq = knownSeqs(settings)[ownId] ?: 0L
+            if (deviceIds.isEmpty() || (ownId !in deviceIds && ownSeq > 0)) {
+                // Empty folder, or this device's journal was deleted remotely:
+                // other devices (and new installs) would never see existing
+                // notes again. Publish the full library; sequence numbers
+                // continue above the old cursor so stale readers still catch up.
+                onProgress("云端缺少本机记录，正在重新排队全部内容…")
+                val before = dao.apiOutboxCount(workspace)
+                queueInitialSnapshot()
+                if (settings.syncPassword.isNotEmpty()) {
+                    prefs.edit().remove(privateSeedKey(settings)).commit()
+                    queuePrivateSnapshot(settings)
+                }
+                if (deviceIds.isNotEmpty()) {
+                    lastRepublished = maxOf(1, dao.apiOutboxCount(workspace) - before)
+                    DiagnosticLogger.log(DiagnosticLevel.WARN, DiagnosticEvent.SYNC_REPUBLISH, counts = mapOf("queued" to lastRepublished.toLong(), "previousSeq" to ownSeq))
+                }
+            }
             else if (dao.apiOutboxCount(workspace) == 0 && (dao.dirtyNoteCount() > 0 || dao.dirtyAssetCount() > 0)) api.queueDirtyRecords(workspace)
             push(settings, client, budget, onProgress)
             // Second pull catches entries published by other devices while this
             // device was pushing (mirrors the API backend's pull/push/pull).
             onProgress("正在核对云端更改…")
             pull(settings, client, budget)
+            lastResolved = resolved.toList()
         }
+    }
+
+    /** Repair: forget read positions so the next sync re-reads every journal (idempotent). */
+    suspend fun resetReadPositions(settings: WebdavSettings) = withContext(Dispatchers.IO) {
+        prefs.edit().remove(knownSeqsKey(settings)).commit()
+        dao.deleteApiCursorsWithPrefix(seqRowPrefix(settings))
+    }
+
+    /** Repair: queue the whole library (and private data when a key is set) for publication. */
+    suspend fun queueFullRepublish(settings: WebdavSettings): Int = withContext(Dispatchers.IO) {
+        val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
+        val before = dao.apiOutboxCount(workspace)
+        queueInitialSnapshot()
+        if (settings.syncPassword.isNotEmpty()) {
+            privacyCipher = WebdavPrivacyCipher(settings.syncPassword)
+            prefs.edit().remove(privateSeedKey(settings)).commit()
+            queuePrivateSnapshot(settings)
+        }
+        maxOf(0, dao.apiOutboxCount(workspace) - before)
     }
 
     // ---- Pull -----------------------------------------------------------------
 
-    private class JournalReplay(val deviceId:String,val entries:List<WebdavJournalEntry>) {
+    private class JournalReplay(val deviceId:String,val entries:List<WebdavJournalEntry>,val own:Boolean=false) {
         val applied=BooleanArray(entries.size)
         var limit=entries.size
     }
@@ -238,12 +295,26 @@ class WebdavSyncClient(
         val seqs = knownSeqs(settings)
         val journals=mutableListOf<JournalReplay>()
         val bootstrap=seqs.isEmpty() && dao.allNotes().isEmpty()
+        val ownId=webdavDeviceId(prefs)
+        // Records applied beyond a cursor that is held back (by a record still
+        // waiting for its note) must not be replayed as if they were new: a
+        // replay of an old body over a newer local edit would look like a conflict.
+        val appliedKey="webdav-applied:${fingerprint(settings)}"
+        val appliedBeyond=runCatching{JsonParser.parseString(prefs.getString(appliedKey,"{}")).asJsonObject}.getOrDefault(JsonObject())
+            .entrySet().associate{(device,values)->device to (runCatching{values.asJsonArray.map{it.asLong}.toSet()}.getOrDefault(emptySet()))}
         for (deviceId in deviceIds) {
-            val known = seqs[deviceId] ?: 0L
+            var known = seqs[deviceId] ?: 0L
             val head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
                 ?.let { WebdavJournalProtocol.parseHead(it) }
             if (head != null) {
                 require(head.deviceId == deviceId) { "远端日志索引设备 ID 不匹配" }
+                // A marker behind our cursor means the journal was deleted and
+                // recreated; skipping it would hide every new record.
+                if (head.lastSeq < known) {
+                    DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_REPOSITORY_RESET,resourceId=deviceId,counts=mapOf("known" to known,"remote" to head.lastSeq))
+                    known = 0L
+                    seqs[deviceId] = 0L
+                }
                 if (head.lastSeq <= known) continue
             }
             // No head is a legacy v4 journal; retain its full-read compatibility.
@@ -251,20 +322,18 @@ class WebdavSyncClient(
             val journalBytes=utf8Size(text).toLong()
             budget.consume(journalBytes,journalBytes)
             val entries = WebdavJournalProtocol.parseJournal(text)
-            if (head != null) {
-                val bytes = text.toByteArray(Charsets.UTF_8)
-                val matchesHead = bytes.size == head.journalBytes &&
-                    WebdavJournalProtocol.sha256(bytes).equals(head.journalSha256, ignoreCase = true)
-                // A journal can have an uncommitted tail when a v1 writer put
-                // the journal but lost its final head PUT. That tail is hidden
-                // until a matching head arrives; any other mismatch is corrupt.
-                if (!matchesHead) {
-                    val committedPrefixMatches = bytes.size >= head.journalBytes &&
-                        WebdavJournalProtocol.sha256(bytes.copyOfRange(0, head.journalBytes)).equals(head.journalSha256, ignoreCase = true)
-                    require((entries.maxOfOrNull { it.seq } ?: 0L) > head.lastSeq && committedPrefixMatches) { "远端日志索引校验失败" }
-                }
+            if (head == null && (entries.maxOfOrNull { it.seq } ?: 0L) < known) {
+                known = 0L
+                seqs[deviceId] = 0L
             }
+            // A journal whose marker PUT failed (or an old writer without
+            // markers) still contains only complete JSON rows. Expose the
+            // committed sequence range instead of blocking every device until
+            // the writer comes back; its unacknowledged rows are republished.
+            
+            val alreadyApplied=appliedBeyond[deviceId].orEmpty()
             val decoded=entries.filter { it.seq>known && it.seq<=(head?.lastSeq?:Long.MAX_VALUE) }.map { entry ->
+                if(entry.seq in alreadyApplied)return@map entry
                 var payload=entry.payload
                 payload[WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER]?.takeIf{it.isJsonPrimitive}?.asString?.let { marker ->
                     val hash=WebdavJournalProtocol.requireHash(marker)
@@ -275,7 +344,9 @@ class WebdavSyncClient(
                 SyncEntityIdentityContract.requireChange(entry.type,entry.id,payload)
                 entry.copy(payload=payload,encrypted=encrypted)
             }
-            journals.add(JournalReplay(deviceId,decoded))
+            journals.add(JournalReplay(deviceId,decoded,deviceId==ownId).apply{
+                decoded.forEachIndexed{index,entry->if(entry.seq in alreadyApplied)applied[index]=true}
+            })
         }
         val bootstrapParents=if(bootstrap)journals.flatMap{it.entries}.groupBy{it.type to it.id}.mapValues{(_,rows)->rows.maxOf{it.ver}} else emptyMap()
         // A compacted journal, or another device's journal, can contain a child
@@ -299,7 +370,7 @@ class WebdavSyncClient(
                         blockedEntities.add(entity)
                         continue
                     }
-                    if(!applyJournalEntry(client,entry,budget)) {
+                    if(!applyJournalEntry(client,entry,budget,journal.own)) {
                         journal.limit=index
                         break
                     }
@@ -323,7 +394,7 @@ class WebdavSyncClient(
                 if(entry.type!="page" || entry.op!="upsert" || entry.id !in missingParents || dao.getNoteHeader(entry.id)!=null)continue
                 val knownPage=dao.apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",entry.id))
                 if(knownPage!=null && dao.apiPage(entry.id)==null)continue
-                if(applyJournalEntry(client,entry,budget)) {
+                if(applyJournalEntry(client,entry,budget,journal.own)) {
                     journal.applied[index]=true
                     progressed=true
                 }
@@ -345,6 +416,36 @@ class WebdavSyncClient(
             }
             if(!progressed)break
         }
+        // A record whose note has not arrived yet (its page may sit in the
+        // writer's next upload batch) keeps that device's cursor in place so it
+        // is retried; later records were still applied above and replay
+        // idempotently. It must not fail the whole sync or block publishing.
+        // If the note never appears (deleted or private elsewhere), give up on
+        // the record after two days so the cursor cannot stay stuck forever.
+        val orphanKey="webdav-orphans:${fingerprint(settings)}"
+        val firstSeen=runCatching{JsonParser.parseString(prefs.getString(orphanKey,"{}")).asJsonObject}.getOrDefault(JsonObject())
+        val stillWaiting=JsonObject()
+        val now=System.currentTimeMillis()
+        for(journal in journals)for(index in 0 until journal.limit) {
+            if(journal.applied[index])continue
+            val entry=journal.entries[index]
+            if(requiredParentPage(entry)==null)continue
+            val key="${journal.deviceId}:${entry.seq}"
+            val since=firstSeen[key]?.takeIf{it.isJsonPrimitive}?.asLong?:now
+            if(now-since>ORPHAN_GRACE_MS) {
+                DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_FAILURE,operationId="orphan-record-skipped",resourceId=entry.id,counts=mapOf("seq" to entry.seq))
+                journal.applied[index]=true
+            } else stillWaiting.addProperty(key,since)
+        }
+        prefs.edit().putString(orphanKey,stillWaiting.toString()).apply()
+        val nextApplied=JsonObject()
+        for(journal in journals) {
+            val firstOpen=journal.entries.indices.firstOrNull{!journal.applied[it]}?:continue
+            val beyond=com.google.gson.JsonArray()
+            for(index in firstOpen+1 until journal.entries.size)if(journal.applied[index])beyond.add(journal.entries[index].seq)
+            if(beyond.size()>0)nextApplied.add(journal.deviceId,beyond)
+        }
+        prefs.edit().putString(appliedKey,nextApplied.toString()).apply()
         for(journal in journals) {
             var committed=seqs[journal.deviceId]?:0L
             for((index,entry) in journal.entries.withIndex()) {
@@ -354,15 +455,11 @@ class WebdavSyncClient(
             seqs[journal.deviceId]=committed
         }
         saveKnownSeqs(settings, seqs)
-        val missing=journals.firstNotNullOfOrNull { journal ->
-            (0 until journal.limit).firstOrNull { !journal.applied[it] }?.let { journal.entries[it] }
-        }
-        check(missing==null) { "云端 ${missing!!.type} 记录（序号 ${missing.seq}）缺少对应笔记；已保留同步位置，待笔记恢复后重试" }
         return deviceIds
     }
 
     /** Returns false for a conflict so the caller can keep the cursor at the committed prefix. */
-    private suspend fun applyJournalEntry(client: WebdavClient, entry: WebdavJournalEntry, budget: RemoteTransferLimits.Budget): Boolean {
+    private suspend fun applyJournalEntry(client: WebdavClient, entry: WebdavJournalEntry, budget: RemoteTransferLimits.Budget, fromOwnDevice: Boolean = false): Boolean {
         val type = entry.type
         val id = entry.id
         val version = entry.ver
@@ -412,13 +509,23 @@ class WebdavSyncClient(
             else -> version != localVersion
         }
         val localStateExists = hasLocalState(type, id, payload)
+        // Our own journal only replays work this device already has; a lost
+        // cursor must never turn that replay into a conflict.
+        if(fromOwnDevice && (pending!=null || localVersion>=version+1))return true
         if(pending==null && !locallyDirty && version+1<localVersion)return true
+        // With an edit queued, a record older than the accepted baseline is an
+        // ancestor this device has already moved past.
+        if(pending!=null && version+1<localVersion)return true
         val compactedAdvance=pending==null && !locallyDirty && version>localVersion
-        if ((pending != null && version > pending.expectedVersion) || locallyDirty || (parentMismatch && !compactedAdvance && localStateExists && !sameRemoteState(type, id, payload, entry.hash))) {
-            conflictKeys.add("$type:$id")
-            affectedPage?.let { pageId -> conflictKeys.add("page:$pageId"); conflictKeys.add("document:$pageId") }
-            affectedPage?.let { api.recordConflict(it, type, payload) }
-            return false
+        // Only the note's own page/body compete with an unsaved local edit;
+        // tags, steps or attachments from another device are simply applied.
+        val dirtyConflict=locallyDirty && (type=="page" || type=="document")
+        if ((pending != null && version > pending.expectedVersion) || dirtyConflict || (parentMismatch && !compactedAdvance && localStateExists && !sameRemoteState(type, id, payload, entry.hash))) {
+            // Concurrent edits never stop synchronization: keep the local
+            // version, republish it as the successor and keep the other
+            // device's body as a separate "conflict copy" note.
+            settleConflict(entry, payload, pending, localVersion, affectedPage)
+            return true
         }
         // A retry/replay with identical content is safe to acknowledge without
         // rewriting local state. This is what prevents an old journal copy from
@@ -464,6 +571,57 @@ class WebdavSyncClient(
         }
         dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), version + 1))
         return true
+    }
+
+    private suspend fun settleConflict(entry: WebdavJournalEntry, payload: JsonObject, pending: io.github.notebook.android.data.ApiSyncOutboxEntity?, localVersion: Long, affectedPage: String?) {
+        val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
+        val target = maxOf(localVersion, pending?.expectedVersion ?: 0L, entry.ver + 1)
+        dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(workspace, entry.type, entry.id), target))
+        if (pending != null) dao.rebaseApiOutbox(entry.type, entry.id, target)
+        var copyId: String? = null
+        if (entry.type == "document" && entry.op == "upsert") {
+            val remoteBody = TipTapCodec.decode(api.documentRepresentation(payload))
+            val local = dao.get(entry.id)
+            if (remoteBody.isNotBlank() && remoteBody.trim() != local?.body?.trim()) copyId = createConflictCopy(local, entry.id, remoteBody, entry.encrypted)
+        }
+        affectedPage?.let { pageId ->
+            dao.get(pageId)?.let { note ->
+                val cleared = if (note.conflict) note.copy(conflict = false, conflictSnapshotJson = null).also { dao.put(it) } else note
+                // A dirty note without a queued row must still reach the remote
+                // as the successor of the branch it just superseded.
+                if (pending == null && cleared.dirty && (entry.type == "page" || entry.type == "document")) api.queueNote(workspace, cleared)
+            }
+        }
+        resolved += ResolvedWebdavConflict(entry.type, entry.id, affectedPage, copyId)
+        DiagnosticLogger.log(
+            DiagnosticLevel.WARN,
+            DiagnosticEvent.SYNC_CONFLICT_RESOLVED,
+            resourceId = entry.id,
+            counts = mapOf("remoteParent" to entry.ver, "localVersion" to localVersion, "copy" to if (copyId != null) 1L else 0L),
+        )
+    }
+
+    private suspend fun createConflictCopy(local: io.github.notebook.android.data.NoteEntity?, originalId: String, body: String, encrypted: Boolean): String {
+        val now = System.currentTimeMillis()
+        val copyId = UUID.randomUUID().toString()
+        val stamp = java.text.SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(now))
+        val firstLine = body.lineSequence().map { it.trimStart('#', ' ', '>').trim() }.firstOrNull { it.isNotBlank() }?.take(60)
+        val baseTitle = local?.title?.takeIf { it.isNotBlank() } ?: firstLine ?: "未命名笔记"
+        val copy = io.github.notebook.android.data.NoteEntity(
+            id = copyId, title = "$baseTitle（冲突副本 $stamp）", body = body,
+            previewText = TipTapCodec.plainText(body).take(240), createdAt = now, updatedAt = now,
+            folderId = local?.folderId, folderName = local?.folderName ?: "未分类", icon = local?.icon,
+            parentPageId = local?.parentPageId, sortOrder = (local?.sortOrder ?: 0.0) + 0.5, treeUpdatedAt = now,
+            itemType = local?.itemType ?: "note", dirty = true,
+        )
+        dao.put(copy)
+        val index = privacy.snapshot()
+        if (encrypted || index.isPrivate(originalId)) {
+            val folder = index.folderOf(originalId, local?.folderId) ?: local?.folderId ?: "webdav-private"
+            privacy.update { it.copy(noteIds = it.noteIds + copyId, mappings = it.mappings + (copyId to folder)) }
+        }
+        api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, copy)
+        return copyId
     }
 
     private fun downloadObjectBytes(client: WebdavClient, hash:String, budget:RemoteTransferLimits.Budget):ByteArray {
@@ -537,15 +695,13 @@ class WebdavSyncClient(
     private suspend fun rememberPrivatePage(id:String,sectionId:String?) {
         val folderId=sectionId?:"webdav-private"
         if(dao.getFolder(folderId)==null)dao.putFolder(FolderEntity(folderId,"隐私笔记",type="encryptedFolder"))
-        val ids=JsonParser.parseString(prefs.getString("encryptedNoteIds","[]")).asJsonArray
-        if(ids.none{it.asString==id})ids.add(id)
-        val mappings=JsonParser.parseString(prefs.getString("encryptedMappings","{}")).asJsonObject
-        mappings.addProperty(id,folderId)
-        prefs.edit().putString("encryptedNoteIds",gson.toJson(ids)).putString("encryptedMappings",gson.toJson(mappings)).apply()
+        privacy.update{it.copy(noteIds=it.noteIds+id,mappings=it.mappings+(id to folderId))}
     }
 
+    private fun privateSeedKey(settings:WebdavSettings)="webdav-private-seeded:${fingerprint(settings)}:${WebdavJournalProtocol.sha256(settings.syncPassword.toByteArray())}"
+
     private suspend fun queuePrivateSnapshot(settings:WebdavSettings) {
-        val seed="webdav-private-seeded:${fingerprint(settings)}:${WebdavJournalProtocol.sha256(settings.syncPassword.toByteArray())}"
+        val seed=privateSeedKey(settings)
         if(prefs.getBoolean(seed,false))return
         val workspace=WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
         val payloads=JsonParser.parseString(prefs.getString("webdavNotebookPayloads","{}")).asJsonObject
@@ -585,8 +741,9 @@ class WebdavSyncClient(
 
     /** Notes inside encrypted folders must never leave this device in plaintext. */
     private suspend fun encryptedNoteIds(): Set<String> {
-        val ids = runCatching { gson.fromJson(prefs.getString("encryptedNoteIds", "[]"), Array<String>::class.java).toSet() }.getOrDefault(emptySet())
-        val mappings = runCatching { JsonParser.parseString(prefs.getString("encryptedMappings", "{}")).asJsonObject.entrySet().associate { it.key to it.value.asString } }.getOrDefault(emptyMap())
+        val snapshot = privacy.snapshot()
+        val ids = snapshot.noteIds
+        val mappings = snapshot.mappings
         val encryptedFolderIds = dao.allFolders().filter { it.type == "encryptedFolder" }.map { it.id }.toSet()
         return ids + mappings.filterValues { it in encryptedFolderIds }.keys
     }
@@ -702,7 +859,7 @@ class WebdavSyncClient(
         }
         if (entries.isEmpty()) return
         onProgress("正在提交同步记录…")
-        val pushed = appendJournal(client, deviceId, entries)
+        val pushed = appendJournal(client, deviceId, entries, knownSeqs(settings)[deviceId] ?: 0L)
         for (item in published) {
             dao.deleteApiOutboxById(item.id)
             val version = item.expectedVersion + 1
@@ -717,7 +874,7 @@ class WebdavSyncClient(
     }
 
     /** WebDAV has no append primitive: fetch the journal, append locally, PUT the whole file. */
-    private fun appendJournal(client: WebdavClient, deviceId: String, entries: List<JsonObject>): Pair<Long, Int> {
+    private fun appendJournal(client: WebdavClient, deviceId: String, entries: List<JsonObject>, minSeq: Long = 0L): Pair<Long, Int> {
         val path = client.journalPath(deviceId)
         // A device is the sole writer of its journal. It may have exceeded the
         // 4 MB steady-state limit before this push gets a chance to compact it,
@@ -726,7 +883,9 @@ class WebdavSyncClient(
             ?.let { WebdavJournalProtocol.parseJournal(it) } ?: emptyList()
         // Keep the sequence numbers monotonic across compaction: other devices
         // filter by per-device cursors, so seq values must never shrink.
-        val firstSeq = (existing.maxOfOrNull { it.seq } ?: 0L) + 1
+        // A deleted remote journal must not restart at 1: readers keep their
+        // old cursor for this device and would silently skip the new rows.
+        val firstSeq = maxOf(existing.maxOfOrNull { it.seq } ?: 0L, minSeq) + 1
         val lines = entries.mapIndexed { index, entry ->
             entry.deepCopy().apply { addProperty("seq", firstSeq + index) }
         }
@@ -794,20 +953,36 @@ class WebdavSyncClient(
     // ---- Per-repository read cursors -------------------------------------------
 
     private fun knownSeqsKey(settings: WebdavSettings) = "webdav-seqs:${fingerprint(settings)}"
+    /** Room mirror of the cursors: survives a process kill that loses an async prefs write. */
+    private fun seqRowPrefix(settings: WebdavSettings) = "webdav-seq:${WebdavJournalProtocol.sha256(fingerprint(settings).toByteArray()).take(24)}:"
 
-    private fun knownSeqs(settings: WebdavSettings): MutableMap<String, Long> {
+    private suspend fun knownSeqs(settings: WebdavSettings): MutableMap<String, Long> {
         val stored = runCatching { JsonParser.parseString(prefs.getString(knownSeqsKey(settings), "{}")).asJsonObject }.getOrDefault(JsonObject())
-        return stored.entrySet().mapNotNull { (device, seq) ->
+        val fromPrefs = stored.entrySet().mapNotNull { (device, seq) ->
             if (seq.isJsonPrimitive && seq.asJsonPrimitive.isNumber && seq.asLong > 0) device to seq.asLong else null
-        }.toMap().toMutableMap()
+        }.toMap()
+        val prefix = seqRowPrefix(settings)
+        val rows = runCatching { dao.apiCursorsWithPrefix(prefix) }.getOrDefault(emptyList())
+            .associate { it.workspaceId.removePrefix(prefix) to it.cursor }
+        if (rows.isEmpty()) return fromPrefs.toMutableMap()
+        val merged = fromPrefs.toMutableMap()
+        // Room rows are written synchronously with every save; an explicit 0
+        // there records a detected remote reset.
+        rows.forEach { (device, seq) -> merged[device] = if (seq == 0L) 0L else maxOf(merged[device] ?: 0L, seq) }
+        return merged.filterValues { it > 0 }.toMutableMap()
     }
 
-    private fun saveKnownSeqs(settings: WebdavSettings, seqs: Map<String, Long>) {
+    private suspend fun saveKnownSeqs(settings: WebdavSettings, seqs: Map<String, Long>) {
         val json = JsonObject()
         seqs.forEach { (device, seq) -> if (seq > 0) json.addProperty(device, seq) }
-        prefs.edit().putString(knownSeqsKey(settings), json.toString()).apply()
+        prefs.edit().putString(knownSeqsKey(settings), json.toString()).commit()
+        val prefix = seqRowPrefix(settings)
+        seqs.forEach { (device, seq) -> dao.putApiCursor(io.github.notebook.android.data.ApiSyncCursorEntity(prefix + device, maxOf(0L, seq))) }
     }
 }
+
+/** How long a record may wait for its note to arrive before it is skipped. */
+private const val ORPHAN_GRACE_MS = 48L * 60 * 60 * 1000
 
 private fun JsonObject.string(key: String, default: String = "") = get(key)?.takeUnless { it.isJsonNull }?.asString ?: default
 private fun JsonObject.optionalString(key: String) = get(key)?.takeUnless { it.isJsonNull }?.asString

@@ -13,6 +13,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -198,6 +199,8 @@ internal fun EmptyNotes(
     description: String,
     library: Boolean = false,
     onCreate: (() -> Unit)? = null,
+    /** New device: offer restoring an existing 坚果云 library first. */
+    onRestore: (() -> Unit)? = null,
 ) {
     Column(
         Modifier.fillMaxWidth().padding(vertical = 72.dp, horizontal = 32.dp),
@@ -231,6 +234,11 @@ internal fun EmptyNotes(
                 modifier = Modifier.padding(top = 8.dp),
             ) {
                 Text(if (library) "创建笔记库" else "新建笔记")
+            }
+        if (onRestore != null)
+            OutlinedButton(onRestore, shape = CircleShape, modifier = Modifier.testTag("restore-from-cloud")) {
+                Icon(Icons.Default.CloudDownload, null, Modifier.size(18.dp))
+                Text("连接坚果云，恢复已有笔记", Modifier.padding(start = 8.dp))
             }
     }
 }

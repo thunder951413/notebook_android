@@ -162,6 +162,14 @@ internal class NoteNavigationHistory(context: Context) {
         write("recent", (listOf(id) + recent().filter { it != id }).take(40))
     }
 
+    /** Pin (newest first) or unpin several notes at once. */
+    fun setPinned(ids: Collection<String>, pinned: Boolean): List<String> {
+        val old = pinned()
+        val next = if (pinned) ids.filter { it !in old } + old else old.filter { it !in ids }
+        write("pinned", next)
+        return next
+    }
+
     fun togglePin(id: String): List<String> {
         val old = pinned()
         val next = if (id in old) old - id else listOf(id) + old

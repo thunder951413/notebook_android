@@ -44,6 +44,9 @@ import androidx.compose.ui.unit.sp
 import io.github.notebook.android.data.AssetEntity
 import io.github.notebook.android.data.TagEntity
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import androidx.compose.ui.layout.layout
+import kotlin.math.roundToInt
 
 @Composable
 internal fun ReferenceEditorBody(
@@ -75,19 +78,25 @@ internal fun ReferenceEditorBody(
     val focus = remember { FocusRequester() }
     var restoreKeyboard by surface.restoreKeyboard
     val density = LocalDensity.current
-    val remainingIme =
-        ((WindowInsets.ime.getBottom(density) - WindowInsets.navigationBars.getBottom(density))
-            .coerceAtLeast(0) / density.density)
+    // The keyboard inset changes every frame while the IME animates. Reading
+    // it during composition recomposed the whole editor (all Markdown blocks)
+    // ~60 times per open/close. Read it only from effects and the layout phase.
+    val imeInsets = WindowInsets.ime
+    val navigationInsets = WindowInsets.navigationBars
+    fun currentIme(): Float =
+        (imeInsets.getBottom(density) - navigationInsets.getBottom(density)).coerceAtLeast(0) / density.density
     var lastImeHeight by rememberSaveable { mutableFloatStateOf(280f) }
     var awaitingKeyboard by remember { mutableStateOf(false) }
     val panelTransition = remember { MutableTransitionState(false) }
     panelTransition.targetState = panel != null
-    LaunchedEffect(remainingIme, panel) {
-        if (remainingIme > 0 && panel == null && !awaitingKeyboard) {
-            delay(120)
-            lastImeHeight = remainingIme
+    LaunchedEffect(panel) {
+        snapshotFlow { currentIme() }.collectLatest { remainingIme ->
+            if (remainingIme > 0 && panel == null && !awaitingKeyboard) {
+                delay(120)
+                lastImeHeight = remainingIme
+            }
+            if (awaitingKeyboard && remainingIme >= lastImeHeight - 2f) awaitingKeyboard = false
         }
-        if (awaitingKeyboard && remainingIme >= lastImeHeight - 2f) awaitingKeyboard = false
     }
     LaunchedEffect(awaitingKeyboard) {
         if (awaitingKeyboard) {
@@ -121,7 +130,7 @@ internal fun ReferenceEditorBody(
             closePanel()
             return
         }
-        restoreKeyboard = remainingIme > 0 || focused
+        restoreKeyboard = currentIme() > 0 || focused
         awaitingKeyboard = false
         panel = name
         keyboard?.hide()
@@ -262,11 +271,21 @@ internal fun ReferenceEditorBody(
                 IconButton({ openPanel("blocks") }) { Icon(Icons.Default.AddCircleOutline, "添加内容") }
             }
         }
-        val reservedBottom =
-            if (panel != null || panelTransition.currentState || awaitingKeyboard)
-                lastImeHeight.coerceAtLeast(remainingIme)
-            else remainingIme
-        Box(Modifier.fillMaxWidth().height(reservedBottom.dp)) {
+        Box(
+            Modifier.fillMaxWidth().layout { measurable, constraints ->
+                // Evaluated in the layout phase: keyboard animation frames only
+                // re-measure this spacer instead of recomposing the editor.
+                val ime = currentIme()
+                val reserved =
+                    if (panel != null || panelTransition.currentState || awaitingKeyboard)
+                        lastImeHeight.coerceAtLeast(ime)
+                    else ime
+                val height = (reserved * density.density).roundToInt().coerceAtLeast(0)
+                val placeable =
+                    measurable.measure(constraints.copy(minHeight = height, maxHeight = height))
+                layout(placeable.width, height) { placeable.place(0, 0) }
+            }
+        ) {
             androidx.compose.animation.AnimatedVisibility(
                 visibleState = panelTransition,
                 enter = slideInVertically(tween(220)) { it } + fadeIn(),

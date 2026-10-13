@@ -188,6 +188,19 @@ class DebugUiStudyActivity : Activity() {
                 }
                 prefs.edit().putBoolean("hierarchy-seeded", true).commit()
             }
+            if (intent.getBooleanExtra("seedDueTodos", false) && !prefs.getBoolean("due-todos-seeded", false)) {
+                val now = System.currentTimeMillis()
+                val endOfToday = java.util.Calendar.getInstance().apply { set(java.util.Calendar.HOUR_OF_DAY, 23); set(java.util.Calendar.MINUTE, 59); set(java.util.Calendar.SECOND, 59); set(java.util.Calendar.MILLISECOND, 999) }.timeInMillis
+                listOf(
+                    Triple("overdue", "提交三星项目周报", now - 3 * 3_600_000L),
+                    Triple("soon", "给物业打电话", now + 40 * 60_000L),
+                    Triple("today", "整理旅行清单", endOfToday),
+                    Triple("later", "续费域名", now + 3 * 24 * 3_600_000L),
+                ).forEach { (key, title, due) ->
+                    repo.save(NoteEntity(studyId("due-todo-$key"), title = title, itemType = "todo", dueAt = due, viewMode = "text"))
+                }
+                prefs.edit().putBoolean("due-todos-seeded", true).commit()
+            }
             withContext(Dispatchers.Main) {
                 startActivity(Intent(this@DebugUiStudyActivity, MainActivity::class.java))
                 finish()

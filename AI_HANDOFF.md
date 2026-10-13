@@ -26,6 +26,11 @@
 
 每台设备只追加或压缩自己的 journal。同步先发现所有设备日志并拉取，再发布本机 outbox；head 文件用于无变化快速路径，不能取代 journal 的完整校验。PROPFIND 解析失败必须终止本次同步，不能解释为“远端为空”。私密库在配置同步密码后通过 AES-256-GCM 加密发布笔记、步骤和附件。共享加密格式由 `WebdavPrivacy.kt` 与跨端固定向量测试约束；缺少密码时必须拒绝发布私密数据，不能退化为明文。
 
+2026-10-13 起，WebDAV 冲突不再阻断同步（与桌面端一致，详见桌面仓库 `docs/SYNC_RELIABILITY_2026-10-13.md`）：
+`WebdavSyncClient.settleConflict` 保留本机版本、把待上传修改改挂在 `max(本机基线, 待上传父版本, 远端 ver+1)` 上并继续处理后续记录；正文不同则由 `createConflictCopy` 生成“原标题（冲突副本 …）”笔记（私密原笔记的副本保持私密）。自身设备日志的重放、比基线更旧的祖先记录一律跳过；读取位置同时写入 prefs（commit）与 Room `api_sync_cursors`（键前缀 `webdav-seq:`）。远端序号回退时从头重读；写入序号以本机已知序号为下限；本机日志在云端缺失时重新排队全部内容。缺少父笔记的记录只停住该设备的读取位置并在 48 小时后跳过，不再抛出异常。设置页“同步状态与修复”提供重新读取与重新上传两个幂等修复操作。
+
+`PrivateNoteIndex` 缓存私密笔记映射（EncryptedSharedPreferences 每次读取都要解密并解析 JSON）；所有写入必须经过它的 `update`，不要直接写 `encryptedNoteIds`/`encryptedMappings`。
+
 SSH/SFTP Markdown v3 与 Notebook Next HTTP API 只承担既有部署的迁移兼容。修改共享实体、附件或历史结构时，仍需检查这两条兼容路径，避免迁移期间破坏旧数据。
 
 ## 编辑与生命周期约束
@@ -131,3 +136,13 @@ adb shell am instrument -w \
 新增 `HierarchyUiTest` 必须只运行在隔离模拟器，其 `@Before` 清空 Room。最终构建单元 187 项通过，Lint 0 errors／33 warnings；完整深色回归 44 项、受影响浅色回归 23 项通过。最后加入合法 ID 命名空间与同名正文摘要两项后，最终安装包的层级专项在深／浅色各 12 项全部通过。详见 `docs/NOTE_HIERARCHY_DESIGN.md`。
 
 `DebugUiStudyActivity` 增加显式 `seedHierarchySamples=true`，幂等添加 10 篇层级演示，保留原 6 篇。真机仅更新独立预览包；交付报告、真实截图、30 秒录屏、APK 和哈希位于桌面工作区 `docs/audits/2026-10-12/note-hierarchy-implementation-report.md` 与 `output/notes-hierarchy-design-2026-10-11/`。
+
+## 2026-10-13 大量笔记的查找与展示、流畅度
+
+- 首页列表：置顶区 + 按“今天／昨天／最近 7 天／最近 30 天／月份”吸顶分组；可在“排序与筛选”切换紧凑列表（偏好键 `homeCompact`）。超过 40 项时右侧出现可拖动的快速滚动条，拖动时气泡显示当前分组（`NoteFastScroller`）；向下滚动后出现“回到顶部”。
+- 搜索（`SyncRepository.searchNotes` + `NoteBrowse.kt`）：空格分隔多关键词（AND）、`"短语"`、`-排除`、`#标签`；标题／库名／标签名同样参与匹配；拼音全拼与首字母匹配中文标题（`PinyinMatcher`，Android 10+ 使用系统 ICU，结果缓存）；排序为标题精确 > 前缀 > 包含 > 拼音 > 正文，同档按更新时间；结果带正文片段与关键词高亮。未输入时显示最近搜索、最近打开和常用标签；搜索中可一键按时间／类型筛选；在库或标签内搜索时提示范围并可切到全部笔记。
+- 性能约束：组合函数里不要直接读 EncryptedSharedPreferences（用 `PrivateNoteIndex` 缓存）；列表的派生数据用 `remember` 依赖笔记列表；转场动画只在 graphicsLayer/draw 阶段读进度；输入法高度不要在大组合函数中读取。
+- 本机安装的正式包由 `release/notebook-local.jks` 签名（密码在同目录 `notebook-local.properties`，均被 .gitignore 忽略），与 GitHub Release 的签名不同：从 GitHub 下载的旧签名 APK 不能覆盖它，需要先卸载。
+- 待办提醒（`reference/TodoReminders.kt`）：首页待办按钮的角标只计“已逾期 + 今天到期”（有逾期为红色）；首页顶部提示条显示已逾期或 2 小时内到期的待办，可直接完成、1 小时后再提示或关闭（关闭持续到截止时间改变）。稍后/关闭只存本机 `todo-banner` 偏好，不进入同步。待办列表默认按截止时间排序并分组为 已逾期／今天／明天／7 天内／以后／无截止日期；截止时间缺省时用提醒时间。
+- 性能：`app/src/main/baseline-prof.txt` 让侧载安装后首次打开笔记也走预编译代码（实测点击帧 41 ms→12 ms）。阅读页表格用 Compose 绘制（`ReaderTable.kt`），普通段落在后台线程预渲染；打开动画进行时只显示标题，落定后再放正文（`LocalDocumentSettled`）。`profile` 构建类型（`./gradlew assembleProfile`）是接近正式包性能、仍用 debug 签名覆盖 `.nexttest` 的包，用于真机测性能。
+- 打开/关闭笔记：`DocumentContainer` 为不变形的“窗口展开”（圆角裁切从卡片扩展到全屏，只做等比轻微缩放），避免非等比缩放把标题拉伸、关闭像合书。点击后先在后台读取正文与阅读位置并预渲染 Markdown（`prepareReader`，共享 `ReaderRenderer`），首帧即在上次位置排出真实页面，再开始动画；不缓存页面截图。

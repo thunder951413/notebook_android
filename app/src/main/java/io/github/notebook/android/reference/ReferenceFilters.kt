@@ -32,6 +32,9 @@ internal fun BoxScope.ReferenceFilters(
     onDescending: () -> Unit,
     onContent: (ContentFilter) -> Unit,
     onFiling: (FilingFilter) -> Unit,
+    compact: Boolean = false,
+    onCompact: () -> Unit = {},
+    showDue: Boolean = false,
 ) {
     var displayedChild by remember { mutableStateOf("sort") }
     child?.let { displayedChild = it }
@@ -73,6 +76,14 @@ internal fun BoxScope.ReferenceFilters(
                 trailingContent = { Icon(Icons.Default.ChevronRight, null) },
                 modifier = Modifier.clickable { onChild("filing") },
             )
+            HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+            ListItem(
+                headlineContent = { Text("紧凑列表") },
+                supportingContent = { Text(if (compact) "已开启：一屏显示更多笔记" else "关闭时以卡片显示摘要与图片") },
+                leadingContent = { Icon(if (compact) Icons.Default.ViewHeadline else Icons.Default.ViewAgenda, null) },
+                trailingContent = { Switch(compact, { onCompact() }) },
+                modifier = Modifier.clickable(onClick = onCompact),
+            )
         }
     }
     AnimatedVisibility(
@@ -100,7 +111,7 @@ internal fun BoxScope.ReferenceFilters(
                 HorizontalDivider()
                 when (displayedChild) {
                     "sort" -> {
-                        NoteOrder.entries.forEach { value ->
+                        NoteOrder.entries.filter { it != NoteOrder.Due || showDue || order == NoteOrder.Due }.forEach { value ->
                             ListItem(
                                 headlineContent = { Text(value.label) },
                                 trailingContent = {

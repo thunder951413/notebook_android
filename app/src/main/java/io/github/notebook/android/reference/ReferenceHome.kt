@@ -53,6 +53,7 @@ internal enum class NoteOrder(val label: String) {
     Updated("修改时间"),
     Created("创建时间"),
     Title("标题"),
+    Due("截止时间"),
 }
 
 internal enum class ContentFilter(val label: String) {
@@ -80,6 +81,8 @@ internal fun orderedNotes(
             NoteOrder.Updated -> compareBy<NoteSummary> { it.updatedAt }
             NoteOrder.Created -> compareBy { it.createdAt }
             NoteOrder.Title -> compareBy { it.title.lowercase() }
+            // Soonest first, undated last, regardless of the direction toggle.
+            NoteOrder.Due -> return notes.sortedWith(compareBy<NoteSummary> { it.attentionAt() ?: Long.MAX_VALUE }.thenByDescending { it.updatedAt }.thenBy { it.id })
         }
     return notes.sortedWith(
         if (descending) comparator.reversed().thenBy { it.id } else comparator.thenBy { it.id }
@@ -119,6 +122,10 @@ internal fun ReferenceHome(
     tagId: String?,
     query: String,
     onQuery: (String) -> Unit,
+    /** Ranked result ids while searching (null = not searching / still loading). */
+    searchOrder: List<String>? = null,
+    searchSnippets: Map<String, String> = emptyMap(),
+    searchTerms: List<String> = emptyList(),
     loadingId: String?,
     status: String?,
     syncing: Boolean,
@@ -140,7 +147,7 @@ internal fun ReferenceHome(
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var hierarchy by rememberSaveable { mutableStateOf(false) }
     var hierarchyAnchor by rememberSaveable { mutableStateOf<String?>(null) }
-    val hierarchyNotes = all.filter { canExposeNote(it, encryptedUnlocked, repo::isEncrypted) }
+    val hierarchyNotes = remember(all, encryptedUnlocked) { all.filter { canExposeNote(it, encryptedUnlocked, repo::isEncrypted) } }
     val hierarchyIndex = remember(hierarchyNotes) { NoteHierarchyIndex(hierarchyNotes) }
     if (hierarchy)
         ReferenceHierarchySheet(
@@ -164,7 +171,10 @@ internal fun ReferenceHome(
     createTransition.targetState = createMenu
     val homeBlur by
         animateDpAsState(if (createMenu) 12.dp else 0.dp, tween(180), label = "create-blur")
-    var order by rememberSaveable { mutableStateOf(NoteOrder.Updated) }
+    val todoContext =
+        destination in setOf(Destination.Today, Destination.Important, Destination.Todos) ||
+            folders.firstOrNull { it.id == folderId }?.type == "todoList"
+    var order by rememberSaveable(todoContext) { mutableStateOf(if (todoContext) NoteOrder.Due else NoteOrder.Updated) }
     var descending by rememberSaveable { mutableStateOf(true) }
     var content by rememberSaveable { mutableStateOf(ContentFilter.All) }
     var filing by rememberSaveable { mutableStateOf(FilingFilter.All) }
@@ -177,7 +187,14 @@ internal fun ReferenceHome(
     var existingPicker by remember { mutableStateOf(false) }
     var confirmAction by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    val preferences = LocalContext.current.getSharedPreferences("editor_preferences", 0)
+    val context = LocalContext.current
+    val preferences = remember(context) { context.getSharedPreferences("editor_preferences", 0) }
+    val navigation = remember(context) { NoteNavigationHistory(context) }
+    var pinnedIds by remember { mutableStateOf(navigation.pinned()) }
+    LaunchedEffect(hierarchy) { if (!hierarchy) pinnedIds = navigation.pinned() }
+    var compact by remember { mutableStateOf(preferences.getBoolean("homeCompact", false)) }
+    var time by rememberSaveable { mutableStateOf(TimeFilter.All) }
+    var recentSearches by remember { mutableStateOf(repo.recentSearches()) }
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -220,43 +237,99 @@ internal fun ReferenceHome(
     val linkIds by repo.linkNoteIds.collectAsState(initial = emptyList())
     val assets by repo.allAssets.collectAsState(initial = emptyList())
     val publicLibraries = folders.filter { it.type == "noteFolder" }.sortedBy { it.sortOrder }
-    val visible =
-        remember(notes, order, descending, content, filing, assets, linkIds) {
-            orderedNotes(
-                notes.filter { note ->
-                    (filing == FilingFilter.All ||
-                        if (filing == FilingFilter.Unfiled) note.folderId == null
-                        else note.folderId != null) &&
-                        (content == ContentFilter.All ||
-                            when (content) {
-                                ContentFilter.Image ->
-                                    assets.any { it.noteId == note.id && it.kind == "image" }
-                                ContentFilter.Audio ->
-                                    assets.any { it.noteId == note.id && it.kind == "audio" }
-                                ContentFilter.Video ->
-                                    assets.any {
-                                        it.noteId == note.id && it.mimeType.startsWith("video/")
-                                    }
-                                ContentFilter.File ->
-                                    assets.any {
-                                        it.noteId == note.id &&
-                                            it.kind == "file" &&
-                                            !it.mimeType.startsWith("video/")
-                                    }
-                                ContentFilter.Link -> note.id in linkIds
-                                else -> true
-                            })
-                },
-                order,
-                descending,
-            )
-        }
-    var snippets by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
-    LaunchedEffect(query, notes.map { it.id }) {
-        snippets =
-            if (query.isBlank()) emptyMap()
-            else notes.take(100).associate { it.id to repo.searchSnippet(it.id, query) }
+    // Precomputed once per attachment change: per-row lookups used to scan
+    // every attachment for every note on each recomposition.
+    val imageByNote = remember(assets) { assets.filter { it.kind == "image" }.groupBy { it.noteId }.mapValues { it.value.first() } }
+    val notesByKind = remember(assets) {
+        mapOf(
+            ContentFilter.Image to assets.filter { it.kind == "image" }.mapTo(HashSet()) { it.noteId },
+            ContentFilter.Audio to assets.filter { it.kind == "audio" }.mapTo(HashSet()) { it.noteId },
+            ContentFilter.Video to assets.filter { it.mimeType.startsWith("video/") }.mapTo(HashSet()) { it.noteId },
+            ContentFilter.File to assets.filter { it.kind == "file" && !it.mimeType.startsWith("video/") }.mapTo(HashSet()) { it.noteId },
+        )
     }
+    val linkSet = remember(linkIds) { linkIds.toHashSet() }
+    val visible =
+        remember(notes, order, descending, content, filing, notesByKind, linkSet, time, searchOrder) {
+            val filtered = notes.filter { note ->
+                (filing == FilingFilter.All ||
+                    if (filing == FilingFilter.Unfiled) note.folderId == null
+                    else note.folderId != null) &&
+                    (content == ContentFilter.All ||
+                        if (content == ContentFilter.Link) note.id in linkSet
+                        else notesByKind[content]?.contains(note.id) == true) &&
+                    time.accepts(note.updatedAt)
+            }
+            if (searchOrder != null) {
+                val rank = HashMap<String, Int>(searchOrder.size).apply { searchOrder.forEachIndexed { index, id -> put(id, index) } }
+                filtered.sortedBy { rank[it.id] ?: Int.MAX_VALUE }
+            } else orderedNotes(filtered, order, descending)
+        }
+    val highlightTerms = if (searchTerms.isNotEmpty()) searchTerms else listOfNotNull(query.trim().takeIf { it.isNotEmpty() })
+    val pinnedSet = remember(pinnedIds) { pinnedIds.toHashSet() }
+    val pinnedVisible = if (search) emptyList() else visible.filter { it.id in pinnedSet }.sortedBy { pinnedIds.indexOf(it.id) }
+    val unpinnedVisible = if (search || pinnedVisible.isEmpty()) visible else visible.filter { it.id !in pinnedSet }
+    val dateSections =
+        remember(unpinnedVisible, order, search) {
+            if (search || order == NoteOrder.Title) emptyList()
+            else if (order == NoteOrder.Due) {
+                val now = System.currentTimeMillis()
+                val sections = mutableListOf<Pair<String, MutableList<NoteSummary>>>()
+                for (note in unpinnedVisible) {
+                    val label = todoGroupLabel(note, now)
+                    if (sections.lastOrNull()?.first == label) sections.last().second += note
+                    else sections += label to mutableListOf(note)
+                }
+                sections
+            }
+            else {
+                val sections = mutableListOf<Pair<String, MutableList<NoteSummary>>>()
+                for (note in unpinnedVisible) {
+                    val label = dateGroupLabel(if (order == NoteOrder.Created) note.createdAt else note.updatedAt)
+                    if (sections.lastOrNull()?.first == label) sections.last().second += note
+                    else sections += label to mutableListOf(note)
+                }
+                sections
+            }
+        }
+    LaunchedEffect(search) { if (search) recentSearches = repo.recentSearches() }
+    // Fast-scroller bubble: which section a lazy-list key belongs to.
+    val sectionByKey =
+        remember(pinnedVisible, dateSections, unpinnedVisible) {
+            HashMap<Any, String>().apply {
+                pinnedVisible.forEach { put("pinned-${it.id}", "置顶") }
+                put("header-pinned", "置顶")
+                if (dateSections.isNotEmpty())
+                    dateSections.forEach { (label, group) ->
+                        put("header-$label", label)
+                        group.forEach { put(it.id, label) }
+                    }
+                else unpinnedVisible.forEach { note -> put(note.id, note.title.trim().take(1).uppercase().ifBlank { "#" }) }
+            }
+        }
+    val tagShortcuts =
+        remember(all, tags) {
+            val counts = HashMap<String, Int>()
+            all.forEach { note -> if (note.deletedAt == null) note.tagIds.split(',').forEach { id -> if (id.isNotBlank()) counts[id] = (counts[id] ?: 0) + 1 } }
+            tags.mapNotNull { tag -> counts[tag.id]?.let { tag.name to it } }.sortedByDescending { it.second }.take(12)
+        }
+    var clock by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(30_000)
+            clock = System.currentTimeMillis()
+        }
+    }
+    val todos = remember(hierarchyNotes, clock) { todoDigest(hierarchyNotes, clock) }
+    val bannerState = remember(context) { TodoBannerState(context) }
+    var bannerRevision by remember { mutableIntStateOf(0) }
+    val bannerItems = remember(todos, bannerRevision, clock) { todos.attention.filterNot { bannerState.hidden(it, clock) } }
+    val libraryCounts =
+        remember(all) {
+            HashMap<String, Int>().apply {
+                all.forEach { note -> if (note.deletedAt == null && note.folderId != null && !repo.isEncrypted(note)) put(note.folderId, (get(note.folderId) ?: 0) + 1) }
+            }
+        }
     LaunchedEffect(visible.map { it.id }) {
         selected = selected.intersect(visible.map { it.id }.toSet())
     }
@@ -282,6 +355,10 @@ internal fun ReferenceHome(
             }
             menu -> menu = false
             createMenu -> createMenu = false
+            search && (content != ContentFilter.All || time != TimeFilter.All) && query.isBlank() -> {
+                content = ContentFilter.All
+                time = TimeFilter.All
+            }
             selecting -> {
                 selecting = false
                 selected = emptySet()
@@ -307,6 +384,54 @@ internal fun ReferenceHome(
                 .onFailure { onStatus("操作失败：${it.localizedMessage}") }
             busy = false
         }
+    }
+    val noteEntry: @Composable (NoteSummary, Boolean) -> Unit = { note, isPinned ->
+        val raw = searchSnippets[note.id] ?: note.preview
+        // Markdown-to-plain conversion is not free; do it once per text.
+        val preview = remember(note.id, raw) { cardPreview(raw) }
+        val coordinates = remember(note.id) { arrayOfNulls<androidx.compose.ui.layout.LayoutCoordinates>(1) }
+        val path = hierarchyIndex.path(note.id, false).takeIf { search || note.parentPageId != null }
+        val click = {
+            if (selecting)
+                selected = if (note.id in selected) selected - note.id else selected + note.id
+            else {
+                coordinates[0]?.takeIf { it.isAttached }?.boundsInRoot()?.let(onCardBounds)
+                if (search && query.isNotBlank()) repo.rememberSearch(query)
+                onOpen(note.id)
+            }
+        }
+        val longClick = {
+            selecting = true
+            selected = selected + note.id
+        }
+        if (compact)
+            Box(Modifier.onGloballyPositioned { coordinates[0] = it }) {
+                CompactNoteRow(note, preview, highlightTerms, isPinned, selecting, note.id in selected, path, click, longClick)
+            }
+        else
+            ReferenceNoteCard(
+                note,
+                preview,
+                highlightTerms,
+                selecting,
+                selected.contains(note.id),
+                loadingId == note.id,
+                imageByNote[note.id],
+                onClick = click,
+                onPositioned = { coordinates[0] = it },
+                onLongClick = longClick,
+                onMenu = {
+                    selecting = true
+                    selected = setOf(note.id)
+                },
+                path = path,
+                childCount = hierarchyIndex.counts[note.id] ?: 0,
+                onChildren = {
+                    hierarchyAnchor = note.id
+                    hierarchy = true
+                },
+                pinned = isPinned,
+            )
     }
     val title =
         folder?.name
@@ -405,6 +530,8 @@ internal fun ReferenceHome(
                                 TextButton({
                                     keyboard?.hide()
                                     search = false
+                                    content = ContentFilter.All
+                                    time = TimeFilter.All
                                     onQuery("")
                                 }) {
                                     Text("取消")
@@ -522,6 +649,34 @@ internal fun ReferenceHome(
                         }
                     }
                 }
+                if (globalHome && !search && !selecting && tab == 0)
+                    DueSoonBanner(
+                        bannerItems,
+                        clock,
+                        onOpen = { id -> onOpen(id) },
+                        onComplete = { item ->
+                            scope.launch {
+                                runCatching { repo.loadNote(item.id)?.let { repo.save(it.copy(completedAt = System.currentTimeMillis())) } }
+                                    .onSuccess { onStatus("已完成「${item.title.ifBlank { "无标题待办" }}」") }
+                                    .onFailure { onStatus("操作失败：${it.localizedMessage}") }
+                            }
+                        },
+                        onSnooze = { item ->
+                            bannerState.snooze(item.id, System.currentTimeMillis() + 60 * 60_000L)
+                            bannerRevision++
+                        },
+                        onDismiss = { item ->
+                            bannerState.dismiss(item)
+                            bannerRevision++
+                        },
+                        onShowAll = { onSelect(Destination.Todos, null, null) },
+                    )
+                if (search) SearchFilterChips(content, time, { content = it }, { time = it })
+                if (search && (folder != null || tagId != null))
+                    Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("仅搜索「$title」", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton({ onSelect(Destination.All, null, null) }) { Text("搜索全部笔记", fontSize = 12.sp) }
+                    }
                 status?.let {
                     Surface(
                         Modifier.padding(horizontal = 16.dp).fillMaxWidth(),
@@ -553,7 +708,7 @@ internal fun ReferenceHome(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            if (search) "搜索结果 · ${visible.size}"
+                            if (search) (if (query.isBlank() && content == ContentFilter.All && time == TimeFilter.All) "搜索" else "找到 ${visible.size} 篇")
                             else if (librariesVisible) "笔记库" else title,
                             Modifier.weight(1f),
                             fontSize = if (search) 18.sp else 32.sp,
@@ -643,7 +798,7 @@ internal fun ReferenceHome(
                                                 fontSize = 14.sp,
                                             )
                                             Text(
-                                                "${all.count{it.folderId==library.id&&it.deletedAt==null&&!repo.isEncrypted(it)}} 篇",
+                                                "${libraryCounts[library.id] ?: 0} 篇",
                                                 fontSize = 12.sp,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             )
@@ -653,7 +808,7 @@ internal fun ReferenceHome(
                                 }
                             }
                         }
-                    else
+                    else Box(Modifier.fillMaxSize()) {
                         LazyColumn(
                             Modifier.fillMaxSize().testTag("note-cards"),
                             state = listState,
@@ -664,7 +819,7 @@ internal fun ReferenceHome(
                                     top = 4.dp,
                                     bottom = 112.dp,
                                 ),
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 12.dp),
                         ) {
                             if (globalHome && !search && !selecting) {
                                 item(key = "spotlight-header") {
@@ -700,59 +855,52 @@ internal fun ReferenceHome(
                                     Spacer(Modifier.height(8.dp))
                                 }
                             }
+                            if (search && query.isBlank() && content == ContentFilter.All && time == TimeFilter.All) {
+                                item(key = "search-start") {
+                                    SearchStartPanel(
+                                        recentSearches,
+                                        remember(all) { navigation.recent().mapNotNull { id -> hierarchyNotes.firstOrNull { it.id == id && it.deletedAt == null } }.take(8) },
+                                        onSearch = onQuery,
+                                        onClearSearches = {
+                                            repo.clearSearchHistory()
+                                            recentSearches = emptyList()
+                                        },
+                                        onOpen = { id ->
+                                            keyboard?.hide()
+                                            onOpen(id)
+                                        },
+                                    )
+                                }
+                                if (tagShortcuts.isNotEmpty())
+                                    item(key = "search-tags") { SearchTagShortcuts(tagShortcuts) { name -> onQuery("#$name ") } }
+                                return@LazyColumn
+                            }
                             if (visible.isEmpty())
                                 item {
                                     EmptyNotes(
                                         if (search) "没有找到相关笔记" else "从一篇笔记开始",
-                                        if (search) "试试其他关键词" else "记录想法，随时回来继续",
+                                        if (search) "换个关键词，或去掉筛选条件试试" else "记录想法，随时回来继续",
                                         onCreate =
                                             if (search || destination == Destination.Trash) null
                                             else onCreate,
+                                        onRestore =
+                                            if (!search && globalHome && all.isEmpty() && !repo.hasRemoteConfiguration()) onSettings
+                                            else null,
                                     )
                                 }
-                            items(visible, key = { it.id }) { note ->
-                                var bounds by remember(note.id) { mutableStateOf<Rect?>(null) }
-                                ReferenceNoteCard(
-                                    note,
-                                    cardPreview(snippets[note.id] ?: note.preview),
-                                    query,
-                                    selecting,
-                                    selected.contains(note.id),
-                                    loadingId == note.id,
-                                    assets.firstOrNull {
-                                        it.noteId == note.id && it.kind == "image"
-                                    },
-                                    onClick = {
-                                        if (selecting)
-                                            selected =
-                                                if (note.id in selected) selected - note.id
-                                                else selected + note.id
-                                        else {
-                                            bounds?.let(onCardBounds)
-                                            onOpen(note.id)
-                                        }
-                                    },
-                                    onBounds = { bounds = it },
-                                    onLongClick = {
-                                        selecting = true
-                                        selected = selected + note.id
-                                    },
-                                    onMenu = {
-                                        selecting = true
-                                        selected = setOf(note.id)
-                                    },
-                                    path =
-                                        hierarchyIndex.path(note.id, false).takeIf {
-                                            search || note.parentPageId != null
-                                        },
-                                    childCount = hierarchyIndex.counts[note.id] ?: 0,
-                                    onChildren = {
-                                        hierarchyAnchor = note.id
-                                        hierarchy = true
-                                    },
-                                )
+                            if (pinnedVisible.isNotEmpty()) {
+                                stickyHeader(key = "header-pinned") { NoteSectionHeader("置顶", pinnedVisible.size) }
+                                items(pinnedVisible, key = { "pinned-${it.id}" }) { note -> noteEntry(note, true) }
                             }
+                            if (dateSections.isNotEmpty())
+                                dateSections.forEach { (label, group) ->
+                                    stickyHeader(key = "header-$label") { NoteSectionHeader(label, group.size) }
+                                    items(group, key = { it.id }) { note -> noteEntry(note, false) }
+                                }
+                            else items(unpinnedVisible, key = { it.id }) { note -> noteEntry(note, false) }
                         }
+                        if (!selecting) NoteFastScroller(listState, { key -> sectionByKey[key] })
+                    }
                 }
             }
             if (tabletEditor != null) {
@@ -806,6 +954,18 @@ internal fun ReferenceHome(
                         ) {
                             Icon(Icons.Default.CopyAll, "创建副本")
                         }
+                        val allPinned = selected.isNotEmpty() && selected.all { it in pinnedSet }
+                        IconButton(
+                            {
+                                pinnedIds = navigation.setPinned(selected, !allPinned)
+                                onStatus(if (allPinned) "已取消置顶" else "已置顶，显示在列表最上方")
+                                selecting = false
+                                selected = emptySet()
+                            },
+                            enabled = enabled,
+                        ) {
+                            Icon(Icons.Default.PushPin, if (allPinned) "取消置顶" else "置顶")
+                        }
                         IconButton({ moving = true }, enabled = enabled) {
                             Icon(Icons.Default.DriveFileMove, "移动到笔记库")
                         }
@@ -847,11 +1007,31 @@ internal fun ReferenceHome(
                                         onSelect(Destination.Todos, null, null)
                                     }
                                 }) {
-                                    Icon(
-                                        if (createMenu) Icons.Default.Settings
-                                        else Icons.Default.Checklist,
-                                        if (createMenu) "设置" else "全部待办",
-                                    )
+                                    if (createMenu || todos.badgeCount == 0)
+                                        Icon(
+                                            if (createMenu) Icons.Default.Settings
+                                            else Icons.Default.Checklist,
+                                            if (createMenu) "设置" else "全部待办",
+                                        )
+                                    else
+                                        BadgedBox(
+                                            badge = {
+                                                Badge(
+                                                    containerColor =
+                                                        if (todos.hasOverdue) MaterialTheme.colorScheme.error
+                                                        else MaterialTheme.colorScheme.tertiary,
+                                                    contentColor =
+                                                        if (todos.hasOverdue) MaterialTheme.colorScheme.onError
+                                                        else MaterialTheme.colorScheme.onTertiary,
+                                                ) { Text(if (todos.badgeCount > 99) "99+" else "${todos.badgeCount}") }
+                                            },
+                                            modifier = Modifier.testTag("todo-badge"),
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Checklist,
+                                                "全部待办，${todos.badgeCount} 项今天到期或已逾期",
+                                            )
+                                        }
                                 }
                             }
                         FloatingPill(
@@ -1009,7 +1189,23 @@ internal fun ReferenceHome(
                     { descending = !descending },
                     { content = it },
                     { filing = it },
+                    compact,
+                    {
+                        compact = !compact
+                        preferences.edit().putBoolean("homeCompact", compact).apply()
+                    },
+                    showDue = todoContext,
                 )
+            }
+        // Long lists: one tap back to the top.
+        val farDown by remember(listState) { derivedStateOf { listState.firstVisibleItemIndex > 12 } }
+        if (farDown && !librariesVisible && !selecting && !createMenu)
+            SmallFloatingActionButton(
+                { scope.launch { listState.animateScrollToItem(0) } },
+                Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = 96.dp).testTag("scroll-to-top"),
+                containerColor = MaterialTheme.colorScheme.surface,
+            ) {
+                Icon(Icons.Default.VerticalAlignTop, "回到顶部")
             }
     }
     if (createLibrary || libraryEditor != null)
@@ -1219,7 +1415,7 @@ private fun CreateSourceCard(
 private fun ReferenceNoteCard(
     note: NoteSummary,
     preview: String,
-    query: String,
+    terms: List<String>,
     selecting: Boolean,
     selected: Boolean,
     loading: Boolean,
@@ -1227,15 +1423,17 @@ private fun ReferenceNoteCard(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMenu: () -> Unit,
-    onBounds: (Rect) -> Unit = {},
+    onPositioned: (androidx.compose.ui.layout.LayoutCoordinates) -> Unit = {},
     path: String? = null,
     childCount: Int = 0,
     onChildren: () -> Unit = {},
+    pinned: Boolean = false,
 ) {
     val accent = MaterialTheme.colorScheme.tertiary
     Surface(
         Modifier.fillMaxWidth()
-            .onGloballyPositioned { onBounds(it.boundsInRoot()) }
+            // Store coordinates only; bounds are computed when the card is opened.
+            .onGloballyPositioned(onPositioned)
             .combinedClickable(enabled = !loading, onClick = onClick, onLongClick = onLongClick)
             .testTag("note-card-${note.id}"),
         shape = RoundedCornerShape(26.dp),
@@ -1247,7 +1445,7 @@ private fun ReferenceNoteCard(
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    highlighted(note.title.ifBlank { "无标题" }, query, accent),
+                    highlightedTerms(note.title.ifBlank { "无标题" }, terms, accent),
                     fontSize = 18.sp,
                     lineHeight = 22.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -1256,7 +1454,7 @@ private fun ReferenceNoteCard(
                 )
                 if (preview.isNotBlank())
                     Text(
-                        highlighted(preview.replace('\n', ' '), query, accent),
+                        highlightedTerms(preview.replace('\n', ' '), terms, accent),
                         Modifier.padding(top = 4.dp),
                         fontSize = 14.sp,
                         lineHeight = 18.sp,
@@ -1291,13 +1489,27 @@ private fun ReferenceNoteCard(
                             }
                     }
                 Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (pinned)
+                        Icon(
+                            Icons.Default.PushPin,
+                            "已置顶",
+                            Modifier.padding(end = 4.dp).size(13.dp),
+                            tint = accent,
+                        )
+                    // Open todos show what matters: when they are due.
+                    val due = note.attentionAt()?.takeIf { note.isOpenTodo() }
+                    val now = System.currentTimeMillis()
+                    val overdue = due != null && todoGroupLabel(note, now) == "已逾期"
                     Text(
-                        SimpleDateFormat("yyyy/M/d HH:mm '更新'", Locale.CHINA)
-                            .format(Date(note.updatedAt)),
+                        when {
+                            due != null -> dueDescription(due, now)
+                            note.itemType == "todo" && note.completedAt != null -> "已完成"
+                            else -> "${relativeDateLabel(note.updatedAt)} 更新"
+                        },
                         Modifier.weight(1f),
                         fontSize = 12.sp,
                         lineHeight = 16.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (overdue) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -1514,7 +1726,7 @@ private fun ExistingNoteSheet(
                     ReferenceNoteCard(
                         note,
                         note.preview,
-                        query,
+                        listOfNotNull(query.trim().takeIf { it.isNotEmpty() }),
                         true,
                         note.id in selected,
                         false,

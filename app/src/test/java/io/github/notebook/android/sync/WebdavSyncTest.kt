@@ -173,7 +173,13 @@ class WebdavSyncTest {
         val edited = database.dao().get(noteId)!!.copy(title = "本机冲突标题", dirty = true)
         database.dao().put(edited); api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, edited)
         client.sync(settings())
-        assertTrue(database.dao().get(noteId)!!.conflict)
+        // The concurrent edit no longer blocks: local metadata wins, the other
+        // body is preserved as a separate conflict copy, later records apply.
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertEquals("本机冲突标题", database.dao().get(noteId)!!.title)
+        val copy = database.dao().allNotes().single { it.title.contains("冲突副本") }
+        assertEquals("服务器冲突正文", copy.body)
+        assertEquals(2, client.lastResolved.size)
         database.dao().putTombstone(io.github.notebook.android.data.TombstoneEntity("note|$noteId", noteId, "note", System.currentTimeMillis(), deviceId))
         api.queueDelete(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "document", noteId)
         api.queueDelete(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "page", noteId)
@@ -186,13 +192,38 @@ class WebdavSyncTest {
         assertTrue(database.dao().apiOutbox(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID).isEmpty())
         val deletes = webdav.journalText(deviceId)!!.lineSequence().filter(String::isNotBlank).map { JsonParser.parseString(it).asJsonObject }.filter { it["op"].asString == "delete" }.toList()
         assertEquals(setOf("page", "document"), deletes.map { it["type"].asString }.toSet())
-        assertTrue(deletes.all { it["ver"].asLong == 2L })
+        assertTrue(deletes.all { it["ver"].asLong >= 2L })
         val fresh = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), NotebookDatabase::class.java).allowMainThreadQueries().build()
         try {
             val freshPrefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences(UUID.randomUUID().toString(), 0)
             val freshClient = WebdavSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), freshPrefs, ApiSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), allowInsecureHttp = true), allowInsecureHttp = true)
             freshClient.sync(settings())
             assertNull("新设备只应恢复删除结果", fresh.dao().get(noteId))
+        } finally { fresh.close() }
+    }
+
+    @Test fun `deleted remote journal is republished above the old sequence and stale readers re-read it`() = runBlocking {
+        database.dao().put(note(title = "需要保住的笔记"))
+        client.sync(settings())
+        val before = webdav.journalText(deviceId)!!.lineSequence().filter(String::isNotBlank).maxOf { JsonParser.parseString(it).asJsonObject["seq"].asLong }
+        // Someone empties the remote folder.
+        webdav.files.keys.filter { it.startsWith("notebook_backup/journal/") }.toList().forEach { webdav.files.remove(it) }
+        client.sync(settings())
+        val after = webdav.journalText(deviceId)!!.lineSequence().filter(String::isNotBlank).map { JsonParser.parseString(it).asJsonObject }.toList()
+        assertTrue("全部内容重新上传", after.any { it["type"].asString == "page" && it["id"].asString == noteId })
+        assertTrue("序号不能回退", after.all { it["seq"].asLong > before })
+        // A reader whose cursor is far ahead (journal recreated by an old client) re-reads it.
+        webdav.putJournal(deviceId, webdav.journalText(deviceId)!!.lineSequence().filter(String::isNotBlank).map { line ->
+            JsonParser.parseString(line).asJsonObject.apply { addProperty("seq", get("seq").asLong - before) }.toString()
+        }.toList())
+        webdav.files.remove("notebook_backup/journal/$deviceId.head.json")
+        val fresh = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), NotebookDatabase::class.java).allowMainThreadQueries().build()
+        try {
+            val freshPrefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences(UUID.randomUUID().toString(), 0)
+            freshPrefs.edit().putString("webdav-seqs:${client.fingerprint(settings())}", """{"$deviceId":999}""").commit()
+            val freshClient = WebdavSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), freshPrefs, ApiSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), allowInsecureHttp = true), allowInsecureHttp = true)
+            freshClient.sync(settings())
+            assertEquals("需要保住的笔记", fresh.dao().get(noteId)!!.title)
         } finally { fresh.close() }
     }
 
@@ -335,9 +366,9 @@ class WebdavSyncTest {
         })
         webdav.putJournal(remoteDevice,listOf(child))
 
-        val error=runCatching { client.sync(settings()) }.exceptionOrNull()
+        // Waiting for the note must not fail the sync (or block publishing).
+        client.sync(settings())
 
-        assertTrue(error?.message.orEmpty().contains("对应笔记"))
         assertNull(database.dao().getStep("waiting-step"))
         val seqs=JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject
         assertEquals(0L,seqs[remoteDevice]?.asLong?:0L)
@@ -436,14 +467,17 @@ class WebdavSyncTest {
 
         client.sync(settings())
 
+        // A concurrent metadata edit keeps the local version and never holds
+        // back the rest of that device's journal.
         assertEquals("Keep local edit",database.dao().get(localId)!!.title)
-        assertTrue(database.dao().get(localId)!!.conflict)
+        assertFalse(database.dao().get(localId)!!.conflict)
         assertEquals("Restored page",database.dao().get(noteId)!!.title)
         assertEquals(19,database.dao().readingPosition(noteId)!!.anchorUtf16Offset)
-        assertNull(database.dao().getTag("blocked-tag"))
+        assertNotNull(database.dao().getTag("blocked-tag"))
         val seqs=JsonParser.parseString(prefs.getString("webdav-seqs:${client.fingerprint(settings())}","{}")).asJsonObject
-        assertEquals(0L,seqs[blockedDevice]?.asLong?:0L)
+        assertEquals(3L,seqs[blockedDevice].asLong)
         assertEquals(1L,seqs[childDevice].asLong)
+        assertTrue("本机版本作为后继版本发布", webdav.journalText(deviceId)!!.contains("Keep local edit"))
     }
 
     @Test
@@ -508,7 +542,7 @@ class WebdavSyncTest {
     }
 
     @Test
-    fun `a conflicting remote edit marks the page and stays out of the push`() = runBlocking {
+    fun `a conflicting remote edit keeps the local version, publishes it as successor and continues`() = runBlocking {
         database.dao().put(note(title = "本地修改"))
         client.sync(settings()) // initial publish at ver 0
         val remoteDevice = "30000000-0000-4000-8000-000000000002"
@@ -523,13 +557,23 @@ class WebdavSyncTest {
 
         client.sync(settings())
 
-        assertTrue(database.dao().get(noteId)!!.conflict)
-        // The conflicted entity was not published into this device's journal.
-        val journal = webdav.journalText(deviceId)!!
-        assertFalse(journal.contains("本地改写"))
-        assertTrue(database.dao().apiOutbox(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID).isNotEmpty())
-        assertNull(database.dao().getTag("after-conflict"))
-        assertFalse(prefs.getString("webdav-seqs:${client.fingerprint(settings())}", "{}").orEmpty().contains(remoteDevice))
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertEquals("本地改写", database.dao().get(noteId)!!.title)
+        // The local page went out as the successor of the remote branch (parent 1 -> ver 2).
+        val published = webdav.journalText(deviceId)!!.lineSequence().filter(String::isNotBlank).map { JsonParser.parseString(it).asJsonObject }
+            .last { it["type"].asString == "page" && it["id"].asString == noteId }
+        assertEquals(2L, published["ver"].asLong)
+        assertNotNull(database.dao().getTag("after-conflict"))
+        assertTrue(prefs.getString("webdav-seqs:${client.fingerprint(settings())}", "{}").orEmpty().contains(remoteDevice))
+        // A second device applies the successor without any conflict.
+        val fresh = Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), NotebookDatabase::class.java).allowMainThreadQueries().build()
+        try {
+            val freshPrefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences(UUID.randomUUID().toString(), 0)
+            val freshClient = WebdavSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), freshPrefs, ApiSyncClient(ApplicationProvider.getApplicationContext(), fresh.dao(), allowInsecureHttp = true), allowInsecureHttp = true)
+            freshClient.sync(settings())
+            assertEquals("本地改写", fresh.dao().get(noteId)!!.title)
+            assertFalse(fresh.dao().get(noteId)!!.conflict)
+        } finally { fresh.close() }
     }
 
     @Test
@@ -746,7 +790,7 @@ class WebdavSyncTest {
     }
 
     @Test
-    fun `concurrent journal parent version records conflict without advancing cursor`() = runBlocking {
+    fun `concurrent remote sibling keeps the local page without blocking`() = runBlocking {
         database.dao().put(note().copy(dirty = false))
         database.dao().putApiVersion(io.github.notebook.android.data.ApiSyncVersionEntity(
             api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "page", noteId), 2,
@@ -758,13 +802,14 @@ class WebdavSyncTest {
 
         client.sync(settings())
 
-        assertTrue(database.dao().get(noteId)!!.conflict)
-        assertNull(database.dao().apiCursor(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID))
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertEquals("本地笔记", database.dao().get(noteId)!!.title)
         assertEquals(2, database.dao().apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, "page", noteId))!!.version)
+        assertEquals(1, client.lastResolved.size)
     }
 
     @Test
-    fun `second v0 journal sibling conflicts while identical replay is consumed`() = runBlocking {
+    fun `second v0 journal sibling is settled automatically while identical replay is consumed`() = runBlocking {
         val remoteDevice = "30000000-0000-4000-8000-000000000008"
         val first = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"page","id":"$noteId","ver":0,"payload":{"id":"$noteId","workspaceId":"00000000-0000-4000-8000-000000000001","kind":"document","title":"共同初始","preview":"相同","favorite":false,"syncStatus":"synced","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:00:00Z"}}"""
         webdav.putJournal(remoteDevice, listOf(first))
@@ -780,7 +825,9 @@ class WebdavSyncTest {
             """{"seq":3,"ts":"2026-08-04T00:00:03Z","op":"upsert","type":"page","id":"$noteId","ver":0,"payload":{"id":"$noteId","workspaceId":"00000000-0000-4000-8000-000000000001","kind":"document","title":"并发分支","preview":"不同","favorite":false,"syncStatus":"synced","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:00:03Z"}}""",
         ))
         client.sync(settings())
-        assertTrue(database.dao().get(noteId)!!.conflict)
+        assertFalse(database.dao().get(noteId)!!.conflict)
+        assertEquals("共同初始", database.dao().get(noteId)!!.title)
+        assertEquals(1, client.lastResolved.size)
     }
 
     @Test
@@ -850,16 +897,17 @@ class WebdavSyncTest {
     }
 
     @Test
-    fun `head checksum mismatch stops the pull before applying data`() = runBlocking {
+    fun `head checksum mismatch exposes only the committed range without failing`() = runBlocking {
         val remoteDevice = "30000000-0000-4000-8000-000000000002"
-        val line = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"tag","id":"tag-x","ver":0,"payload":{"id":"tag-x","name":"bad","color":"red","updatedAt":"2026-08-04T00:00:00Z"}}"""
-        webdav.putJournal(remoteDevice, listOf(line))
+        val line = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"tag","id":"tag-x","ver":0,"payload":{"id":"tag-x","name":"committed","color":"red","updatedAt":"2026-08-04T00:00:00Z"}}"""
+        val tail = """{"seq":2,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"tag","id":"tag-y","ver":0,"payload":{"id":"tag-y","name":"uncommitted","color":"red","updatedAt":"2026-08-04T00:00:00Z"}}"""
+        webdav.putJournal(remoteDevice, listOf(line, tail))
         webdav.putHead(remoteDevice, line.toByteArray(StandardCharsets.UTF_8).size + 1, "0".repeat(64), 1)
 
-        val result = runCatching { client.sync(settings()) }
+        client.sync(settings())
 
-        assertTrue(result.exceptionOrNull()?.message?.contains("校验失败") == true)
-        assertNull(database.dao().getTag("tag-x"))
+        assertNotNull(database.dao().getTag("tag-x"))
+        assertNull("未提交的尾部保持不可见", database.dao().getTag("tag-y"))
     }
 
     @Test
