@@ -194,7 +194,9 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     val updateLifecycleOwner=LocalLifecycleOwner.current
     DisposableEffect(updateLifecycleOwner,appUpdate){val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)appUpdate.checkForUpdate()};updateLifecycleOwner.lifecycle.addObserver(observer);if(updateLifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))appUpdate.checkForUpdate();onDispose{updateLifecycleOwner.lifecycle.removeObserver(observer)}}
     UpdatePrompt(appUpdate)
-    val textImporter=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{val target=folders.firstOrNull{it.id==folderId};runCatching{repo.importText(source,target)}.onSuccess{note->startInEditMode=false;editing=note;status="已导入 ${note.title}"}.onFailure{status="导入失败：${it.localizedMessage}"}}}}
+    var pendingImport by remember{mutableStateOf<List<android.net.Uri>?>(null)}
+    val textImporter=rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()){uris->if(uris.isNotEmpty())pendingImport=uris}
+    var showAi by remember{mutableStateOf(false)};var aiNoteId by remember{mutableStateOf<String?>(null)}
     fun lockPrivateContent(){
         encryptedUnlocked=false
         documentStack.clear()
@@ -302,6 +304,11 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         onDispose{privacyLifecycleOwner.lifecycle.removeObserver(observer)}
     }
 
+    pendingImport?.let{uris->ImportTargetDialog(uris.size,folders.filter{it.type=="noteFolder"||(it.type=="encryptedFolder"&&encryptedUnlocked)},folderId,editing?.takeIf{it.itemType!="todo"},{pendingImport=null}){folder,parent->
+        pendingImport=null
+        scope.launch{runCatching{repo.importFiles(uris,folder,parent?.id)}.onSuccess{report->status=report.message;if(report.imported.size==1&&parent==null){startInEditMode=false;editing=report.imported.first()}}.onFailure{status="导入失败：${it.localizedMessage}"}}
+    }}
+    if(showAi){io.github.notebook.android.ai.AiAssistantScreen(repo,aiNoteId,{markdown,modifier->MarkdownView(markdown,modifier)},onOpenNote={id->showAi=false;openNote(id)},onBack={showAi=false});return}
     if(showSettings){ReferenceSettings(repo,{showSettings=false},{back->ServerSettings(repo,back)},{manage=it;showSettings=false});return}
     manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
 
@@ -350,7 +357,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("标签",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("管理",Modifier.clickable{manage="tag"},style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)}
             tags.take(if(showAllTags)tags.size else 6).forEach{tag->DrawerRow(tag.name,Icons.Default.Label,tagId==tag.id){select(Destination.All,tag=tag.id)}}
             if(tags.size>6)Text(if(showAllTags)"收起标签" else "查看全部标签（${tags.size}）",Modifier.fillMaxWidth().clickable{showAllTags=!showAllTags}.padding(start=28.dp,top=6.dp,bottom=8.dp),style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("AI 助手",Icons.Default.AutoAwesome,false){aiNoteId=null;showAi=true;scope.launch{drawer.close()}};DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
         homeHolder.SaveableStateProvider("home"){ReferenceHome(
@@ -362,7 +369,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
                 if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id)
                 repo.markUnsaved(draft.id);cardOrigin=null;startInEditMode=true;editing=draft
             },onSelect={d,f,t->select(d,f,t)},onNavigation={scope.launch{drawer.open()}},onSettings={showSettings=true},onSync={runSync()},
-            onImport={textImporter.launch(arrayOf("text/plain","text/markdown","text/x-markdown"))},onStatus={status=it},onCardBounds={cardOrigin=it},
+            onImport={textImporter.launch(io.github.notebook.android.data.TextImport.MIME_TYPES)},onAiAssistant={aiNoteId=null;showAi=true},onStatus={status=it},onCardBounds={cardOrigin=it},
             encryptedUnlocked=encryptedUnlocked,onCreateChild={id->cardOrigin=null;scope.launch{repo.loadNote(id)?.let{createChild(it)}}},onHierarchyOpen={cardOrigin=null;openNote(it)},
             tabletEditor=if(isTablet){{editing?.let{note->key(note.id){EditorPane(note,repo,surfaceFor(note.id),initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={openNote(it)},onNewChild={createChild(it)},onEditModeChanged={startInEditMode=it},onDone={closeDocument()})}}?:EmptyNotes("选择一篇笔记","在左侧打开笔记开始阅读")}}else null
         )}
@@ -1108,4 +1115,18 @@ private fun downloadLabel(progress:DownloadProgress):String{
     }
     val percent=progress.fraction?.let{"${(it*100).roundToInt()}% · "}.orEmpty()
     return if(progress.totalBytes>0)"$percent${bytes(progress.downloadedBytes)} / ${bytes(progress.totalBytes)}" else "$percent${bytes(progress.downloadedBytes)}"
+}
+
+/** Where imported files go: a folder's top level, or under the open note. */
+@Composable private fun ImportTargetDialog(count:Int,folders:List<FolderEntity>,currentFolderId:String?,openNote:NoteEntity?,onDismiss:()->Unit,onImport:(FolderEntity?,NoteEntity?)->Unit){
+    val options=buildList<Pair<String,Pair<FolderEntity?,NoteEntity?>>>{
+        openNote?.let{note->add("“${note.title.ifBlank{"当前笔记"}}”下面" to (folders.firstOrNull{it.id==note.folderId} to note))}
+        folders.sortedBy{it.sortOrder}.forEach{add(it.name to (it to null))}
+        add("未分类" to (null to null))
+    }
+    var selected by remember{mutableStateOf(options.indexOfFirst{it.second.second==null&&it.second.first?.id==currentFolderId}.takeIf{it>=0}?:0)}
+    AlertDialog(onDismissRequest=onDismiss,title={Text("导入 $count 个文件到")},text={Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())){
+        options.forEachIndexed{index,option->Row(Modifier.fillMaxWidth().clickable{selected=index}.padding(vertical=4.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){RadioButton(selected==index,{selected=index});Text(option.first,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)}}
+        Text("支持 Markdown、.txt 和网页（.html）。.txt 保留原样换行；网页只保留结构。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=8.dp))
+    }},confirmButton={Button({val target=options[selected].second;onImport(target.first,target.second)}){Text("导入")}},dismissButton={TextButton(onDismiss){Text("取消")}})
 }

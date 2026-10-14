@@ -258,6 +258,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun backlinks(noteId:String)=dao.observeBacklinks(noteId)
     fun settings()=SshSettings(prefs.getString("host","")!!,prefs.getInt("port",22),prefs.getString("user","")!!,prefs.getString("password","")!!,prefs.getString("path","~/notebook_backup")!!,prefs.getString("fingerprint","")!!,prefs.getString("privateKeyPath","")!!,prefs.getString("privateKeyPassphrase","")!!)
     fun apiSettings()=ApiSyncSettings(prefs.getString("apiBaseUrl","")!!,prefs.getString("apiWorkspaceId","00000000-0000-4000-8000-000000000001")!!,prefs.getString("apiToken","")!!)
+    /** AI assistant settings; the API key stays in the encrypted preferences of this device only. */
+    fun aiSettings():io.github.notebook.android.ai.AiSettings{val provider=runCatching{io.github.notebook.android.ai.AiProvider.valueOf(prefs.getString("aiProvider","DeepSeek")!!)}.getOrDefault(io.github.notebook.android.ai.AiProvider.DeepSeek);return io.github.notebook.android.ai.AiSettings(provider,prefs.getString("aiBaseUrl",provider.baseUrl)!!,prefs.getString("aiModel",provider.model)!!,prefs.getString("aiApiKey","")!!)}
+    fun saveAiSettings(s:io.github.notebook.android.ai.AiSettings){check(prefs.edit().putString("aiProvider",s.provider.name).putString("aiBaseUrl",s.baseUrl.trim()).putString("aiModel",s.model.trim()).putString("aiApiKey",s.apiKey.trim()).commit()){"AI 设置保存失败，请重试"}}
     fun webdavSettings()=WebdavSettings(prefs.getString("webdavBaseUrl","https://dav.jianguoyun.com/dav/")!!,prefs.getString("webdavUser","")!!,prefs.getString("webdavAppPassword","")!!,prefs.getString("webdavPath","notebook_backup")!!,prefs.getString("webdavSyncPassword","")!!)
     fun saveWebdavSettings(s:WebdavSettings){check(prefs.edit().putString("syncBackend",SyncBackend.WEBDAV.name).putString("webdavBaseUrl",s.baseUrl.trim()).putString("webdavUser",s.username.trim()).putString("webdavAppPassword",s.appPassword).putString("webdavPath",s.remotePath.trim()).putString("webdavSyncPassword",s.syncPassword).commit()){ "同步配置保存失败，请重试" }}
     suspend fun testWebdav():WebdavTestResult=webdavSync.test(webdavSettings())
@@ -647,6 +650,41 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val body=decodeText(bytes).replace("\r\n","\n").replace('\r','\n').removePrefix("\uFEFF")
         val id=UUID.randomUUID().toString();val encrypted=folder?.type=="encryptedFolder";if(encrypted)markEncrypted(id,folder!!.id)
         save(NoteEntity(id=id,title=displayName.substringBeforeLast('.').ifBlank{"导入笔记"},body=body,folderId=folder?.id,folderName=folder?.name?:"未分类",tagIds=""))
+    }
+
+    data class ImportReport(val imported:List<NoteEntity>,val skipped:List<io.github.notebook.android.data.TextImport.Skip>){val message get()=io.github.notebook.android.data.TextImport.summary(imported.size,skipped)}
+
+    /**
+     * Imports Markdown / plain-text / HTML files as notes into [folder], under
+     * [parentPageId] when given. Unsupported or unreadable files are reported,
+     * not fatal.
+     */
+    suspend fun importFiles(uris:List<android.net.Uri>,folder:FolderEntity?,parentPageId:String?=null):ImportReport=withContext(Dispatchers.IO){
+        val resolver=appContext.contentResolver
+        val imported=mutableListOf<NoteEntity>();val skipped=mutableListOf<io.github.notebook.android.data.TextImport.Skip>()
+        val siblings=notes.first().filter{it.folderId==folder?.id&&it.parentPageId==parentPageId&&it.deletedAt==null}
+        var sortOrder=(siblings.maxOfOrNull{it.sortOrder}?:0.0)+1000.0
+        val parent=parentPageId?.let{dao.get(it)}
+        val encryptedFolderId=if(folder?.type=="encryptedFolder")folder.id else parent?.takeIf{isEncrypted(it)}?.let{encryptedFolderId(it)}
+        for(uri in uris){
+            var name="导入笔记";var declaredSize:Long?=null
+            runCatching{resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME,android.provider.OpenableColumns.SIZE),null,null,null)?.use{cursor->if(cursor.moveToFirst()){name=cursor.getString(0)?:name;if(!cursor.isNull(1))declaredSize=cursor.getLong(1)}}}
+            val kind=io.github.notebook.android.data.TextImport.kind(name)
+            if(kind==null){skipped+=io.github.notebook.android.data.TextImport.Skip(name,"不支持的格式");continue}
+            if((declaredSize?:0)>io.github.notebook.android.data.TextImport.MAX_BYTES){skipped+=io.github.notebook.android.data.TextImport.Skip(name,"超过 5 MB");continue}
+            try{
+                val bytes=resolver.openInputStream(uri).use{input->requireNotNull(input){"无法读取"};val output=ByteArrayOutputStream();val buffer=ByteArray(64*1024);var total=0L;while(true){val count=input.read(buffer);if(count<0)break;total+=count;require(total<=io.github.notebook.android.data.TextImport.MAX_BYTES){"超过 5 MB"};output.write(buffer,0,count)};output.toByteArray()}
+                val source=io.github.notebook.android.data.TextImport.decode(bytes)
+                if(source.isBlank()){skipped+=io.github.notebook.android.data.TextImport.Skip(name,"空文件");continue}
+                val title=io.github.notebook.android.data.TextImport.title(name,source,kind)
+                val body=io.github.notebook.android.data.TextImport.toMarkdown(kind,source,title)
+                val id=UUID.randomUUID().toString()
+                if(encryptedFolderId!=null)markEncrypted(id,encryptedFolderId)
+                imported+=save(NoteEntity(id=id,title=title,body=body,folderId=folder?.id,folderName=folder?.name?:"未分类",parentPageId=parentPageId,sortOrder=sortOrder,tagIds=""))
+                sortOrder+=1000.0
+            }catch(error:Throwable){skipped+=io.github.notebook.android.data.TextImport.Skip(name,(error.message?:"无法读取").take(40))}
+        }
+        ImportReport(imported,skipped)
     }
 
     /** Copy a user-selected private key into app-private storage and persist its path. */

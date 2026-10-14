@@ -137,6 +137,7 @@ internal fun ReferenceHome(
     onSettings: () -> Unit,
     onSync: () -> Unit,
     onImport: () -> Unit,
+    onAiAssistant: () -> Unit = {},
     onStatus: (String) -> Unit,
     onCardBounds: (Rect) -> Unit = {},
     tabletEditor: (@Composable () -> Unit)? = null,
@@ -634,6 +635,14 @@ internal fun ReferenceHome(
                                                 onSync()
                                             },
                                             enabled = !syncing,
+                                        )
+                                        DropdownMenuItem(
+                                            { Text("AI 助手") },
+                                            {
+                                                menu = false
+                                                onAiAssistant()
+                                            },
+                                            leadingIcon = { Icon(Icons.Default.AutoAwesome, null) },
                                         )
                                         DropdownMenuItem(
                                             { Text("设置与同步") },
@@ -1143,7 +1152,7 @@ internal fun ReferenceHome(
                         }
                         CreateSourceCard(
                             "导入笔记",
-                            "Markdown 与文本",
+                            "Markdown、文本、网页",
                             Icons.Default.FileOpen,
                             Modifier.weight(1f),
                         ) {
