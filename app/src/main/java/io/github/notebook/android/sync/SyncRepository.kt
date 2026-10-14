@@ -490,17 +490,35 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         return result
     }
     suspend fun moveToTrash(id:String){
-        val targets=subtree(id);targets.forEach{trashedNoteIds.add(it.id)}
+        // Pages already in the trash keep their own deletion time, so restoring
+        // this page later does not bring them back too.
+        val targets=subtree(id).filter{it.id==id||it.deletedAt==null};targets.forEach{trashedNoteIds.add(it.id)}
         try{
             val deletedAt=System.currentTimeMillis()
             targets.forEach{target->val pending=pendingDrafts.remove(target.id);draftJobs.remove(target.id)?.cancelAndJoin();save((pending?:target).copy(deletedAt=deletedAt))}
         }catch(error:Throwable){targets.forEach{trashedNoteIds.remove(it.id)};throw error}
     }
-    suspend fun restore(id:String){subtree(id).forEach{note->
-        draftJobs.remove(note.id)?.cancelAndJoin();pendingDrafts.remove(note.id)
-        trashedNoteIds.remove(note.id)
-        save(note.copy(deletedAt=null),restoring=true)
-    }}
+    /**
+     * Restores a page and the pages that were moved to the trash together with
+     * it (same deletion time). Pages deleted earlier on their own stay in the
+     * trash instead of reappearing as stray (often empty) notes. A page keeps
+     * its parent link even while the parent is in the trash, so restoring the
+     * parent later puts it back in place.
+     */
+    suspend fun restore(id:String){
+        val root=loadEditable(id)?:return
+        val batch=root.deletedAt
+        // Breadth-first, so a parent is decided before its children.
+        val restoring=mutableSetOf<String>()
+        subtree(id).forEach{note->
+            val sameBatch=note.id==id||batch==null||note.deletedAt==null||note.deletedAt==batch
+            if(!sameBatch||(note.id!=id&&note.parentPageId !in restoring))return@forEach
+            restoring+=note.id
+            draftJobs.remove(note.id)?.cancelAndJoin();pendingDrafts.remove(note.id)
+            trashedNoteIds.remove(note.id)
+            save(note.copy(deletedAt=null),restoring=true)
+        }
+    }
     suspend fun movePage(id:String,parentId:String?):NoteEntity=withContext(NonCancellable){syncMutex.withLock{
         flushAll()
         val page=loadEditable(id)?:error("页面不存在")
