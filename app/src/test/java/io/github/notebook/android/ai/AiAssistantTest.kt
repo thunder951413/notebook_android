@@ -42,4 +42,20 @@ class AiAssistantTest {
         assertEquals(listOf(3 to "讲编译"), AiAssistant.parseSearchResults("结果：{\"results\":[{\"index\":3,\"reason\":\"讲编译\"},{\"index\":\"x\"}]}"))
         assertEquals(emptyList<Pair<Int, String>>(), AiAssistant.parseSearchResults("无法解析"))
     }
+
+    @Test fun `export builds one section per answer with note links`() {
+        val markdown = AiAssistant.exportMarkdown(listOf(
+            AiAssistant.ExportItem("uboot 怎么编译？", "先配置再编译 [1]", listOf(ContextSource(1, "a1", "uboot|说明]", "工作"))),
+            AiAssistant.ExportItem("总结要点", "要点", emptyList()),
+        ))
+        assertEquals("## uboot 怎么编译？\n\n先配置再编译 [1]\n\n来源：\n- [1] [[page:a1|uboot 说明\\]]]\n\n---\n\n## 总结要点\n\n要点\n", markdown)
+        assertEquals("AI：uboot 怎么编译？", AiAssistant.exportTitle(listOf(AiAssistant.ExportItem("uboot 怎么编译？", "", emptyList()))))
+    }
+
+    @Test fun `scope survives a round trip and bad input is empty`() {
+        val scope = AiScope(folderIds = setOf("f1"), noteIds = setOf("a"))
+        assertEquals(scope, AiAssistant.scopeFromJson(AiAssistant.scopeToJson(scope)))
+        assertEquals(AiScope(), AiAssistant.scopeFromJson("not json"))
+        assertEquals(AiScope(), AiAssistant.scopeFromJson(null))
+    }
 }

@@ -222,6 +222,8 @@ internal object LegacyHistoryContract {
 data class NoteSearchResult(val ids:List<String>,val snippets:Map<String,String>,val terms:List<String>)
 
 /** Compatible with the macOS SSH JSON store. Swift JSONEncoder dates are seconds since 2001-01-01. */
+const val INBOX_NAME="待处理"
+
 class SyncRepository(context:Context, private val dao:NotebookDao,preferences:android.content.SharedPreferences?=null) {
     private val appContext=context.applicationContext
     private val gson=GsonBuilder().disableHtmlEscaping().create()
@@ -685,6 +687,34 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
             }catch(error:Throwable){skipped+=io.github.notebook.android.data.TextImport.Skip(name,(error.message?:"无法读取").take(40))}
         }
         ImportReport(imported,skipped)
+    }
+
+    /** The "待处理" library that collects files opened or shared into Notebook; created on first use. */
+    suspend fun inboxFolder():FolderEntity=withContext(Dispatchers.IO){
+        dao.allFolders().firstOrNull{it.name==INBOX_NAME&&it.type=="noteFolder"}?:run{saveFolder(INBOX_NAME);dao.allFolders().first{it.name==INBOX_NAME&&it.type=="noteFolder"}}
+    }
+
+    /** Name and first lines of each incoming file, for the "how to handle" sheet. */
+    suspend fun previewIncoming(uris:List<android.net.Uri>):List<Pair<String,String>> =withContext(Dispatchers.IO){
+        uris.map{uri->
+            var name=uri.lastPathSegment?.substringAfterLast('/')?:"文件"
+            runCatching{appContext.contentResolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use{c->if(c.moveToFirst())c.getString(0)?.let{name=it}}}
+            val snippet=if(io.github.notebook.android.data.TextImport.kind(name)==null)"不支持的格式" else runCatching{
+                appContext.contentResolver.openInputStream(uri)?.use{input->val buffer=ByteArray(4096);val count=input.read(buffer).coerceAtLeast(0);io.github.notebook.android.data.TextImport.decode(buffer.copyOf(count))}
+                    ?.lineSequence()?.map(String::trim)?.filter(String::isNotEmpty)?.take(3)?.joinToString(" · ")?.take(160).orEmpty()
+            }.getOrElse{"无法读取：${it.message}"}
+            name to snippet
+        }
+    }
+
+    /** Text shared from another app becomes one note. */
+    suspend fun importSharedText(text:String,subject:String?,folder:FolderEntity?,parentPageId:String?=null):NoteEntity=withContext(Dispatchers.IO){
+        val title=subject?.trim()?.takeIf(String::isNotEmpty)?.take(80)?:text.lineSequence().map{it.replace(Regex("^#+\\s*"),"").trim()}.firstOrNull(String::isNotEmpty)?.take(40)?:"分享的内容"
+        val siblings=notes.first().filter{it.folderId==folder?.id&&it.parentPageId==parentPageId&&it.deletedAt==null}
+        val id=UUID.randomUUID().toString()
+        val parent=parentPageId?.let{dao.get(it)}
+        (if(folder?.type=="encryptedFolder")folder.id else parent?.takeIf{isEncrypted(it)}?.let{encryptedFolderId(it)})?.let{markEncrypted(id,it)}
+        save(NoteEntity(id=id,title=title,body=text.replace("\r\n","\n").trim(),folderId=folder?.id,folderName=folder?.name?:"未分类",parentPageId=parentPageId,sortOrder=(siblings.maxOfOrNull{it.sortOrder}?:0.0)+1000.0,tagIds=""))
     }
 
     /** Copy a user-selected private key into app-private storage and persist its path. */

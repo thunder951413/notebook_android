@@ -102,16 +102,38 @@ import io.github.notebook.android.diagnostics.DiagnosticLogger
 class MainActivity : ComponentActivity() {
     private lateinit var repository:SyncRepository
     private val notificationTarget=mutableStateOf<String?>(null)
+    private val incomingShare=mutableStateOf<IncomingShare?>(null)
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         Reminders.createChannel(this)
         repository = (application as NotebookApp).repository
         notificationTarget.value=noteIdFromIntent(intent)
-        setContent { NotebookTheme { NotebookScreen(repository,notificationTarget.value){notificationTarget.value=null} } }
+        if(state==null)incomingShare.value=incomingShareFromIntent(intent)
+        setContent { NotebookTheme { NotebookScreen(repository,notificationTarget.value,{notificationTarget.value=null},incomingShare.value){incomingShare.value=null} } }
     }
-    override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);notificationTarget.value=noteIdFromIntent(intent)}
+    override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);notificationTarget.value=noteIdFromIntent(intent);incomingShareFromIntent(intent)?.let{incomingShare.value=it}}
     override fun onStart(){super.onStart();repository.requestForegroundSync()}
     override fun onStop(){repository.onAppBackgrounded();super.onStop()}
+}
+
+/** Files or text handed to Notebook through "Open with" or "Share". */
+internal data class IncomingShare(val uris:List<android.net.Uri>,val text:String?,val subject:String?)
+
+internal fun incomingShareFromIntent(intent:Intent?):IncomingShare?{
+    intent?:return null
+    return when(intent.action){
+        Intent.ACTION_VIEW->intent.data?.takeIf{it.scheme=="content"||it.scheme=="file"}?.let{IncomingShare(listOf(it),null,null)}
+        Intent.ACTION_SEND->{
+            @Suppress("DEPRECATION") val stream=intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)
+            val text=intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf(String::isNotBlank)
+            if(stream==null&&text==null)null else IncomingShare(listOfNotNull(stream),if(stream==null)text else null,intent.getStringExtra(Intent.EXTRA_SUBJECT))
+        }
+        Intent.ACTION_SEND_MULTIPLE->{
+            @Suppress("DEPRECATION") val streams=intent.getParcelableArrayListExtra<android.net.Uri>(Intent.EXTRA_STREAM).orEmpty()
+            streams.takeIf{it.isNotEmpty()}?.let{IncomingShare(it,null,null)}
+        }
+        else->null
+    }
 }
 
 /** Only app-local page links are accepted; every resulting id is still authorized in NotebookScreen. */
@@ -148,7 +170,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun NotebookScreen(repo:SyncRepository,notificationNoteId:String?=null,onNotificationConsumed:()->Unit={}) {
+@Composable private fun NotebookScreen(repo:SyncRepository,notificationNoteId:String?=null,onNotificationConsumed:()->Unit={},incoming:IncomingShare?=null,onIncomingHandled:()->Unit={}) {
     val all by repo.notes.collectAsState(initial=emptyList())
     val folders by repo.folders.collectAsState(initial=emptyList())
     val tags by repo.tags.collectAsState(initial=emptyList())
@@ -307,6 +329,20 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     pendingImport?.let{uris->ImportTargetDialog(uris.size,folders.filter{it.type=="noteFolder"||(it.type=="encryptedFolder"&&encryptedUnlocked)},folderId,editing?.takeIf{it.itemType!="todo"},{pendingImport=null}){folder,parent->
         pendingImport=null
         scope.launch{runCatching{repo.importFiles(uris,folder,parent?.id)}.onSuccess{report->status=report.message;if(report.imported.size==1&&parent==null){startInEditMode=false;editing=report.imported.first()}}.onFailure{status="导入失败：${it.localizedMessage}"}}
+    }}
+    incoming?.let{share->IncomingSheet(repo,share,folders.filter{it.type=="noteFolder"||(it.type=="encryptedFolder"&&encryptedUnlocked)},all.filter{it.deletedAt==null&&it.itemType!="todo"&&canExposeNote(it,encryptedUnlocked,repo::isEncrypted)},onDismiss=onIncomingHandled){inbox,folder,parent->
+        onIncomingHandled()
+        scope.launch{
+            runCatching{
+                val target=if(inbox)repo.inboxFolder() else folder
+                val text=share.text
+                if(text!=null)SyncRepository.ImportReport(listOf(repo.importSharedText(text,share.subject,target,parent?.id)),emptyList())
+                else repo.importFiles(share.uris,target,parent?.id)
+            }.onSuccess{report->
+                status=if(inbox)"${report.message}，在“待处理”里" else report.message
+                if(!inbox&&report.imported.size==1){startInEditMode=false;editing=report.imported.first()}
+            }.onFailure{status="导入失败：${it.localizedMessage}"}
+        }
     }}
     if(showAi){io.github.notebook.android.ai.AiAssistantScreen(repo,aiNoteId,{markdown,modifier->MarkdownView(markdown,modifier)},onOpenNote={id->showAi=false;openNote(id)},onBack={showAi=false});return}
     if(showSettings){ReferenceSettings(repo,{showSettings=false},{back->ServerSettings(repo,back)},{manage=it;showSettings=false});return}
@@ -1129,4 +1165,48 @@ private fun downloadLabel(progress:DownloadProgress):String{
         options.forEachIndexed{index,option->Row(Modifier.fillMaxWidth().clickable{selected=index}.padding(vertical=4.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){RadioButton(selected==index,{selected=index});Text(option.first,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)}}
         Text("支持 Markdown、.txt 和网页（.html）。.txt 保留原样换行；网页只保留结构。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=8.dp))
     }},confirmButton={Button({val target=options[selected].second;onImport(target.first,target.second)}){Text("导入")}},dismissButton={TextButton(onDismiss){Text("取消")}})
+}
+
+/**
+ * A file or text arrived through "Open with" / "Share": put it in 待处理 to
+ * sort out later, or choose where it becomes a note.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun IncomingSheet(repo:SyncRepository,share:IncomingShare,folders:List<FolderEntity>,notes:List<NoteSummary>,onDismiss:()->Unit,onConfirm:(inbox:Boolean,folder:FolderEntity?,parent:NoteSummary?)->Unit){
+    var preview by remember(share){mutableStateOf<List<Pair<String,String>>?>(null)}
+    LaunchedEffect(share){preview=if(share.text!=null)listOf((share.subject?.takeIf(String::isNotBlank)?:"分享的文字") to share.text.lineSequence().map(String::trim).filter(String::isNotEmpty).take(3).joinToString(" · ").take(160)) else repo.previewIncoming(share.uris)}
+    var choosing by remember{mutableStateOf(false)}
+    var folder by remember{mutableStateOf<FolderEntity?>(null)}
+    var parent by remember{mutableStateOf<NoteSummary?>(null)}
+    var query by remember{mutableStateOf("")}
+    val supported=share.text!=null||preview?.any{it.second!="不支持的格式"}==true
+    ModalBottomSheet(onDismissRequest=onDismiss,sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true)){
+        Column(Modifier.fillMaxWidth().padding(horizontal=20.dp).padding(bottom=24.dp)){
+            Text(if(share.text!=null)"收到一段文字" else "用 Notebook 打开 ${share.uris.size} 个文件",style=MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(10.dp))
+            val items=preview
+            if(items==null)LinearProgressIndicator(Modifier.fillMaxWidth()) else items.take(4).forEach{(name,snippet)->
+                Surface(shape=androidx.compose.foundation.shape.RoundedCornerShape(12.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh,modifier=Modifier.fillMaxWidth().padding(vertical=3.dp)){Column(Modifier.padding(12.dp)){Text(name,fontWeight=FontWeight.Medium,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis);if(snippet.isNotBlank())Text(snippet,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=2,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)}}
+            }
+            if((items?.size?:0)>4)Text("还有 ${items!!.size-4} 个文件",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(16.dp))
+            if(!choosing){
+                Button({onConfirm(true,null,null)},enabled=supported,modifier=Modifier.fillMaxWidth().height(52.dp).testTag("incoming-inbox")){Icon(Icons.Default.Inbox,null);Spacer(Modifier.width(8.dp));Text("放到待处理")}
+                Text("先存进“待处理”笔记库，以后再整理。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp,bottom=10.dp))
+                OutlinedButton({choosing=true},enabled=supported,modifier=Modifier.fillMaxWidth().height(52.dp).testTag("incoming-choose")){Icon(Icons.Default.DriveFileMove,null);Spacer(Modifier.width(8.dp));Text("选择位置，变成笔记")}
+            }else{
+                Text("放到笔记库",style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.primary)
+                Column(Modifier.heightIn(max=200.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())){
+                    (listOf<FolderEntity?>(null)+folders.sortedBy{it.sortOrder}).forEach{item->Row(Modifier.fillMaxWidth().clickable{folder=item;parent=null}.padding(vertical=2.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){RadioButton(parent==null&&folder?.id==item?.id,{folder=item;parent=null});Text(item?.name?:"未分类")}}
+                }
+                Text("或放在某篇笔记下面",style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.primary,modifier=Modifier.padding(top=10.dp))
+                OutlinedTextField(query,{query=it},placeholder={Text("搜索笔记标题")},singleLine=true,modifier=Modifier.fillMaxWidth())
+                val matches=remember(query,notes){if(query.isBlank())emptyList() else notes.filter{it.title.contains(query.trim(),ignoreCase=true)}.take(30)}
+                Column(Modifier.heightIn(max=200.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())){
+                    (listOfNotNull(parent?.takeIf{p->matches.none{it.id==p.id}})+matches).forEach{note->Row(Modifier.fillMaxWidth().clickable{parent=note;folder=folders.firstOrNull{it.id==note.folderId}}.padding(vertical=2.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){RadioButton(parent?.id==note.id,{parent=note;folder=folders.firstOrNull{it.id==note.folderId}});Column{Text(note.title.ifBlank{"无标题"},maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis);Text(note.folderName,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
+                }
+                Row(Modifier.fillMaxWidth().padding(top=12.dp),horizontalArrangement=Arrangement.End){TextButton({choosing=false}){Text("返回")};Spacer(Modifier.width(8.dp));Button({onConfirm(false,folder,parent)}){Text(if(parent!=null)"放到“${parent!!.title.take(10)}”下面" else "放到“${folder?.name?:"未分类"}”")}}
+            }
+        }
+    }
 }

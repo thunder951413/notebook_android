@@ -1047,6 +1047,23 @@ internal fun ReferenceHome(
                             Modifier.weight(1f)
                                 .then(if (homeBlur > 0.dp) Modifier.blur(homeBlur) else Modifier)
                         ) {
+                            // AI sits before 笔记 as a frequently used action (not a tab).
+                            Box(
+                                Modifier.weight(1f)
+                                    .height(44.dp)
+                                    .testTag("home-ai")
+                                    .clip(CircleShape)
+                                    .clickable(enabled = !createMenu) { onAiAssistant() },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                ) {
+                                    Icon(Icons.Default.AutoAwesome, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+                                    Text("AI", fontSize = 11.sp, lineHeight = 14.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
                             listOf("笔记", "笔记库").forEachIndexed { index, label ->
                                 Box(
                                     Modifier.weight(1f)

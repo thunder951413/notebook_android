@@ -11,6 +11,10 @@
     <application android:name=".NotebookApp" android:allowBackup="false" android:label="Notebook" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher" android:theme="@style/Theme.Notebook">
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+            <!-- "Open with" for Markdown, text and HTML files (some file managers report .md as octet-stream). -->
+            <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="content"/><data android:scheme="file"/><data android:mimeType="text/*"/><data android:mimeType="application/octet-stream"/><data android:mimeType="application/x-markdown"/></intent-filter>
+            <!-- Files or text shared from other apps. -->
+            <intent-filter><action android:name="android.intent.action.SEND"/><action android:name="android.intent.action.SEND_MULTIPLE"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="text/*"/><data android:mimeType="application/octet-stream"/><data android:mimeType="application/x-markdown"/></intent-filter>
         </activity>
         <receiver android:name=".reminder.ReminderReceiver" android:exported="false" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true"><meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/></provider>

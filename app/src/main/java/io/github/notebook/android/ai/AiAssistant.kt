@@ -165,6 +165,29 @@ object AiAssistant {
         }.getOrDefault(emptyList())
     }
 
+    /** One exported answer: the question that led to it and its sources. */
+    data class ExportItem(val question: String, val answer: String, val sources: List<ContextSource>)
+
+    /**
+     * The note built from selected answers. Each answer is a section headed
+     * by its question; its sources become note links ([[page:id|title]]).
+     */
+    fun exportMarkdown(items: List<ExportItem>): String = items.joinToString("\n\n---\n\n") { item ->
+        val heading = item.question.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80) ?: "AI 回答"
+        val sources = if (item.sources.isEmpty()) "" else "\n\n来源：\n" + item.sources.joinToString("\n") { "- [${it.index}] [[page:${it.noteId}|${it.title.replace("]", "\\]").replace("|", " ")}]]" }
+        "## $heading\n\n${item.answer.trim()}$sources"
+    } + "\n"
+
+    fun exportTitle(items: List<ExportItem>): String = items.firstOrNull()?.question?.lineSequence()?.firstOrNull { it.isNotBlank() }?.trim()?.take(40)?.let { "AI：$it" } ?: "AI 回答"
+
+    fun scopeToJson(scope: AiScope): String = Gson().toJson(mapOf("folderIds" to scope.folderIds.toList(), "noteIds" to scope.noteIds.toList(), "extraNoteIds" to scope.extraNoteIds.toList()))
+
+    fun scopeFromJson(json: String?): AiScope = runCatching {
+        val value = JsonParser.parseString(json ?: return AiScope()).asJsonObject
+        fun set(key: String) = value.getAsJsonArray(key)?.map { it.asString }?.toSet().orEmpty()
+        AiScope(set("folderIds"), set("noteIds"), set("extraNoteIds"))
+    }.getOrDefault(AiScope())
+
     fun citedSources(answer: String): List<Int> = Regex("\\[(\\d{1,3})]").findAll(answer).map { it.groupValues[1].toInt() }.distinct().sorted().toList()
 }
 
