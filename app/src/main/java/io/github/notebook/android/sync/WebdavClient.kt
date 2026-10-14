@@ -68,9 +68,7 @@ class WebdavClient(
     }
 
     init {
-        val uri = runCatching { java.net.URI(base) }.getOrElse { throw IllegalArgumentException("WebDAV 服务器地址格式不正确") }
-        require(uri.scheme == "https" || (allowInsecureHttp && uri.scheme == "http")) { "正式版同步服务必须使用 HTTPS" }
-        require(!uri.host.isNullOrBlank()) { "WebDAV 服务器地址缺少主机名" }
+        WebdavProtocolRules.requireBaseUrl(base, allowInsecureHttp)
         require(username.isNotBlank()) { "请填写 WebDAV 用户名" }
         require(appPassword.isNotBlank()) { "请填写 WebDAV 应用密码" }
     }
@@ -347,12 +345,17 @@ internal fun webdavHrefBasename(href: String): String? {
     }.getOrDefault(encodedName)
 }
 
-/** Repository path relative to the WebDAV root; rejects traversal and absolute paths. */
+/**
+ * Repository path relative to the WebDAV root (fixture: remote-path.json).
+ * Empty and "." segments are dropped; "..", absolute paths and control
+ * characters are rejected rather than resolved.
+ */
 internal fun safeRemotePath(value: String): String {
-    val normalized = value.trim().replace('\\', '/').trimEnd('/')
-    require(normalized.isNotBlank()) { "远端同步目录不能为空" }
+    val normalized = value.trim().replace('\\', '/')
     require(!normalized.startsWith('/')) { "远端同步目录请填写相对路径（例如 notebook_backup）" }
     require(normalized.none { it.isISOControl() }) { "远端同步目录不能包含控制字符" }
-    require(!normalized.split('/').any { it == ".." || it == "." || it.isBlank() }) { "远端同步目录不安全" }
-    return normalized
+    val parts = normalized.split('/').filter { it.isNotEmpty() && it != "." }
+    require(parts.isNotEmpty()) { "远端同步目录不能为空" }
+    require(parts.none { it == ".." }) { "远端同步目录不安全" }
+    return parts.joinToString("/")
 }

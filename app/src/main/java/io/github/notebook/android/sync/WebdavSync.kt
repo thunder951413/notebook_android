@@ -104,8 +104,19 @@ internal object WebdavJournalProtocol {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    /**
+     * Parse `<device>.head.json` for [deviceId] (fixture: journal-head.json in
+     * SyncContractFixtures/webdav-v4, shared with the desktop clients).
+     */
+    fun parseHead(text: String, deviceId: String): WebdavJournalHead {
+        require(text.toByteArray(Charsets.UTF_8).size <= MAX_HEAD_BYTES) { "远端日志索引超过 64 KiB 上限" }
+        val head = parseHead(text)
+        require(head.deviceId == deviceId) { "远端日志索引设备 ID 不匹配" }
+        return head
+    }
+
     fun parseHead(text: String): WebdavJournalHead {
-        val root = JsonParser.parseString(text).asJsonObject
+        val root = runCatching { JsonParser.parseString(text).asJsonObject }.getOrElse { error("远端日志索引格式不正确") }
         val version = root["version"]?.asInt ?: error("远端日志索引缺少版本")
         require(version == 1) { "远端日志索引版本不支持" }
         val deviceId = requireDeviceId(root["deviceId"]?.asString ?: error("远端日志索引缺少设备 ID"))
@@ -138,18 +149,93 @@ internal object WebdavJournalProtocol {
                 .also { require(it.isNotBlank()) { "远端日志缺少实体 ID" } }
             val payload = root["payload"]?.takeIf { it.isJsonObject }?.asJsonObject ?: error("远端日志缺少内容")
             SyncEntityIdentityContract.requireChange(type, id, payload)
+            val seq = root["seq"]?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong ?: error("远端日志缺少序号")
+            require(seq >= 0) { "远端日志序号不合法" }
+            val ver = root["ver"]?.takeUnless { it.isJsonNull }?.let { value ->
+                require(value.isJsonPrimitive && value.asJsonPrimitive.isNumber && value.asLong >= 0) { "远端日志版本不合法" }
+                value.asLong
+            } ?: 0L
             WebdavJournalEntry(
-                seq = root["seq"].takeIf { it.isJsonPrimitive }?.asLong ?: error("远端日志缺少序号"),
+                seq = seq,
                 ts = root["ts"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty(),
                 op = op,
                 type = type,
                 id = id,
-                ver = root["ver"]?.takeIf { it.isJsonPrimitive }?.asLong ?: 0L,
+                ver = ver,
                 hash = root["hash"]?.takeIf { it.isJsonPrimitive }?.asString,
                 payload = payload,
             )
         }
     }
+}
+
+/** Compacted journal: latest record per entity plus a bounded revision ring, ordered by seq. */
+internal data class CompactedJournal(val entries: List<WebdavJournalEntry>, val stateEntries: Int, val historyEntries: Int)
+
+/** Records a reader exposes from one downloaded peer journal (fixture: committed-view.json). */
+internal data class CommittedView(val known: Long, val reset: Boolean, val mismatch: Boolean, val seqs: List<Long>)
+
+/** Decision taken before downloading a peer journal (fixture: committed-view.json). */
+internal data class JournalReadPlan(val known: Long, val reset: Boolean, val fetch: Boolean)
+
+/**
+ * Pure protocol rules shared with the desktop clients and exercised by the
+ * cross-platform fixtures in SyncContractFixtures/webdav-v4.
+ */
+internal object WebdavProtocolRules {
+    private val gson = GsonBuilder().disableHtmlEscaping().create()
+
+    /**
+     * HTTPS everywhere in release builds (stricter than the desktop shells,
+     * which also allow loopback HTTP); debug builds accept plain HTTP for
+     * local test servers. Fixture: base-url.json ("loopback" cases).
+     */
+    fun requireBaseUrl(value: String, allowInsecureHttp: Boolean = false): java.net.URI {
+        val uri = runCatching { java.net.URI(value.trim()) }.getOrElse { throw IllegalArgumentException("WebDAV 服务器地址格式不正确") }
+        require(uri.scheme == "https" || (allowInsecureHttp && uri.scheme == "http")) { "正式版同步服务必须使用 HTTPS" }
+        require(!uri.host.isNullOrBlank()) { "WebDAV 服务器地址缺少主机名" }
+        return uri
+    }
+
+    fun compact(entries: List<WebdavJournalEntry>): CompactedJournal {
+        // State is an LWW snapshot (including tombstones); revisions are
+        // bounded history, not an ever-growing event stream.
+        val state = entries.filterNot { it.type == "revision" }
+            .groupBy { it.type to it.id }.values.map { it.maxBy { entry -> entry.seq } }
+        val revisions = entries.filter { it.type == "revision" }
+            .groupBy { it.type to it.id }.values.map { it.maxBy { entry -> entry.seq } }
+            .sortedByDescending { it.seq }
+        var revisionBytes = 0
+        val retainedRevisions = mutableListOf<WebdavJournalEntry>()
+        for (revision in revisions) {
+            val size = gson.toJson(revision).toByteArray(Charsets.UTF_8).size + 1
+            if (retainedRevisions.size >= WebdavJournalProtocol.MAX_REVISION_ENTRIES) break
+            if (retainedRevisions.isNotEmpty() && revisionBytes + size > WebdavJournalProtocol.MAX_REVISION_BYTES) break
+            retainedRevisions.add(revision)
+            revisionBytes += size
+        }
+        return CompactedJournal((state + retainedRevisions).sortedBy { it.seq }, state.size, retainedRevisions.size)
+    }
+
+    fun planJournalRead(headLastSeq: Long?, known: Long): JournalReadPlan = when {
+        headLastSeq != null && headLastSeq < known -> JournalReadPlan(0L, reset = true, fetch = true)
+        headLastSeq != null -> JournalReadPlan(known, reset = false, fetch = known < headLastSeq)
+        else -> JournalReadPlan(known, reset = false, fetch = true)
+    }
+
+    fun committedView(entries: List<WebdavJournalEntry>, text: String, head: WebdavJournalHead?, known: Long): CommittedView {
+        val journalLastSeq = entries.maxOfOrNull { it.seq } ?: 0L
+        val reset = head == null && journalLastSeq < known
+        val cursor = if (reset) 0L else known
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        val mismatch = head != null && (bytes.size != head.journalBytes || !WebdavJournalProtocol.sha256(bytes).equals(head.journalSha256, ignoreCase = true))
+        val seqs = entries.map { it.seq }.filter { it > cursor && it <= (head?.lastSeq ?: Long.MAX_VALUE) }
+        return CommittedView(cursor, reset, mismatch, seqs)
+    }
+
+    /** Devices are replayed in code point order of their id, records by seq (fixture: pull-order.json). */
+    fun <T> pullOrder(items: List<T>, deviceId: (T) -> String, seq: (T) -> Long): List<T> =
+        items.sortedWith(compareBy<T, String>(naturalOrder()) { deviceId(it) }.thenBy { seq(it) })
 }
 
 /** Per-device read cursor shared with the v4 journal repository. */
@@ -291,7 +377,7 @@ class WebdavSyncClient(
 
     private suspend fun pull(settings: WebdavSettings, client: WebdavClient, budget: RemoteTransferLimits.Budget): List<String> {
         client.ensureDirectory("${settings.remotePath.trim()}/journal")
-        val deviceIds = client.listJournalNames()
+        val deviceIds = WebdavProtocolRules.pullOrder(client.listJournalNames(), { it }, { 0L })
         val seqs = knownSeqs(settings)
         val journals=mutableListOf<JournalReplay>()
         val bootstrap=seqs.isEmpty() && dao.allNotes().isEmpty()
@@ -305,34 +391,35 @@ class WebdavSyncClient(
         for (deviceId in deviceIds) {
             var known = seqs[deviceId] ?: 0L
             val head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
-                ?.let { WebdavJournalProtocol.parseHead(it) }
-            if (head != null) {
-                require(head.deviceId == deviceId) { "远端日志索引设备 ID 不匹配" }
-                // A marker behind our cursor means the journal was deleted and
-                // recreated; skipping it would hide every new record.
-                if (head.lastSeq < known) {
-                    DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_REPOSITORY_RESET,resourceId=deviceId,counts=mapOf("known" to known,"remote" to head.lastSeq))
-                    known = 0L
-                    seqs[deviceId] = 0L
-                }
-                if (head.lastSeq <= known) continue
+                ?.let { WebdavJournalProtocol.parseHead(it, deviceId) }
+            // A marker behind our cursor means the journal was deleted and
+            // recreated; skipping it would hide every new record. A marker at
+            // or below the cursor means there is nothing new to download.
+            val plan = WebdavProtocolRules.planJournalRead(head?.lastSeq, known)
+            if (plan.reset) {
+                DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_REPOSITORY_RESET,resourceId=deviceId,counts=mapOf("known" to known,"remote" to (head?.lastSeq ?: 0L)))
+                known = 0L
+                seqs[deviceId] = 0L
             }
+            if (!plan.fetch) continue
             // No head is a legacy v4 journal; retain its full-read compatibility.
             val text = client.getText(client.journalPath(deviceId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES) ?: continue
             val journalBytes=utf8Size(text).toLong()
             budget.consume(journalBytes,journalBytes)
             val entries = WebdavJournalProtocol.parseJournal(text)
-            if (head == null && (entries.maxOfOrNull { it.seq } ?: 0L) < known) {
+            val view = WebdavProtocolRules.committedView(entries, text, head, known)
+            if (view.reset) {
                 known = 0L
                 seqs[deviceId] = 0L
             }
+            val visible = view.seqs.toHashSet()
             // A journal whose marker PUT failed (or an old writer without
             // markers) still contains only complete JSON rows. Expose the
             // committed sequence range instead of blocking every device until
             // the writer comes back; its unacknowledged rows are republished.
             
             val alreadyApplied=appliedBeyond[deviceId].orEmpty()
-            val decoded=entries.filter { it.seq>known && it.seq<=(head?.lastSeq?:Long.MAX_VALUE) }.map { entry ->
+            val decoded=entries.filter { it.seq in visible }.map { entry ->
                 if(entry.seq in alreadyApplied)return@map entry
                 var payload=entry.payload
                 payload[WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER]?.takeIf{it.isJsonPrimitive}?.asString?.let { marker ->
@@ -890,25 +977,9 @@ class WebdavSyncClient(
             entry.deepCopy().apply { addProperty("seq", firstSeq + index) }
         }
         val appended = existing + lines.map { it.toJournalEntry() }
-        // Compact every write. State is an LWW snapshot (including tombstones);
-        // revisions are bounded history, not an ever-growing event stream.
-        val state = appended.filterNot { it.type == "revision" }
-            .groupBy { it.type to it.id }.values.map { it.maxBy { entry -> entry.seq } }
-        val revisions = appended.filter { it.type == "revision" }
-            .groupBy { it.type to it.id }.values.map { it.maxBy { entry -> entry.seq } }
-            .sortedByDescending { it.seq }
-        var revisionBytes = 0
-        val retainedRevisions = mutableListOf<WebdavJournalEntry>()
-        for (revision in revisions) {
-            val size = utf8Size(gson.toJson(revision)) + 1
-            if (retainedRevisions.size >= WebdavJournalProtocol.MAX_REVISION_ENTRIES) break
-            if (retainedRevisions.isNotEmpty() && revisionBytes + size > WebdavJournalProtocol.MAX_REVISION_BYTES) break
-            run {
-                retainedRevisions.add(revision)
-                revisionBytes += size
-            }
-        }
-        val retained = (state + retainedRevisions).sortedBy { it.seq }
+        // Compact every write (shared rule: journal-compact.json).
+        val compacted = WebdavProtocolRules.compact(appended)
+        val retained = compacted.entries
         if (retained.size > WebdavJournalProtocol.MAX_ENTRIES) error("设备日志条目数超过 10 万，请先压缩日志")
         val body = retained.joinToString("\n") { gson.toJson(it) } + "\n"
         if (utf8Size(body) > WebdavJournalProtocol.MAX_LOG_BYTES) error("设备日志压缩后超过 100 MB 上限")
@@ -923,8 +994,8 @@ class WebdavSyncClient(
             addProperty("journalBytes", bodyBytes.size)
             addProperty("journalSha256", WebdavJournalProtocol.sha256(bodyBytes))
             addProperty("updatedAt", Instant.now().toString())
-            addProperty("stateEntries", state.size)
-            addProperty("historyEntries", retainedRevisions.size)
+            addProperty("stateEntries", compacted.stateEntries)
+            addProperty("historyEntries", compacted.historyEntries)
         }
         client.putText(client.journalHeadPath(deviceId), gson.toJson(head))
         return firstSeq to entries.size
