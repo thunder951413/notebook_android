@@ -7,14 +7,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AiAssistantTest {
-    private fun note(id: String, title: String, folder: String? = "f1", parent: String? = null, order: Double = 0.0, type: String = "note") =
-        NoteSummary(id, title, "", 0, 0, folder, "工作", null, parent, order, 0, null, "none", 1, "", null, type, null, null, false, false, false, 0)
+    private fun note(id: String, title: String, folder: String? = "f1", parent: String? = null, order: Double = 0.0, type: String = "note", tags: String = "") =
+        NoteSummary(id, title, "", 0, 0, folder, "工作", null, parent, order, 0, null, "none", 1, tags, null, type, null, null, false, false, false, 0)
 
     private val folders = listOf(FolderEntity("f1", "工作", 0), FolderEntity("f2", "生活", 1))
     private val notes = listOf(
         note("a", "模块手册", order = 1.0), note("a1", "uboot", parent = "a", order = 1.0), note("a11", "编译", parent = "a1"),
         note("a2", "drm", parent = "a", order = 2.0), note("b", "入职", order = 2.0), note("t", "买菜", type = "todo"),
-        note("secret", "密码", order = 3.0), note("c", "旅行", folder = "f2"),
+        note("secret", "密码", order = 3.0, tags = "t1"), note("c", "旅行", folder = "f2", tags = "t2,t1"),
     )
 
     @Test fun `scope includes subtrees in tree order and leaves out todos and private notes`() {
@@ -22,6 +22,8 @@ class AiAssistantTest {
         assertEquals(listOf("a", "a1", "a11", "a2"), AiAssistant.resolve(AiScope(noteIds = setOf("a")), notes, folders, private).map { it.id })
         assertEquals(listOf("b", "c"), AiAssistant.resolve(AiScope(folderIds = setOf("f2"), extraNoteIds = setOf("b", "t", "secret")), notes, folders, private).map { it.id })
         assertEquals(7 - 1, AiAssistant.resolve(AiScope(), notes, folders, private).size)
+        // Tags add every note carrying any picked tag (private notes still excluded).
+        assertEquals(listOf("a2", "c"), AiAssistant.resolve(AiScope(noteIds = setOf("a2"), tagIds = setOf("t1")), notes, folders, private).map { it.id })
     }
 
     @Test fun `path and merged markdown`() {
@@ -53,7 +55,7 @@ class AiAssistantTest {
     }
 
     @Test fun `scope survives a round trip and bad input is empty`() {
-        val scope = AiScope(folderIds = setOf("f1"), noteIds = setOf("a"))
+        val scope = AiScope(folderIds = setOf("f1"), noteIds = setOf("a"), tagIds = setOf("t1"))
         assertEquals(scope, AiAssistant.scopeFromJson(AiAssistant.scopeToJson(scope)))
         assertEquals(AiScope(), AiAssistant.scopeFromJson("not json"))
         assertEquals(AiScope(), AiAssistant.scopeFromJson(null))

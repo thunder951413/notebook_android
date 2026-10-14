@@ -134,6 +134,7 @@ fun AiAssistantScreen(
     val scope = rememberCoroutineScope()
     val notes by repo.notes.collectAsState(initial = emptyList())
     val folders by repo.folders.collectAsState(initial = emptyList())
+    val tags by repo.tags.collectAsState(initial = emptyList())
     var settings by remember { mutableStateOf(repo.aiSettings()) }
     var aiScope by remember { mutableStateOf(if (initialNoteId != null) AiScope(noteIds = setOf(initialNoteId)) else savedScope(context)) }
     LaunchedEffect(aiScope) { saveScope(context, aiScope) }
@@ -158,7 +159,7 @@ fun AiAssistantScreen(
 
     val label = when {
         aiScope.isEmpty -> "全部笔记"
-        else -> (aiScope.folderIds.mapNotNull { id -> folders.firstOrNull { it.id == id }?.name } + aiScope.noteIds.mapNotNull { id -> notes.firstOrNull { it.id == id }?.title?.ifBlank { "无标题" } } + listOfNotNull(aiScope.extraNoteIds.size.takeIf { it > 0 }?.let { "$it 篇搜索结果" }))
+        else -> (aiScope.folderIds.mapNotNull { id -> folders.firstOrNull { it.id == id }?.name } + aiScope.noteIds.mapNotNull { id -> notes.firstOrNull { it.id == id }?.title?.ifBlank { "无标题" } } + aiScope.tagIds.mapNotNull { id -> tags.firstOrNull { it.id == id }?.name?.let { "#$it" } } + listOfNotNull(aiScope.extraNoteIds.size.takeIf { it > 0 }?.let { "$it 篇搜索结果" }))
             .let { if (it.isEmpty()) "全部笔记" else if (it.size > 2) it.take(2).joinToString("、") + " 等 ${it.size} 项" else it.joinToString("、") }
     }
 
@@ -363,7 +364,7 @@ fun AiAssistantScreen(
     }
 
     if (showPicker) ModalBottomSheet(onDismissRequest = { showPicker = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        ScopePicker(aiScope, notes.filter { it.deletedAt == null && it.itemType != "todo" && !repo.isEncrypted(it) }, folders.filter { it.type != "encryptedFolder" && it.type != "todoList" }, { aiScope = it }) { showPicker = false }
+        ScopePicker(aiScope, notes.filter { it.deletedAt == null && it.itemType != "todo" && !repo.isEncrypted(it) }, folders.filter { it.type != "encryptedFolder" && it.type != "todoList" }, tags, { aiScope = it }) { showPicker = false }
     }
     if (showSettings) AiSettingsDialog(settings, onDismiss = { showSettings = false }) { updated ->
         runCatching { repo.saveAiSettings(updated) }.onSuccess { settings = updated; showSettings = false; notice = "AI 设置已保存" }.onFailure { notice = it.message }
@@ -422,8 +423,10 @@ private fun LocationRow(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun ScopePicker(scope: AiScope, notes: List<NoteSummary>, folders: List<FolderEntity>, onChange: (AiScope) -> Unit, onDone: () -> Unit) {
+private fun ScopePicker(scope: AiScope, notes: List<NoteSummary>, folders: List<FolderEntity>, tags: List<io.github.notebook.android.data.TagEntity>, onChange: (AiScope) -> Unit, onDone: () -> Unit) {
     var filter by remember { mutableStateOf("") }
+    var byTag by remember { mutableStateOf(scope.tagIds.isNotEmpty() && scope.noteIds.isEmpty() && scope.folderIds.isEmpty()) }
+    val tagCounts = remember(notes) { notes.flatMap { it.tagIdSet() }.groupingBy { it }.eachCount() }
     val ordered = remember(notes, folders) { AiAssistant.treeOrder(notes, folders) }
     val byId = remember(notes) { notes.associateBy { it.id } }
     fun depth(note: NoteSummary): Int { var depth = 0; var cursor = note.parentPageId?.let(byId::get); while (cursor != null && depth < 16) { depth++; cursor = cursor.parentPageId?.let(byId::get) }; return depth }
@@ -432,14 +435,28 @@ private fun ScopePicker(scope: AiScope, notes: List<NoteSummary>, folders: List<
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("选择范围", style = MaterialTheme.typography.titleMedium)
-                Text("勾选笔记时，它下面的笔记也会一起用上", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (byTag) "带任一勾选标签的笔记都会用上" else "勾选笔记时，它下面的笔记也会一起用上", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             TextButton({ onChange(AiScope()) }) { Text("全部笔记") }
             Button(onDone) { Text("完成") }
         }
-        OutlinedTextField(filter, { filter = it }, placeholder = { Text("筛选笔记") }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 8.dp)) {
+            SegmentedButton(selected = !byTag, onClick = { byTag = false }, shape = SegmentedButtonDefaults.itemShape(0, 2), modifier = Modifier.testTag("ai-scope-notes")) { Text("按笔记" + (scope.folderIds.size + scope.noteIds.size).takeIf { it > 0 }?.let { "（$it）" }.orEmpty()) }
+            SegmentedButton(selected = byTag, onClick = { byTag = true }, shape = SegmentedButtonDefaults.itemShape(1, 2), modifier = Modifier.testTag("ai-scope-tags")) { Text("按标签" + scope.tagIds.size.takeIf { it > 0 }?.let { "（$it）" }.orEmpty()) }
+        }
+        OutlinedTextField(filter, { filter = it }, placeholder = { Text(if (byTag) "筛选标签" else "筛选笔记") }, singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp))
         HorizontalDivider()
-        LazyColumn(Modifier.fillMaxWidth()) {
+        if (byTag) LazyColumn(Modifier.fillMaxWidth()) {
+            val shown = tags.filter { filter.isBlank() || it.name.contains(filter.trim(), ignoreCase = true) }.sortedByDescending { tagCounts[it.id] ?: 0 }
+            if (shown.isEmpty()) item(key = "no-tags") { Text(if (tags.isEmpty()) "还没有标签" else "没有匹配的标签", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            items(shown, key = { "tag-${it.id}" }) { tag ->
+                Row(Modifier.fillMaxWidth().clickable { onChange(scope.copy(extraNoteIds = emptySet(), tagIds = if (tag.id in scope.tagIds) scope.tagIds - tag.id else scope.tagIds + tag.id)) }.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(tag.id in scope.tagIds, null)
+                    Text("#${tag.name}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("${tagCounts[tag.id] ?: 0} 篇", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(end = 8.dp))
+                }
+            }
+        } else LazyColumn(Modifier.fillMaxWidth()) {
             folders.sortedBy { it.sortOrder }.forEach { folder ->
                 val inFolder = ordered.filter { it.folderId == folder.id && (filter.isBlank() || it.title.contains(filter, ignoreCase = true)) }
                 if (inFolder.isEmpty() && filter.isNotBlank()) return@forEach

@@ -37,10 +37,13 @@ data class AiSettings(val provider: AiProvider = AiProvider.DeepSeek, val baseUr
 
 data class ChatMessage(val role: String, val content: String)
 
-/** Folders and note subtrees picked by the user. Empty means all notes. */
-data class AiScope(val folderIds: Set<String> = emptySet(), val noteIds: Set<String> = emptySet(), val extraNoteIds: Set<String> = emptySet()) {
-    val isEmpty get() = folderIds.isEmpty() && noteIds.isEmpty() && extraNoteIds.isEmpty()
+/** Folders, note subtrees and tags picked by the user (a note matches any of them). Empty means all notes. */
+data class AiScope(val folderIds: Set<String> = emptySet(), val noteIds: Set<String> = emptySet(), val extraNoteIds: Set<String> = emptySet(), val tagIds: Set<String> = emptySet()) {
+    val isEmpty get() = folderIds.isEmpty() && noteIds.isEmpty() && extraNoteIds.isEmpty() && tagIds.isEmpty()
 }
+
+/** A note's tag ids (stored comma-separated). */
+fun NoteSummary.tagIdSet(): Set<String> = tagIds.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 
 data class ContextSource(val index: Int, val noteId: String, val title: String, val path: String)
 data class AiContext(val text: String, val sources: List<ContextSource>, val truncated: Boolean)
@@ -70,7 +73,7 @@ object AiAssistant {
         val children = usable.groupBy { it.parentPageId }
         val picked = mutableSetOf<String>()
         fun addSubtree(id: String) { if (picked.add(id)) children[id]?.forEach { addSubtree(it.id) } }
-        usable.forEach { if (it.folderId in scope.folderIds || it.id in scope.extraNoteIds) picked += it.id }
+        usable.forEach { if (it.folderId in scope.folderIds || it.id in scope.extraNoteIds || (scope.tagIds.isNotEmpty() && it.tagIdSet().any(scope.tagIds::contains))) picked += it.id }
         scope.noteIds.forEach { if (usable.any { note -> note.id == it }) addSubtree(it) }
         return ordered.filter { it.id in picked }
     }
@@ -180,12 +183,12 @@ object AiAssistant {
 
     fun exportTitle(items: List<ExportItem>): String = items.firstOrNull()?.question?.lineSequence()?.firstOrNull { it.isNotBlank() }?.trim()?.take(40)?.let { "AI：$it" } ?: "AI 回答"
 
-    fun scopeToJson(scope: AiScope): String = Gson().toJson(mapOf("folderIds" to scope.folderIds.toList(), "noteIds" to scope.noteIds.toList(), "extraNoteIds" to scope.extraNoteIds.toList()))
+    fun scopeToJson(scope: AiScope): String = Gson().toJson(mapOf("folderIds" to scope.folderIds.toList(), "noteIds" to scope.noteIds.toList(), "extraNoteIds" to scope.extraNoteIds.toList(), "tagIds" to scope.tagIds.toList()))
 
     fun scopeFromJson(json: String?): AiScope = runCatching {
         val value = JsonParser.parseString(json ?: return AiScope()).asJsonObject
         fun set(key: String) = value.getAsJsonArray(key)?.map { it.asString }?.toSet().orEmpty()
-        AiScope(set("folderIds"), set("noteIds"), set("extraNoteIds"))
+        AiScope(set("folderIds"), set("noteIds"), set("extraNoteIds"), set("tagIds"))
     }.getOrDefault(AiScope())
 
     fun citedSources(answer: String): List<Int> = Regex("\\[(\\d{1,3})]").findAll(answer).map { it.groupValues[1].toInt() }.distinct().sorted().toList()
