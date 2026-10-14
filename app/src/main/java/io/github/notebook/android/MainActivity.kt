@@ -802,8 +802,17 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         referenceTargets=targetIds.mapNotNull{id->repo.loadNote(id)?.takeIf{target->!repo.isEncrypted(target)||encryptedUnlocked}?.let{id to it}}.toMap()
         referenceAssets=referenceTargets.keys.flatMap{repo.assetList(it)}.associateBy{it.id}
     }
+    // `[[标题]]` resolves against the library like on the desktop.
+    val resolveTitle=remember(allNotes){NotebookReferenceSyntax.titleResolver(allNotes.filter{it.deletedAt==null}.map{WikiLinkCandidate(it.id,it.title,it.itemType=="todo",it.updatedAt)})}
+    val missingLinkContext=LocalContext.current
     fun openReference(uri:String){
         val parsed=android.net.Uri.parse(uri)
+        if(parsed.host=="title"){
+            val title=parsed.pathSegments.firstOrNull()?:return
+            val target=resolveTitle(title)
+            if(target!=null)onOpenNote(target)else android.widget.Toast.makeText(missingLinkContext,"还没有“$title”这篇笔记",android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
         val targetId=parsed.pathSegments.firstOrNull()?:return
         onOpenNote(targetId)
     }
@@ -858,7 +867,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         items(blocks.size,key={"note-markdown-${blocks[it].id}"}){index->
             val block=blocks[index]
             if(block.kind==MarkdownBlockKind.Blank)Spacer(Modifier.fillMaxWidth().height(8.dp))else{
-                val expandedMarkdown=remember(block.text,referenceTargets,allNotes,encryptedUnlocked){NotebookReferenceSyntax.forDisplay(block.text,pageTitle={id->allNotes.firstOrNull{it.id==id}?.takeIf{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}?.title},targetContent={reference->referenceTargets[reference.pageId]?.let{NotebookReferenceSyntax.extractTarget(it.body,reference)}})}
+                val expandedMarkdown=remember(block.text,referenceTargets,allNotes,encryptedUnlocked,resolveTitle){NotebookReferenceSyntax.forDisplay(block.text,pageTitle={id->allNotes.firstOrNull{it.id==id}?.takeIf{canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}?.title},targetContent={reference->referenceTargets[reference.pageId]?.let{NotebookReferenceSyntax.extractTarget(it.body,reference)}},resolveTitle=resolveTitle)}
                 val imageRefs=remember(expandedMarkdown){NotebookAssetSyntax.images(expandedMarkdown)}
                 val displayMarkdown=remember(expandedMarkdown){NotebookAssetSyntax.withoutImages(expandedMarkdown)}
                 Column(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=if(index==0)12.dp else 0.dp)){
@@ -884,7 +893,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         if(showBody)items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
     };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
     if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){if(document.headings.isEmpty())Text("添加标题后，这里会出现目录",Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant);Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
-    if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(visibleBacklinks.isEmpty())Text("还没有其他可查看的页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(visibleBacklinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when(link.targetKind){"block"->"引用了内容块";"group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
+    if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(visibleBacklinks.isEmpty())Text("还没有其他可查看的页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(visibleBacklinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when{link.id.contains(":title:")->"以标题链接到此页";link.targetKind=="block"->"引用了内容块";link.targetKind=="group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
 }
 

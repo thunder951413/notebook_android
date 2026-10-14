@@ -82,4 +82,29 @@ class NotebookReferenceSyntaxTest {
         assertTrue(display.contains("打开原文"))
         assertFalse(display.contains("^b-one"))
     }
+
+    @Test fun `title links are parsed outside code and rendered as app links`() {
+        val source = "参见 [[会议记录]] 与 [[产品 愿景|愿景]]、[[page:abc|旧式]]，`[[代码]]` 不算，[[还没写]]。"
+        val links = NotebookReferenceSyntax.wikiLinks(source)
+        assertEquals(listOf("会议记录" to null, "产品 愿景" to "愿景", "还没写" to null), links.map { it.title to it.alias })
+        assertEquals("[[会议记录]]", source.substring(links[0].start, links[0].end))
+        val resolve = NotebookReferenceSyntax.titleResolver(listOf(
+            WikiLinkCandidate("meeting", "会议记录", isTodo = false, updatedAt = 1),
+            WikiLinkCandidate("meeting-todo", "会议记录", isTodo = true, updatedAt = 9),
+            WikiLinkCandidate("vision", "产品  愿景", isTodo = false, updatedAt = 1),
+        ))
+        val display = NotebookReferenceSyntax.forDisplay(source, resolveTitle = resolve)
+        assertTrue(display, display.contains("[会议记录](notebook://page/meeting)"))
+        assertTrue(display, display.contains("[愿景](notebook://page/vision)"))
+        assertTrue(display, display.contains("[还没写（未创建）](notebook://title/%E8%BF%98%E6%B2%A1%E5%86%99)"))
+        assertTrue(display, display.contains("`[[代码]]`"))
+        assertFalse(display, display.contains("[[会议记录]]"))
+    }
+
+    @Test fun `title comparison matches the desktop normalization`() {
+        assertEquals(NotebookReferenceSyntax.normalizeTitle("meeting notes"), NotebookReferenceSyntax.normalizeTitle("  Ｍeeting   Notes "))
+        val resolve = NotebookReferenceSyntax.titleResolver(listOf(WikiLinkCandidate("a", "Meeting Notes", isTodo = false, updatedAt = 1)))
+        assertEquals("a", resolve("  meeting   notes "))
+        assertEquals(null, resolve("other"))
+    }
 }

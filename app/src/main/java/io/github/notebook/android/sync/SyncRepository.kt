@@ -16,6 +16,7 @@ import io.github.notebook.android.NotebookReference
 import io.github.notebook.android.NoteSearchQuery
 import io.github.notebook.android.rankSearchHits
 import io.github.notebook.android.NotebookReferenceSyntax
+import io.github.notebook.android.WikiLinkCandidate
 import io.github.notebook.android.reminder.Reminders
 import io.github.notebook.android.diagnostics.DiagnosticEvent
 import io.github.notebook.android.diagnostics.DiagnosticLevel
@@ -480,7 +481,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val structuralDraft=if(current!=null&&current.treeUpdatedAt>draft.treeUpdatedAt)draft.copy(folderId=current.folderId,folderName=current.folderName,parentPageId=current.parentPageId,sortOrder=current.sortOrder,treeUpdatedAt=current.treeUpdatedAt)else draft
         if(current!=null&&sameEditableContent(current,structuralDraft)){dao.deleteDraft(draft.id);return@withLock current}
         val base=current?:draft;val saved=base.copy(title=draft.title,body=draft.body,previewText=previewText(draft.body),folderId=structuralDraft.folderId,folderName=structuralDraft.folderName,icon=draft.icon,parentPageId=structuralDraft.parentPageId,sortOrder=structuralDraft.sortOrder,treeUpdatedAt=structuralDraft.treeUpdatedAt,reminderAt=draft.reminderAt,recurrence=draft.recurrence,tagIds=draft.tagIds,deletedAt=draft.deletedAt,itemType=draft.itemType,dueAt=draft.dueAt,completedAt=draft.completedAt,important=draft.important,viewMode=draft.viewMode,updatedAt=System.currentTimeMillis(),version=(current?.version?:draft.version)+1,dirty=true)
-        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);dao.deleteDraft(draft.id);if(syncBackend()!=SyncBackend.SSH){val workspace=syncWorkspaceId();apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
+        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);if(current==null||current.title!=saved.title)reindexTitleLinksAsync();dao.deleteDraft(draft.id);if(syncBackend()!=SyncBackend.SSH){val workspace=syncWorkspaceId();apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.icon==b.icon&&a.parentPageId==b.parentPageId&&a.sortOrder==b.sortOrder&&a.treeUpdatedAt==b.treeUpdatedAt&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important&&a.viewMode==b.viewMode
     private suspend fun subtree(id:String):List<NoteEntity>{
@@ -1190,7 +1191,16 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private suspend fun scheduleNextOutboxBatch(workspace:String,outboxBefore:Int){
         if(outboxBefore>=200&&dao.apiOutboxCount(workspace)>0)SyncWorker.enqueueNow(appContext)
     }
+    /** Re-resolves title links in every note after a title appeared or changed. */
+    private fun reindexTitleLinksAsync(){appScope.launch{runCatching{dao.noteIdsWithLinks().forEach{id->loadEditable(id)?.let{indexReferences(it)}}}}}
     private suspend fun indexReferences(note:NoteEntity){
+        val titleLinks:List<PageLinkEntity> = if(note.deletedAt!=null)emptyList() else NotebookReferenceSyntax.wikiLinks(note.body).let{links->
+            if(links.isEmpty())return@let emptyList<PageLinkEntity>()
+            val resolve=NotebookReferenceSyntax.titleResolver(dao.linkCandidates().map{WikiLinkCandidate(it.id,it.title,it.itemType=="todo",it.updatedAt)})
+            links.mapIndexedNotNull{index,link->resolve(link.title)?.takeIf{it!=note.id}?.let{target->PageLinkEntity(
+                id="${note.id}:title:$index:$target",sourceNoteId=note.id,targetNoteId=target,targetKind="page",targetId=null,
+                alias=link.alias,embed=false,sourceOffset=link.start,updatedAt=note.updatedAt)}}.distinctBy{it.targetNoteId}
+        }
         val links=if(note.deletedAt!=null)emptyList() else NotebookReferenceSyntax.parse(note.body).mapIndexed{index,reference->
             PageLinkEntity(
                 id="${note.id}:$index:${reference.pageId}:${reference.kind}:${reference.targetId.orEmpty()}:${reference.embed}",
@@ -1204,7 +1214,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
                 updatedAt=note.updatedAt
             )
         }
-        dao.replacePageLinks(note.id,links)
+        dao.replacePageLinks(note.id,links+titleLinks)
     }
     private suspend fun loadEditable(id:String):NoteEntity?{val header=dao.getNoteHeader(id)?:return null;val body=readLargeText(dao.bodyLength(id)){start,length->dao.bodyChunk(id,start,length)}.orEmpty();return header.copy(body=body,previewText=header.previewText.ifBlank{previewText(body)})}
     private suspend fun loadSnapshot(id:String)=readLargeText(dao.snapshotLength(id)){start,length->dao.snapshotChunk(id,start,length)}

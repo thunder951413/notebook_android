@@ -49,6 +49,9 @@ data class NoteEntity(
 )
 
 /** Lightweight row used by navigation, filtering and the virtualized note list. */
+/** Projection for resolving title links. */
+data class NoteLinkCandidate(val id:String,val title:String,val itemType:String,val updatedAt:Long)
+
 data class NoteSummary(
     val id:String,
     val title:String,
@@ -184,6 +187,9 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("SELECT length(conflictSnapshotJson) FROM notes WHERE id=:id") suspend fun conflictSnapshotLength(id:String):Int?
     @Query("SELECT substr(conflictSnapshotJson,:start,:length) FROM notes WHERE id=:id") suspend fun conflictSnapshotChunk(id:String,start:Int,length:Int):String?
     @Query("SELECT id FROM notes") suspend fun allNoteIds():List<String>
+    /** Notes a `[[title]]` link may resolve to (id, title, kind, recency only). */
+    @Query("SELECT id,title,itemType,updatedAt FROM notes WHERE deletedAt IS NULL") suspend fun linkCandidates():List<NoteLinkCandidate>
+    @Query("SELECT id FROM notes WHERE deletedAt IS NULL AND body LIKE '%[[%'") suspend fun noteIdsWithLinks():List<String>
     @Query("SELECT id FROM notes WHERE dirty=1") suspend fun dirtyNoteIds():List<String>
     @Query("SELECT id FROM notes WHERE title LIKE '%' || :query || '%' OR body LIKE '%' || :query || '%'") suspend fun searchNoteIds(query:String):List<String>
     @Transaction suspend fun allNotes(): List<NoteEntity> = allNoteIds().mapNotNull{get(it)}

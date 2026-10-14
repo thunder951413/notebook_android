@@ -23,7 +23,54 @@ internal data class NotebookReference(
     }
 }
 
+/** A `[[标题]]` / `[[标题|显示文字]]` title link (plain GFM text shared with the desktop). */
+internal data class WikiLinkMatch(val title: String, val alias: String?, val start: Int, val end: Int)
+
+/** A note that a title link may resolve to. */
+internal data class WikiLinkCandidate(val id: String, val title: String, val isTodo: Boolean, val updatedAt: Long)
+
 internal object NotebookReferenceSyntax {
+    private val wikiLink = Regex("""\[\[(?!page:)([^\[\]|\n]+?)(?:\|([^\[\]\n]+?))?\]\]""")
+    private val fencedCode = Regex("""^( {0,3})(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^\1?\2[`~]*[ \t]*$|\z)""", RegexOption.MULTILINE)
+    private val inlineCode = Regex("""(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)""")
+    private const val MAX_WIKI_TITLE = 200
+
+    /** Same comparison key as the desktop: NFKC, trimmed, single spaces, lower case. */
+    fun normalizeTitle(title: String): String =
+        java.text.Normalizer.normalize(title, java.text.Normalizer.Form.NFKC).trim().replace(Regex("""\s+"""), " ").lowercase(java.util.Locale.ROOT)
+
+    private fun codeRanges(markdown: String): List<IntRange> {
+        val ranges = fencedCode.findAll(markdown).map { it.range }.toMutableList()
+        inlineCode.findAll(markdown).forEach { match -> if (ranges.none { match.range.first in it }) ranges.add(match.range) }
+        return ranges
+    }
+
+    /** Title links outside code, in document order. */
+    fun wikiLinks(markdown: String): List<WikiLinkMatch> {
+        if (!markdown.contains("[[")) return emptyList()
+        val code = codeRanges(markdown)
+        return wikiLink.findAll(markdown).mapNotNull { match ->
+            if (code.any { match.range.first in it }) return@mapNotNull null
+            val title = match.groupValues[1].trim()
+            if (title.isEmpty() || title.length > MAX_WIKI_TITLE) return@mapNotNull null
+            WikiLinkMatch(title, match.groupValues[2].trim().ifBlank { null }, match.range.first, match.range.last + 1)
+        }.toList()
+    }
+
+    /** Resolves titles like the desktop: notes before to-dos, then the most recently updated. */
+    fun titleResolver(candidates: List<WikiLinkCandidate>): (String) -> String? {
+        val best = HashMap<String, WikiLinkCandidate>()
+        for (candidate in candidates) {
+            val key = normalizeTitle(candidate.title)
+            if (key.isEmpty()) continue
+            val current = best[key]
+            if (current == null || (current.isTodo && !candidate.isTodo) || (current.isTodo == candidate.isTodo && candidate.updatedAt > current.updatedAt)) best[key] = candidate
+        }
+        return { title -> best[normalizeTitle(title)]?.id }
+    }
+
+    fun titleUri(title: String): String = "notebook://title/" + java.net.URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+
     private val reference = Regex(
         """(!)?\[\[page:([A-Za-z0-9][A-Za-z0-9._:-]*)(?:#(?:\^([A-Za-z0-9][A-Za-z0-9._:-]*)|group:([A-Za-z0-9][A-Za-z0-9._:-]*)))?(?:\|([^\]\n]+))?\]\]"""
     )
@@ -58,11 +105,13 @@ internal object NotebookReferenceSyntax {
     fun forDisplay(
         markdown: String,
         pageTitle: (String) -> String? = { null },
+        resolveTitle: (String) -> String? = { null },
         targetContent: (NotebookReference) -> String? = { null }
     ): String {
         val withoutBoundaries = groupBoundary.replace(markdown, "")
         val withoutAnchors = blockAnchor.replace(withoutBoundaries, "")
-        return reference.replace(withoutAnchors) { match ->
+        val withTitleLinks = replaceWikiLinks(withoutAnchors, resolveTitle)
+        return reference.replace(withTitleLinks) { match ->
             val parsed = parse(match.value).single()
             val fallback = pageTitle(parsed.pageId)?.ifBlank { null } ?: "关联页面 ${parsed.pageId.take(8)}"
             val dynamic = targetContent(parsed)?.trim()?.takeIf(String::isNotEmpty)
@@ -76,6 +125,23 @@ internal object NotebookReferenceSyntax {
                 else "$body\n\n[打开原文 · $label](${parsed.uri})"
             } else "[$label](${parsed.uri})"
         }
+    }
+
+    /** `[[标题]]` → an app link; unresolved titles stay readable and open by title. */
+    private fun replaceWikiLinks(markdown: String, resolveTitle: (String) -> String?): String {
+        val links = wikiLinks(markdown)
+        if (links.isEmpty()) return markdown
+        val output = StringBuilder()
+        var cursor = 0
+        for (link in links) {
+            output.append(markdown, cursor, link.start)
+            val label = (link.alias ?: link.title).replace("[", "［").replace("]", "］")
+            val target = resolveTitle(link.title)
+            if (target != null) output.append("[").append(label).append("](notebook://page/").append(target).append(")")
+            else output.append("[").append(label).append("（未创建）](").append(titleUri(link.title)).append(")")
+            cursor = link.end
+        }
+        return output.append(markdown, cursor, markdown.length).toString()
     }
 
     fun extractTarget(markdown: String, reference: NotebookReference): String? {

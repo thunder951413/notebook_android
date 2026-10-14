@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import io.github.notebook.android.sync.SyncRepository
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.*
 import org.junit.Assert.*
@@ -269,5 +270,24 @@ class LibraryOperationsTest {
         assertEquals(snapshot, copy.snapshotJson)
         assertEquals(body, repo.loadNote(copy.id)!!.body)
         assertEquals(snapshot.codePointCount(0, snapshot.length), db.dao().snapshotLength(copy.id))
+    }
+
+    @Test
+    fun titleLinksAppearAsBacklinksAndFollowNewNotes() = runBlocking {
+        repo.save(NoteEntity("target", title = "会议记录", body = "正文"))
+        repo.save(NoteEntity("source", title = "周报", body = "参见 [[会议记录]] 和 [[以后再写|稍后]]，`[[代码]]` 不算。"))
+        val links = db.dao().observeBacklinks("target").first()
+        assertEquals(listOf("source"), links.map { it.sourceNoteId })
+        assertTrue(links.single().id.contains(":title:"))
+        // A note created later picks up the existing dangling link.
+        repo.save(NoteEntity("later", title = "以后再写", body = ""))
+        var later = emptyList<PageLinkEntity>()
+        for (attempt in 0 until 50) {
+            later = db.dao().observeBacklinks("later").first()
+            if (later.isNotEmpty()) break
+            Thread.sleep(20)
+        }
+        assertEquals(listOf("source"), later.map { it.sourceNoteId })
+        assertEquals("稍后", later.single().alias)
     }
 }
