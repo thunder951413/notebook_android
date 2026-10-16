@@ -466,12 +466,13 @@ internal fun SearchTagShortcuts(tags: List<Pair<String, Int>>, onTag: (String) -
 }
 
 /**
- * Swipe an open todo to the left to complete it. The row is only swipeable
- * while [enabled]; if saving fails the row springs back.
+ * Swipe an open todo to the left to complete it. [onComplete] must run the save
+ * in a scope that outlives this row (the row leaves the list as soon as the
+ * todo is done) and report back through `done`; on failure the row springs back.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: suspend () -> Boolean, content: @Composable () -> Unit) {
+internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: (done: (Boolean) -> Unit) -> Unit, content: @Composable () -> Unit) {
     if (!enabled) {
         content()
         return
@@ -481,7 +482,7 @@ internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: suspend () -> Bool
     state = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
             if (value == SwipeToDismissBoxValue.EndToStart) {
-                scope.launch { if (!onComplete()) state.reset() }
+                onComplete { ok -> if (!ok) scope.launch { state.reset() } }
                 true
             } else false
         },
@@ -492,15 +493,18 @@ internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: suspend () -> Bool
         modifier = Modifier.testTag("swipe-complete"),
         enableDismissFromStartToEnd = false,
         backgroundContent = {
-            Box(
-                Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.primaryContainer).padding(end = 20.dp),
-                contentAlignment = Alignment.CenterEnd,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
-                    Text("完成", Modifier.padding(start = 6.dp), color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Medium)
+            // Only paint while the row is actually being dragged; otherwise the
+            // colour peeks out around the card's rounded corners.
+            if (state.dismissDirection == SwipeToDismissBoxValue.EndToStart)
+                Box(
+                    Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.primaryContainer).padding(end = 20.dp),
+                    contentAlignment = Alignment.CenterEnd,
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                        Text("完成", Modifier.padding(start = 6.dp), color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Medium)
+                    }
                 }
-            }
         },
     ) { content() }
 }

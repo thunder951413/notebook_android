@@ -405,11 +405,16 @@ internal fun ReferenceHome(
             selecting = true
             selected = selected + note.id
         }
-        val complete: suspend () -> Boolean = {
-            runCatching { repo.loadNote(note.id)?.let { repo.save(it.copy(completedAt = System.currentTimeMillis())) } }
-                .onSuccess { onStatus("已完成「${note.title.ifBlank { "无标题待办" }}」") }
-                .onFailure { onStatus("操作失败：${it.localizedMessage}") }
-                .isSuccess
+        // Save from the screen's scope: this row is disposed as soon as the todo
+        // leaves the list, which would cancel a row-scoped save halfway.
+        val complete: (done: (Boolean) -> Unit) -> Unit = { done ->
+            scope.launch {
+                val ok = runCatching { repo.loadNote(note.id)?.let { repo.save(it.copy(completedAt = System.currentTimeMillis())) } }
+                    .onSuccess { onStatus("已完成「${note.title.ifBlank { "无标题待办" }}」") }
+                    .onFailure { onStatus("操作失败：${it.localizedMessage}") }
+                    .isSuccess
+                done(ok)
+            }
         }
         val swipeable = note.isOpenTodo() && !selecting
         if (compact)

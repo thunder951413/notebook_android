@@ -577,7 +577,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     suspend fun saveFolder(name:String,type:String="noteFolder",id:String=UUID.randomUUID().toString(),color:String?=null){
         require(name.isNotBlank()) { "笔记库名称不能为空" }
         val existing=dao.getFolder(id)
-        val folder=(existing?:FolderEntity(id,name,dao.allFolders().size,type)).copy(name=name.trim(),color=color?:existing?.color,updatedAt=System.currentTimeMillis())
+        val folder=(existing?:FolderEntity(id,name,dao.allFolders().size,type,notebookId=if(type=="noteFolder")notebookForNewLibrary(dao.allFolders(),dao.apiNotebooks()) else "personal")).copy(name=name.trim(),color=color?:existing?.color,updatedAt=System.currentTimeMillis())
         dao.putFolder(folder)
         if(syncBackend()!=SyncBackend.SSH)apiSync.queueFolder(syncWorkspaceId(),folder)
         requestSyncIfConfigured()
