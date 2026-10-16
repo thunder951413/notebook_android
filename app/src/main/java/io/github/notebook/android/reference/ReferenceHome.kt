@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.shape.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -194,6 +195,7 @@ internal fun ReferenceHome(
     var pinnedIds by remember { mutableStateOf(navigation.pinned()) }
     LaunchedEffect(hierarchy) { if (!hierarchy) pinnedIds = navigation.pinned() }
     var compact by remember { mutableStateOf(preferences.getBoolean("homeCompact", false)) }
+    var libraryList by remember { mutableStateOf(preferences.getBoolean("libraryList", false)) }
     var time by rememberSaveable { mutableStateOf(TimeFilter.All) }
     var recentSearches by remember { mutableStateOf(repo.recentSearches()) }
     val scope = rememberCoroutineScope()
@@ -739,6 +741,19 @@ internal fun ReferenceHome(
                             fontSize = if (search) 18.sp else 32.sp,
                             fontWeight = FontWeight.Bold,
                         )
+                        if (librariesVisible && !search && !selecting)
+                            IconButton(
+                                {
+                                    libraryList = !libraryList
+                                    preferences.edit().putBoolean("libraryList", libraryList).apply()
+                                },
+                                Modifier.testTag("library-view-toggle"),
+                            ) {
+                                Icon(
+                                    if (libraryList) Icons.Default.GridView else Icons.AutoMirrored.Filled.ViewList,
+                                    if (libraryList) "图标显示" else "列表显示",
+                                )
+                            }
                         if (!search && !selecting && (tab == 0 || folder != null))
                             TextButton({ filters = true }) {
                                 Icon(Icons.Default.Tune, "筛选", Modifier.size(19.dp))
@@ -752,23 +767,6 @@ internal fun ReferenceHome(
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                if (folder != null && !search) {
-                    Column(
-                        Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        LibraryCover(
-                            libraryColor(folder.color),
-                            Modifier.size(92.dp, 76.dp),
-                            folder.type == "encryptedFolder",
-                        )
-                        Text(
-                            "${notes.size} 篇笔记",
-                            fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
                 AnimatedContent(
                     targetState = librariesVisible && !search,
                     modifier = Modifier.weight(1f),
@@ -793,6 +791,39 @@ internal fun ReferenceHome(
                                         createLibrary = true
                                     }
                                 }
+                            if (libraryList)
+                                items(publicLibraries, key = { "list-${it.id}" }) { library ->
+                                    Row(
+                                        Modifier.fillMaxWidth()
+                                            .testTag("library-row-${library.id}")
+                                            .combinedClickable(
+                                                onClick = { onSelect(Destination.All, library.id, null) },
+                                                onLongClick = { libraryEditor = library },
+                                            )
+                                            .padding(horizontal = 4.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        LibraryCover(
+                                            libraryColor(library.color),
+                                            Modifier.size(52.dp, 42.dp),
+                                            library.type == "encryptedFolder",
+                                        )
+                                        Text(
+                                            library.name,
+                                            Modifier.weight(1f).padding(start = 12.dp),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            fontWeight = FontWeight.Medium,
+                                            fontSize = 16.sp,
+                                        )
+                                        Text(
+                                            "${libraryCounts[library.id] ?: 0} 篇",
+                                            fontSize = 13.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            else
                             items(publicLibraries.chunked(3), key = { it.first().id }) { row ->
                                 Row(
                                     Modifier.fillMaxWidth().padding(vertical = 12.dp),
