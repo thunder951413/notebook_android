@@ -599,15 +599,20 @@ class WebdavSyncClient(
         // Our own journal only replays work this device already has; a lost
         // cursor must never turn that replay into a conflict.
         if(fromOwnDevice && (pending!=null || localVersion>=version+1))return true
-        if(pending==null && !locallyDirty && version+1<localVersion)return true
+        // A delete is authoritative whatever version it was written against:
+        // the counters of two devices drift apart, and treating that drift as
+        // a conflict (or as an old ancestor) silently kept deleted notes. Only
+        // an edit this device has not sent yet keeps the note alive.
+        val isDelete=operation=="delete"
+        if(!isDelete && pending==null && !locallyDirty && version+1<localVersion)return true
         // With an edit queued, a record older than the accepted baseline is an
         // ancestor this device has already moved past.
-        if(pending!=null && version+1<localVersion)return true
+        if(!isDelete && pending!=null && version+1<localVersion)return true
         val compactedAdvance=pending==null && !locallyDirty && version>localVersion
         // Only the note's own page/body compete with an unsaved local edit;
         // tags, steps or attachments from another device are simply applied.
         val dirtyConflict=locallyDirty && (type=="page" || type=="document")
-        if ((pending != null && version > pending.expectedVersion) || dirtyConflict || (parentMismatch && !compactedAdvance && localStateExists && !sameRemoteState(type, id, payload, entry.hash))) {
+        if ((pending != null && (isDelete || version > pending.expectedVersion)) || dirtyConflict || (!isDelete && parentMismatch && !compactedAdvance && localStateExists && !sameRemoteState(type, id, payload, entry.hash))) {
             // Concurrent edits never stop synchronization: keep the local
             // version, republish it as the successor and keep the other
             // device's body as a separate "conflict copy" note.
@@ -617,7 +622,7 @@ class WebdavSyncClient(
         // A retry/replay with identical content is safe to acknowledge without
         // rewriting local state. This is what prevents an old journal copy from
         // turning a matching snapshot into a false conflict.
-        if (parentMismatch && !compactedAdvance && localStateExists) {
+        if (!isDelete && parentMismatch && !compactedAdvance && localStateExists) {
             dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), maxOf(localVersion, version + 1)))
             return true
         }
