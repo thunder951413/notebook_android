@@ -567,6 +567,8 @@ class WebdavSyncClient(
         } catch (error: IllegalArgumentException) {
             throw IllegalArgumentException("云端 $type 记录（序号 ${entry.seq}）：${error.message}", error)
         }
+        val writtenAt=runCatching{java.time.Instant.parse(entry.ts).toEpochMilli()}.getOrNull()
+        if(operation=="upsert"&&(type=="page"||type=="document"))api.reviveRemotelyDeletedNote(id,writtenAt)
         if(api.consumeChangeForDeletedPage(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,type,id,payload,version+1))return true
         // Compare the actual document, rather than an external-object marker,
         // when a retained cursor causes an already applied record to replay.
@@ -636,7 +638,7 @@ class WebdavSyncClient(
             val values=JsonParser.parseString(prefs.getString("webdavNotebookPayloads","{}")).asJsonObject
             values.add(id,payload);prefs.edit().putString("webdavNotebookPayloads",gson.toJson(values)).apply()
         }
-        if (operation == "delete") api.applyDelete(type, id, payload) else when (type) {
+        if (operation == "delete") api.applyDelete(type, id, payload, writtenAt ?: System.currentTimeMillis()) else when (type) {
             "notebook" -> dao.putApiNotebook(io.github.notebook.android.data.ApiNotebookEntity(
                 id, payload.string("workspaceId", WebdavJournalProtocol.DEFAULT_WORKSPACE_ID), payload.string("name"),
                 payload.optionalString("emoji"), payload.optionalString("color"), payload.integer("sortOrder"),

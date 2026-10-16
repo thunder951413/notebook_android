@@ -432,11 +432,21 @@ class ApiSyncClient(
         wrapper["apiConflicts"].asJsonObject.add(type,payload.deepCopy());dao.put(note.copy(conflict=true,conflictSnapshotJson=gson.toJson(wrapper)))
     }}
 
-    internal suspend fun applyDelete(type:String,id:String,p:JsonObject){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);deleteNoteAndAssets(id)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->deleteAssetAndFile(id);"page_link"->dao.deletePageLink(id);"revision"->dao.deleteRemoteRevision(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
+    internal suspend fun applyDelete(type:String,id:String,p:JsonObject,at:Long=System.currentTimeMillis()){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);deleteNoteAndAssets(id,at)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->deleteAssetAndFile(id);"page_link"->dao.deletePageLink(id);"revision"->dao.deleteRemoteRevision(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
     internal suspend fun deleteAssetAndFile(id:String){dao.getAsset(id)?.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)};dao.deleteAsset(id)}
-    internal suspend fun deleteNoteAndAssets(noteId:String){
+    /**
+     * A tombstone left by a delete that came from another device is only a
+     * "this was deleted at <time>" marker: a later write from a device (a restore
+     * from its trash) supersedes it. Tombstones from deletions made on this phone
+     * (any other device id) never expire.
+     */
+    internal suspend fun reviveRemotelyDeletedNote(noteId:String,writtenAt:Long?){
+        val tombstone=dao.tombstone("note|$noteId")?:return
+        if(tombstone.deviceId==REMOTE_DELETE_DEVICE&&writtenAt!=null&&writtenAt>tombstone.deletedAt)dao.deleteTombstone(tombstone.itemKey)
+    }
+    internal suspend fun deleteNoteAndAssets(noteId:String,at:Long=System.currentTimeMillis()){
         val assets=dao.assets(noteId)
-        dao.permanentlyDeleteNote(TombstoneEntity("note|$noteId",noteId,"note",System.currentTimeMillis(),"00000000-0000-4000-8000-000000000000"),emptyList())
+        dao.permanentlyDeleteNote(TombstoneEntity("note|$noteId",noteId,"note",at,REMOTE_DELETE_DEVICE),emptyList())
         assets.forEach{asset->asset.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)}}
     }
 
@@ -445,7 +455,7 @@ class ApiSyncClient(
     internal fun pageIdFor(type:String,id:String,p:JsonObject?)=when(type){"page","document"->id;"task_step","asset","page_tag","reading_position","revision"->p?.optionalString("pageId")?:id.substringBefore(':');"page_link"->p?.optionalString("sourcePageId");else->null}
     private fun execute(s:ApiSyncSettings,request:Request)=http.newCall(request.newBuilder().apply{if(s.token.isNotBlank())header("Authorization","Bearer ${s.token}")}.build()).execute().also{if(!it.isSuccessful){val detail=it.body?.string().orEmpty().take(500);it.close();throw IllegalStateException("同步服务返回 ${it.code}${if(detail.isBlank())"" else "：$detail"}")}}
     private fun assetUrl(s:ApiSyncSettings,id:String)="${s.baseUrl}/v1/sync/assets/${encoded(id)}?workspace_id=${encoded(s.workspaceId)}"
-    companion object {private val JSON="application/json; charset=utf-8".toMediaType();private fun encoded(v:String)=URLEncoder.encode(v,StandardCharsets.UTF_8.name());private fun iso(ms:Long)=Instant.ofEpochMilli(ms).toString();private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}}
+    companion object {internal const val REMOTE_DELETE_DEVICE="00000000-0000-4000-8000-000000000000";private val JSON="application/json; charset=utf-8".toMediaType();private fun encoded(v:String)=URLEncoder.encode(v,StandardCharsets.UTF_8.name());private fun iso(ms:Long)=Instant.ofEpochMilli(ms).toString();private fun sha(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}}
 }
 
 /** Adapter between the web editor's TipTap JSON and the existing native Markdown surface. */

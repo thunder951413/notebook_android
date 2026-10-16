@@ -12,6 +12,7 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -121,5 +122,48 @@ class WebdavRemoteDeleteTest {
 
     @Test fun `an unsent local edit keeps the note`() {
         assertNotNull(run(localVersion = 2, remoteParent = 2, localEdit = true))
+    }
+
+    private fun record(op: String, type: String, ts: String, parentVersion: Long, payload: JsonObject) = JsonObject().apply {
+        addProperty("ts", ts); addProperty("op", op); addProperty("type", type)
+        addProperty("id", noteId); addProperty("ver", parentVersion); add("payload", payload)
+    }
+
+    /** Desktop trashed the note (old behaviour: a delete) and later restored it: the restore must win. */
+    @Test fun `a restore written after a remote delete brings the note back`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val database = Room.inMemoryDatabaseBuilder(context, NotebookDatabase::class.java).allowMainThreadQueries().build()
+        val server = MockWebServer().apply { start() }
+        try {
+            val dav = Dav(server)
+            val prefs = context.getSharedPreferences("restore-${UUID.randomUUID()}", Context.MODE_PRIVATE)
+            prefs.edit().putString("device", deviceId).commit()
+            val api = ApiSyncClient(context, database.dao(), allowInsecureHttp = true)
+            val client = WebdavSyncClient(context, database.dao(), prefs, api, allowInsecureHttp = true)
+            val settings = WebdavSettings(baseUrl = "http://127.0.0.1:${server.port}/dav/", username = "user", appPassword = "app-password", remotePath = "notebook_backup")
+            database.dao().put(NoteEntity(id = noteId, title = "Restored", body = "old body", previewText = "", dirty = true))
+            client.sync(settings)
+            val page = JsonObject().apply {
+                addProperty("id", noteId); addProperty("workspaceId", workspace); addProperty("kind", "document"); addProperty("title", "Restored")
+                addProperty("preview", "new body"); addProperty("favorite", false); addProperty("createdAt", "2026-10-01T00:00:00Z")
+                addProperty("updatedAt", "2026-10-05T00:00:00Z"); addProperty("syncStatus", "synced"); addProperty("sortOrder", 1000)
+            }
+            val document = JsonObject().apply {
+                addProperty("pageId", noteId); addProperty("schemaVersion", 3); addProperty("markdown", "new body"); addProperty("updatedAt", "2026-10-05T00:00:00Z")
+            }
+            val current = database.dao().apiVersion(api.versionKey(workspace, "page", noteId))?.version ?: 0L
+            dav.append(peerId, listOf(
+                record("delete", "page", "2026-10-04T00:00:00Z", current, JsonObject()),
+                record("upsert", "page", "2026-10-05T00:00:00Z", current + 1, page),
+                record("upsert", "document", "2026-10-05T00:00:00Z", current, document),
+            ))
+            client.sync(settings)
+            val note = database.dao().get(noteId)
+            assertNotNull("the restore after the delete must bring the note back", note)
+            assertEquals("new body", note!!.body.trim())
+        } finally {
+            database.close()
+            server.shutdown()
+        }
     }
 }

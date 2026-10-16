@@ -231,6 +231,7 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("DELETE FROM assets WHERE id=:id") suspend fun deleteAsset(id:String)
     @Query("SELECT * FROM tombstones") suspend fun tombstones():List<TombstoneEntity>
     @Query("SELECT * FROM tombstones WHERE itemKey=:itemKey") suspend fun tombstone(itemKey:String):TombstoneEntity?
+    @Query("DELETE FROM tombstones WHERE itemKey=:itemKey") suspend fun deleteTombstone(itemKey:String)
     @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putTombstone(item:TombstoneEntity)
     /** Commit the user's irreversible deletion and its outgoing operations together. */
     @Transaction suspend fun permanentlyDeleteNote(tombstone:TombstoneEntity,operations:List<ApiSyncOutboxEntity>){
