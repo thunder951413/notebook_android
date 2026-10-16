@@ -1,6 +1,7 @@
 package io.github.notebook.android
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
@@ -24,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
@@ -461,4 +463,44 @@ internal fun SearchTagShortcuts(tags: List<Pair<String, Int>>, onTag: (String) -
             }
         }
     }
+}
+
+/**
+ * Swipe an open todo to the left to complete it. The row is only swipeable
+ * while [enabled]; if saving fails the row springs back.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: suspend () -> Boolean, content: @Composable () -> Unit) {
+    if (!enabled) {
+        content()
+        return
+    }
+    val scope = rememberCoroutineScope()
+    lateinit var state: SwipeToDismissBoxState
+    state = rememberSwipeToDismissBoxState(
+        confirmValueChange = { value ->
+            if (value == SwipeToDismissBoxValue.EndToStart) {
+                scope.launch { if (!onComplete()) state.reset() }
+                true
+            } else false
+        },
+        positionalThreshold = { distance -> distance * .4f },
+    )
+    SwipeToDismissBox(
+        state,
+        modifier = Modifier.testTag("swipe-complete"),
+        enableDismissFromStartToEnd = false,
+        backgroundContent = {
+            Box(
+                Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.primaryContainer).padding(end = 20.dp),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                    Text("完成", Modifier.padding(start = 6.dp), color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Medium)
+                }
+            }
+        },
+    ) { content() }
 }

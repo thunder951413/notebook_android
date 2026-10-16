@@ -405,11 +405,21 @@ internal fun ReferenceHome(
             selecting = true
             selected = selected + note.id
         }
+        val complete: suspend () -> Boolean = {
+            runCatching { repo.loadNote(note.id)?.let { repo.save(it.copy(completedAt = System.currentTimeMillis())) } }
+                .onSuccess { onStatus("已完成「${note.title.ifBlank { "无标题待办" }}」") }
+                .onFailure { onStatus("操作失败：${it.localizedMessage}") }
+                .isSuccess
+        }
+        val swipeable = note.isOpenTodo() && !selecting
         if (compact)
-            Box(Modifier.onGloballyPositioned { coordinates[0] = it }) {
-                CompactNoteRow(note, preview, highlightTerms, isPinned, selecting, note.id in selected, path, click, longClick)
+            SwipeToCompleteRow(swipeable, complete) {
+                Box(Modifier.onGloballyPositioned { coordinates[0] = it }) {
+                    CompactNoteRow(note, preview, highlightTerms, isPinned, selecting, note.id in selected, path, click, longClick)
+                }
             }
         else
+          SwipeToCompleteRow(swipeable, complete) {
             ReferenceNoteCard(
                 note,
                 preview,
@@ -433,6 +443,7 @@ internal fun ReferenceHome(
                 },
                 pinned = isPinned,
             )
+          }
     }
     val title =
         folder?.name
