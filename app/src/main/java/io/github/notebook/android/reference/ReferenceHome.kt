@@ -653,6 +653,7 @@ internal fun ReferenceHome(
                                                 onSync()
                                             },
                                             enabled = !syncing,
+                                            leadingIcon = { Icon(Icons.Default.Sync, null) },
                                         )
                                         DropdownMenuItem(
                                             { Text("AI 助手") },

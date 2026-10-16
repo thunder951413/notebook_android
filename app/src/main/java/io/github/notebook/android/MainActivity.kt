@@ -201,7 +201,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         if(documentStack.isEmpty()){editing=null;activeDocumentId=null;startInEditMode=false}
         else {val previous=documentStack.removeAt(documentStack.lastIndex);scope.launch{val note=repo.loadNote(previous.first);editing=note?.takeIf{!repo.isEncrypted(it)||encryptedUnlocked};startInEditMode=previous.second}}
     }
-    var showSettings by remember{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
+    var showSettings by remember{mutableStateOf(false)};var syncNowRequest by remember{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
     var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)}
     var showAllFolders by remember{mutableStateOf(false)};var showAllTags by remember{mutableStateOf(false)}
     var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)};var pendingPrivateNoteId by remember{mutableStateOf<String?>(null)};var pendingPrivateStartInEditMode by remember{mutableStateOf(false)};var deviceCredentialInProgress by remember{mutableStateOf(false)}
@@ -345,7 +345,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         }
     }}
     if(showAi){io.github.notebook.android.ai.AiAssistantScreen(repo,aiNoteId,{markdown,modifier->MarkdownView(markdown,modifier)},onOpenNote={id->showAi=false;openNote(id)},onBack={showAi=false});return}
-    if(showSettings){ReferenceSettings(repo,{showSettings=false},{back->ServerSettings(repo,back)},{manage=it;showSettings=false});return}
+    if(showSettings){ReferenceSettings(repo,{showSettings=false;syncNowRequest=false},{back->ServerSettings(repo,back,syncNowRequest)},{manage=it;showSettings=false},startInSync=syncNowRequest);return}
     manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
 
     fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;scope.launch{drawer.close()}}
@@ -404,7 +404,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
                 val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday)
                 if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id)
                 repo.markUnsaved(draft.id);cardOrigin=null;startInEditMode=true;editing=draft
-            },onSelect={d,f,t->select(d,f,t)},onNavigation={scope.launch{drawer.open()}},onSettings={showSettings=true},onSync={runSync()},
+            },onSelect={d,f,t->select(d,f,t)},onNavigation={scope.launch{drawer.open()}},onSettings={showSettings=true},onSync={syncNowRequest=true;showSettings=true},
             onImport={textImporter.launch(io.github.notebook.android.data.TextImport.MIME_TYPES)},onAiAssistant={aiNoteId=null;showAi=true},onStatus={status=it},onCardBounds={cardOrigin=it},
             encryptedUnlocked=encryptedUnlocked,onCreateChild={id->cardOrigin=null;scope.launch{repo.loadNote(id)?.let{createChild(it)}}},onHierarchyOpen={cardOrigin=null;openNote(it)},
             tabletEditor=if(isTablet){{editing?.let{note->key(note.id){EditorPane(note,repo,surfaceFor(note.id),initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={openNote(it)},onNewChild={createChild(it)},onEditModeChanged={startInEditMode=it},onDone={closeDocument()})}}?:EmptyNotes("选择一篇笔记","在左侧打开笔记开始阅读")}}else null
@@ -989,7 +989,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 @Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit){
+@Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit,autoSync:Boolean=false){
     BackHandler(onBack=onBack)
     val context=LocalContext.current
     var backend by remember{mutableStateOf(repo.syncBackend())}
@@ -1014,6 +1014,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
             isError=true
         }finally{syncing=false}
     }
+    LaunchedEffect(autoSync){if(autoSync)syncNow()}
     fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
     val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{
         val type=runCatching{com.google.gson.JsonParser.parseString(payload).asJsonObject.get("type")?.asString}.getOrNull()

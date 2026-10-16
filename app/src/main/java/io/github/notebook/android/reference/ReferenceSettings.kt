@@ -21,15 +21,17 @@ internal fun ReferenceSettings(
     onBack: () -> Unit,
     onSyncSettings: @Composable (() -> Unit) -> Unit,
     onManage: (String) -> Unit,
+    startInSync: Boolean = false,
 ) {
-    var sync by remember { mutableStateOf(false) }
+    var sync by remember { mutableStateOf(startInSync) }
     var about by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("editor_preferences", 0) }
     var autoKeyboard by remember { mutableStateOf(preferences.getBoolean("autoKeyboard", true)) }
     var quickCreate by remember { mutableStateOf(preferences.getBoolean("quickCreate", true)) }
     if (sync) {
-        onSyncSettings { sync = false }
+        // Opened straight from the menu's 立即同步: back leaves settings entirely.
+        onSyncSettings { if (startInSync) onBack() else sync = false }
         return
     }
     BackHandler(onBack = onBack)
