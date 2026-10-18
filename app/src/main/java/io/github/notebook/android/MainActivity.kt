@@ -1059,7 +1059,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                     Button({runCatching{repo.saveWebdavSettings(w)}.onSuccess{backend=SyncBackend.WEBDAV;scope.launch{syncNow()}}.onFailure{message=it.localizedMessage?:"同步配置保存失败，请重试";isError=true}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
                 }
                 SyncHealthCard(repo,syncing,message){kind->scope.launch{
-                    runCatching{if(kind=="reread")repo.resetSyncReadPositions() else repo.republishAll()}
+                    runCatching{when(kind){"reread"->repo.resetSyncReadPositions();"republish"->repo.republishAll();else->Unit}}
                         .onSuccess{syncNow()}
                         .onFailure{message="修复失败：${it.localizedMessage?:it.javaClass.simpleName}";isError=true}
                 }}
@@ -1115,6 +1115,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
     var confirm by remember{mutableStateOf<String?>(null)}
     var issues by remember{mutableStateOf<io.github.notebook.android.sync.WebdavSyncIssues?>(null)}
     var confirmDismiss by remember{mutableStateOf(false)}
+    var confirmRebuild by remember{mutableStateOf(false)}
     val healthScope=rememberCoroutineScope()
     LaunchedEffect(syncing,refreshKey){if(!syncing){pending=runCatching{repo.pendingUploadCount()}.getOrNull();copies=runCatching{repo.conflictCopyCount()}.getOrNull();issues=runCatching{repo.syncIssues()}.getOrNull()}}
     val last=repo.lastSyncSuccessAt()
@@ -1131,7 +1132,9 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
         issues?.takeUnless{it.isEmpty}?.let{found->
             HorizontalDivider()
             Text("需要处理的同步问题",fontWeight=FontWeight.SemiBold,color=MaterialTheme.colorScheme.error)
-            found.blocked.forEach{Text("设备 ${it.deviceId.take(8)}：${when(it.code){io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_CORRUPT->"日志含有无法解析的记录";io.github.notebook.android.sync.WebdavBlockCode.HEAD_CORRUPT->"提交标记损坏";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TRUNCATED->"日志被截断，部分记录丢失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_MISSING->"日志文件缺失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TOO_LARGE->"日志超过 100 MB"}}。其余设备的同步不受影响。",style=MaterialTheme.typography.bodySmall)}
+            val ownBlocked=found.blocked.any{it.deviceId==repo.ownDeviceId()}
+            found.blocked.forEach{Text((if(it.deviceId==repo.ownDeviceId())"本机" else "设备 ${it.deviceId.take(8)}")+"：${when(it.code){io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_CORRUPT->"日志含有无法解析的记录";io.github.notebook.android.sync.WebdavBlockCode.HEAD_CORRUPT->"提交标记损坏";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TRUNCATED->"日志被截断，部分记录丢失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_MISSING->"日志文件缺失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TOO_LARGE->"日志超过 100 MB"}}。"+(if(it.deviceId==repo.ownDeviceId())"新的修改暂时无法上传，请选择“重建本机日志”。" else "其余设备的同步不受影响；请在那台设备上选择“重建本机日志”。"),style=MaterialTheme.typography.bodySmall)}
+            if(ownBlocked)Button({confirmRebuild=true},Modifier.fillMaxWidth(),enabled=!syncing){Text("重建本机日志")}
             found.quarantined.groupBy{it.reason}.forEach{(reason,rows)->Text("${rows.size} 条：${when(reason){"needs-key"->"需要隐私同步密钥，填写后会自动读取";"bad-key"->"隐私同步密钥不匹配，请确认各设备使用同一密钥";"unknown-type"->"来自更新版本的记录，升级应用后会自动读取";"missing-object"->"云端文件缺失，请在产生该内容的设备上“重新上传本机”后重试";"object-corrupt"->"云端文件已损坏，请在产生该内容的设备上“重新上传本机”后重试";"workspace-mismatch"->"属于其他工作区，可以删除";else->"记录内容不正确，升级应用后会重试一次"}}",style=MaterialTheme.typography.bodySmall)}
             if(found.quarantined.isNotEmpty())Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                 OutlinedButton({healthScope.launch{runCatching{repo.retrySyncIssues()};issues=runCatching{repo.syncIssues()}.getOrNull()}},Modifier.weight(1f),enabled=!syncing){Text("重试异常记录",maxLines=1)}
@@ -1139,6 +1142,10 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
             }
         }
     }}
+    if(confirmRebuild)AlertDialog(onDismissRequest={confirmRebuild=false},title={Text("重建本机日志？")},
+        text={Text("本机在云端的同步日志已损坏，所以无法上传新的修改。重建会保留一份损坏文件的副本（同目录下以 .corrupt 结尾），移除损坏的日志，再把本机全部内容重新上传；序号会接着原来的继续，其他设备已读取的内容不会重复或丢失。本机笔记不会改动。")},
+        confirmButton={Button({confirmRebuild=false;healthScope.launch{runCatching{repo.rebuildOwnJournal()}.onSuccess{onRepair("rebuilt")}.onFailure{issues=runCatching{repo.syncIssues()}.getOrNull()};issues=runCatching{repo.syncIssues()}.getOrNull()}}){Text("重建并重新上传")}},
+        dismissButton={TextButton({confirmRebuild=false}){Text("取消")}})
     if(confirmDismiss)AlertDialog(onDismissRequest={confirmDismiss=false},title={Text("删除异常记录？")},
         text={Text("这些云端记录将不再尝试读取，本机内容不受影响；其他设备上的原始记录不会被删除。此操作无法撤销。")},
         confirmButton={Button({confirmDismiss=false;healthScope.launch{runCatching{repo.dismissSyncIssues()};issues=runCatching{repo.syncIssues()}.getOrNull()}}){Text("删除")}},

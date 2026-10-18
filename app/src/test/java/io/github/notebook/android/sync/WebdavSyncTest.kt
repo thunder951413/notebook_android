@@ -55,6 +55,7 @@ private class FakeWebdavServer(private val server: MockWebServer) {
                         files[path] = request.body.readByteArray()
                         return MockResponse().setResponseCode(201)
                     }
+                    "DELETE" -> return MockResponse().setResponseCode(if (files.remove(path) != null) 204 else 404)
                     "GET" -> {
                         gets.add(path)
                         val data = files[path] ?: return MockResponse().setResponseCode(404)
@@ -324,6 +325,31 @@ class WebdavSyncTest {
         assertNull(database.dao().getAsset("../escape"))
         assertEquals("Restored page",database.dao().get(noteId)!!.title)
         assertEquals(listOf(QuarantineReason.INVALID_PAYLOAD),client.issues(settings()).quarantined.map{it.reason})
+    }
+
+    @Test fun `a damaged own journal stops publishing, and rebuilding keeps a copy and continues above the old sequence`() = runBlocking {
+        val body=remoteEntry(1,"page",noteId,remotePage())+"\n"+remoteEntry(2,"tag","t1",JsonObject().apply{addProperty("id","t1");addProperty("name","tag");addProperty("color","gray");addProperty("updatedAt","2026-08-04T00:00:00Z")})+"\n"
+        webdav.putJournal(deviceId,listOf(remoteEntry(1,"page",noteId,remotePage()),remoteEntry(2,"tag","t1",JsonObject().apply{addProperty("id","t1")}),"{truncated record"))
+        webdav.putHead(deviceId,body.toByteArray().size,WebdavJournalProtocol.sha256(body.toByteArray()),5)
+        val damaged=webdav.files["notebook_backup/journal/$deviceId.jsonl"]!!.copyOf()
+
+        val failure=runCatching{client.sync(settings())}.exceptionOrNull()
+        assertEquals(OWN_JOURNAL_DAMAGED_MESSAGE,failure?.message)
+        assertEquals(WebdavBlockCode.JOURNAL_CORRUPT,client.issues(settings()).blocked.single().code)
+
+        val outcome=client.rebuildOwnJournal(settings())
+        assertEquals(5L,outcome.floorSeq)
+        assertArrayEquals(damaged,webdav.files[requireNotNull(outcome.backup)])
+        assertNull(webdav.files["notebook_backup/journal/$deviceId.jsonl"])
+        assertNull(webdav.files["notebook_backup/journal/$deviceId.head.json"])
+
+        // Writing again continues above the floor, so readers that consumed up to 5 see the new rows.
+        database.dao().put(note())
+        client.sync(settings())
+        val rows=WebdavJournalProtocol.parseJournal(webdav.journalText(deviceId)!!)
+        assertTrue(rows.isNotEmpty())
+        assertTrue("sequence numbers must stay above the floor: ${rows.map{it.seq}}",rows.all{it.seq>5})
+        assertTrue(client.issues(settings()).blocked.isEmpty())
     }
 
     @Test fun `a broken peer journal is isolated and the healthy peer keeps syncing`() = runBlocking {

@@ -276,6 +276,28 @@ internal object WebdavProtocolRules {
         return DeviceAssessment(view.known, view.reset, view.mismatch, if (view.truncated) WebdavBlockCode.JOURNAL_TRUNCATED else null, view.journalLastSeq, view.seqs, entries)
     }
 
+    /** Where a damaged journal is kept when it is rebuilt (never matched by a listing). */
+    fun corruptBackupPath(path: String, stampMs: Long) = "$path.corrupt-$stampMs"
+
+    private val integerText = Regex("^\\d+$")
+    private fun com.google.gson.JsonElement?.integerOrNull(): Long? =
+        this?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber && integerText.matches(it.asString) }?.let { runCatching { it.asLong }.getOrNull() }
+
+    /**
+     * The highest sequence number a damaged own journal and its marker still
+     * vouch for (fixture: journal-rebuild.json). A rebuilt journal must
+     * continue above it: other devices have already consumed everything up to
+     * there. Both inputs are read leniently, since they are exactly the files
+     * that failed strict parsing. Only integer values count.
+     */
+    fun rebuildFloor(journalText: String?, headText: String?): Long {
+        val fromHead = headText?.let { runCatching { JsonParser.parseString(it).asJsonObject["lastSeq"].integerOrNull() }.getOrNull() } ?: 0L
+        val fromRows = journalText?.split('\n')?.mapNotNull { line ->
+            runCatching { JsonParser.parseString(line.trim()).asJsonObject["seq"].integerOrNull() }.getOrNull()
+        }?.maxOrNull() ?: 0L
+        return maxOf(fromHead, fromRows)
+    }
+
     /** Devices are replayed in code point order of their id, records by seq (fixture: pull-order.json). */
     fun <T> pullOrder(items: List<T>, deviceId: (T) -> String, seq: (T) -> Long): List<T> =
         items.sortedWith(compareBy<T, String>(naturalOrder()) { deviceId(it) }.thenBy { seq(it) })
@@ -290,6 +312,10 @@ internal fun webdavDeviceId(prefs: SharedPreferences): String =
  * ApiSync outbox/version tables so switching backends never loses queued
  * changes. Payload shapes match the /v1/sync API contract.
  */
+internal data class RebuildOutcome(val backup: String?, val floorSeq: Long, val republished: Int)
+
+internal const val OWN_JOURNAL_DAMAGED_MESSAGE = "本机在云端的同步日志已损坏，暂时无法上传。请在 同步设置 → 同步状态与修复 中选择“重建本机日志”。"
+
 /** What still needs attention after a sync that otherwise succeeded. */
 internal data class WebdavSyncIssues(val quarantined: List<QuarantinedRecord>, val blocked: List<WebdavBlockedDevice>) {
     val isEmpty get() = quarantined.isEmpty() && blocked.isEmpty()
@@ -367,6 +393,10 @@ class WebdavSyncClient(
             val deviceIds = pull(settings, client, budget)
             val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
             val ownId = webdavDeviceId(prefs)
+            // Nothing can be published while this device's own journal is damaged:
+            // appending to it would fail (or, if truncated, could reuse sequence
+            // numbers other devices already consumed). Say so instead of retrying.
+            if (lastBlocked.any { it.deviceId == ownId && it.code != WebdavBlockCode.JOURNAL_MISSING }) throw IllegalStateException(OWN_JOURNAL_DAMAGED_MESSAGE)
             val ownSeq = knownSeqs(settings)[ownId] ?: 0L
             if (deviceIds.isEmpty() || (ownId !in deviceIds && ownSeq > 0)) {
                 // Empty folder, or this device's journal was deleted remotely:
@@ -399,6 +429,44 @@ class WebdavSyncClient(
     suspend fun resetReadPositions(settings: WebdavSettings) = withContext(Dispatchers.IO) {
         prefs.edit().remove(knownSeqsKey(settings)).commit()
         dao.deleteApiCursorsWithPrefix(seqRowPrefix(settings))
+    }
+
+    /**
+     * Repair for a device whose own journal can no longer be read or appended
+     * to: keep copies of the damaged journal and marker, remove the live files
+     * (journal first), and continue numbering above everything other devices
+     * consumed. The whole library is queued for publication again. Nothing is
+     * deleted unless its copy was stored first.
+     */
+    internal suspend fun rebuildOwnJournal(settings: WebdavSettings): RebuildOutcome = withContext(Dispatchers.IO) {
+        validate(settings)
+        val client = client(settings)
+        val ownId = webdavDeviceId(prefs)
+        val journalPath = client.journalPath(ownId)
+        val headPath = client.journalHeadPath(ownId)
+        val journal = client.getBytes(journalPath, WebdavJournalProtocol.MAX_LOG_BYTES)
+        val head = client.getBytes(headPath, WebdavJournalProtocol.MAX_HEAD_BYTES * 2)
+        val floor = WebdavProtocolRules.rebuildFloor(journal?.toString(Charsets.UTF_8), head?.toString(Charsets.UTF_8))
+        val stamp = System.currentTimeMillis()
+        var backup: String? = null
+        if (journal != null) {
+            backup = WebdavProtocolRules.corruptBackupPath(journalPath, stamp)
+            client.putBytes(backup, journal)
+        }
+        if (head != null) client.putBytes(WebdavProtocolRules.corruptBackupPath(headPath, stamp), head)
+        // Journal first: a marker without a journal is reported as missing,
+        // while a journal without a marker would be read as a legacy one.
+        client.delete(journalPath)
+        client.delete(headPath)
+        // The floor outlives the removed files: sequence numbers must never
+        // move backwards, so it joins this device's own read position.
+        val seqs = knownSeqs(settings)
+        seqs[ownId] = maxOf(seqs[ownId] ?: 0L, floor)
+        saveKnownSeqs(settings, seqs)
+        lastBlocked = lastBlocked.filterNot { it.deviceId == ownId }
+        val republished = queueFullRepublish(settings)
+        DiagnosticLogger.log(DiagnosticLevel.WARN, DiagnosticEvent.SYNC_REPUBLISH, counts = mapOf("queued" to republished.toLong(), "previousSeq" to floor))
+        RebuildOutcome(backup, floor, republished)
     }
 
     /** Repair: queue the whole library (and private data when a key is set) for publication. */

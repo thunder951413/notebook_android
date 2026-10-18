@@ -286,6 +286,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     /** Set-aside remote records and devices whose journal could not be trusted (WebDAV). */
     internal suspend fun syncIssues():WebdavSyncIssues=withContext(Dispatchers.IO){webdavSync.issues(webdavSettings())}
+    internal fun ownDeviceId():String=webdavDeviceId(prefs)
+    /** Repair: keep a copy of this device's damaged journal, remove it and queue everything for publication again. */
+    internal suspend fun rebuildOwnJournal():RebuildOutcome=syncMutex.withLock{webdavSync.rebuildOwnJournal(webdavSettings())}
     /** Try the set-aside records again; returns how many remain. */
     suspend fun retrySyncIssues():Int=syncMutex.withLock{webdavSync.retryQuarantine(webdavSettings())}
     /** Drop the set-aside records for good (the user confirmed). */

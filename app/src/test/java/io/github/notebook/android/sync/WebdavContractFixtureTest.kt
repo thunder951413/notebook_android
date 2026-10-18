@@ -26,7 +26,7 @@ class WebdavContractFixtureTest {
     companion object {
         val NAMES = listOf(
             "base-url.json", "committed-view.json", "conflict.json", "journal-compact.json", "journal-head.json",
-            "journal-parse.json", "layout.json", "privacy-envelope.json", "propfind-listing.json", "pull-isolation.json", "pull-order.json", "remote-path.json",
+            "journal-parse.json", "journal-rebuild.json", "layout.json", "privacy-envelope.json", "propfind-listing.json", "pull-isolation.json", "pull-order.json", "remote-path.json",
         )
 
         fun fixtureText(name: String): String =
@@ -176,6 +176,14 @@ class WebdavContractFixtureTest {
             assertEquals(case.label(), expected["blocked"].takeUnless { it.isJsonNull }?.asString, assessment.blocked?.code)
             assertEquals(case.label(), expected.getAsJsonArray("seqs").longs(), assessment.seqs)
             assertEquals(case.label(), expected["reset"].asBoolean, plan.reset || assessment.reset)
+        }
+    }
+
+    @Test fun `journal-rebuild`() {
+        for (case in fixture("journal-rebuild.json").cases()) {
+            val journal = case["journalText"].takeUnless { it.isJsonNull }?.asString
+            val head = case["headText"].takeUnless { it.isJsonNull }?.asString
+            assertEquals(case.label(), case["expectedFloor"].asLong, WebdavProtocolRules.rebuildFloor(journal, head))
         }
     }
 

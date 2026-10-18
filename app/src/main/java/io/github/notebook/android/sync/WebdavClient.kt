@@ -142,6 +142,15 @@ class WebdavClient(
         request("PUT", path, body).use { it.requireStatus("上传 $path 失败") }
     }
 
+    fun putBytes(path: String, bytes: ByteArray) {
+        request("PUT", path, bytes.toRequestBody("application/octet-stream".toMediaType())).use { it.requireStatus("上传 $path 失败") }
+    }
+
+    /** DELETE; a resource that is already gone counts as deleted. */
+    fun delete(path: String) {
+        request("DELETE", path).use { if (it.code != 404 && !it.isSuccessful) throw fail(it, "删除 $path 失败") }
+    }
+
     fun putObject(hash: String, bytes: ByteArray) {
         WebdavJournalProtocol.requireHash(hash)
         if (hash in knownObjects) return
