@@ -54,7 +54,10 @@ class ProtocolTest {
 
     @Test fun `webdav journal rejects a traversal asset before it can be applied`() {
         val line = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"asset","id":"../escape","ver":0,"payload":{"pageId":"page-1","filename":"x.bin"}}"""
-        assertThrows(IllegalArgumentException::class.java) { WebdavJournalProtocol.parseJournal(line) }
+        // The journal parses (so one bad record cannot hide the others), but the
+        // record's identity check refuses it before any apply step.
+        val entry = WebdavJournalProtocol.parseJournal(line).single()
+        assertThrows(IllegalArgumentException::class.java) { SyncEntityIdentityContract.requireChange(entry.type, entry.id, entry.payload) }
     }
 
     @Test fun `legacy ssh private assets stay dirty and their known manifest entries are removed`() {

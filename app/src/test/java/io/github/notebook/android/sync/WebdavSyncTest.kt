@@ -271,15 +271,79 @@ class WebdavSyncTest {
         assertEquals("PRIVATE TITLE",WebdavPrivacyCipher(configuration.syncPassword).decryptPayload(page.type,page.id,page.payload)["title"].asString)
     }
 
-    @Test fun `wrong private key does not import entities or advance journal cursor`() = runBlocking {
+    @Test fun `wrong private key sets the record aside without importing it, and the right key brings it in`() = runBlocking {
         val encrypted=WebdavPrivacyCipher("correct-key").encryptPayload("page",noteId,remotePage().apply{addProperty("locked",true)})
         val peer="30000000-0000-4000-8000-000000000019"
         webdav.putJournal(peer,listOf(remoteEntry(1,"page",noteId,encrypted)))
-        assertTrue(runCatching{client.sync(settings().copy(syncPassword="wrong-key"))}.isFailure)
+        // The sync itself succeeds: one unreadable private record must not stop the library.
+        client.sync(settings().copy(syncPassword="wrong-key"))
         assertNull(database.dao().get(noteId))
+        val waiting=client.issues(settings()).quarantined
+        assertEquals(listOf(QuarantineReason.BAD_KEY),waiting.map{it.reason})
+        // Fixing the key is enough: the next sync retries the record by itself.
         client.sync(settings().copy(syncPassword="correct-key"))
         assertFalse(database.dao().get(noteId)!!.conflict)
         assertTrue(prefs.getString("encryptedNoteIds","")!!.contains(noteId))
+        assertTrue(client.issues(settings()).isEmpty)
+    }
+
+    @Test fun `no key keeps private records waiting while public records still sync`() = runBlocking {
+        val peer="30000000-0000-4000-8000-000000000029"
+        val publicId="20000000-0000-4000-8000-0000000000aa"
+        val sealed=WebdavPrivacyCipher("some-key").encryptPayload("page",noteId,remotePage().apply{addProperty("locked",true)})
+        val open=remotePage().apply{addProperty("id",publicId);addProperty("title","Open page")}
+        webdav.putJournal(peer,listOf(remoteEntry(1,"page",noteId,sealed),remoteEntry(2,"page",publicId,open)))
+        client.sync(settings())
+        assertEquals("Open page",database.dao().get(publicId)!!.title)
+        assertNull(database.dao().get(noteId))
+        assertEquals(listOf(QuarantineReason.NEEDS_KEY),client.issues(settings()).quarantined.map{it.reason})
+        client.sync(settings().copy(syncPassword="some-key"))
+        assertNotNull(database.dao().get(noteId))
+        assertTrue(client.issues(settings()).isEmpty)
+    }
+
+    @Test fun `a record of an unknown type is set aside and later records still apply`() = runBlocking {
+        val peer="30000000-0000-4000-8000-000000000039"
+        webdav.putJournal(peer,listOf(
+            remoteEntry(1,"hologram","h1",JsonObject().apply{addProperty("id","h1")}),
+            remoteEntry(2,"page",noteId,remotePage()),
+        ))
+        client.sync(settings())
+        println("DEBUG issues="+client.issues(settings()).quarantined.map{it.reason+":"+it.type+":"+it.message})
+        assertEquals("Restored page",database.dao().get(noteId)!!.title)
+        assertEquals(listOf(QuarantineReason.UNKNOWN_TYPE),client.issues(settings()).quarantined.map{it.reason})
+    }
+
+    @Test fun `a traversal asset id is set aside and never applied`() = runBlocking {
+        val peer="30000000-0000-4000-8000-000000000049"
+        webdav.putJournal(peer,listOf(
+            remoteEntry(1,"asset","../escape",JsonObject().apply{addProperty("pageId",noteId);addProperty("filename","x.bin")}),
+            remoteEntry(2,"page",noteId,remotePage()),
+        ))
+        client.sync(settings())
+        assertNull(database.dao().getAsset("../escape"))
+        assertEquals("Restored page",database.dao().get(noteId)!!.title)
+        assertEquals(listOf(QuarantineReason.INVALID_PAYLOAD),client.issues(settings()).quarantined.map{it.reason})
+    }
+
+    @Test fun `a broken peer journal is isolated and the healthy peer keeps syncing`() = runBlocking {
+        val healthy="30000000-0000-4000-8000-0000000000a1"
+        val corrupt="30000000-0000-4000-8000-0000000000a2"
+        val truncated="30000000-0000-4000-8000-0000000000a3"
+        val healthyBody=remoteEntry(1,"page",noteId,remotePage())+"\n"
+        webdav.putJournal(healthy,listOf(remoteEntry(1,"page",noteId,remotePage())))
+        webdav.putHead(healthy,healthyBody.toByteArray().size,WebdavJournalProtocol.sha256(healthyBody.toByteArray()),1)
+        webdav.putJournal(corrupt,listOf(remoteEntry(1,"page","20000000-0000-4000-8000-0000000000c1",remotePage().apply{addProperty("id","20000000-0000-4000-8000-0000000000c1")}),"{not json"))
+        val full=listOf(remoteEntry(1,"page","20000000-0000-4000-8000-0000000000d1",remotePage().apply{addProperty("id","20000000-0000-4000-8000-0000000000d1")}),remoteEntry(2,"page","20000000-0000-4000-8000-0000000000d2",remotePage().apply{addProperty("id","20000000-0000-4000-8000-0000000000d2")})).joinToString("\n")+"\n"
+        webdav.putJournal(truncated,listOf(remoteEntry(1,"page","20000000-0000-4000-8000-0000000000d1",remotePage().apply{addProperty("id","20000000-0000-4000-8000-0000000000d1")})))
+        webdav.putHead(truncated,full.toByteArray().size,WebdavJournalProtocol.sha256(full.toByteArray()),2)
+
+        client.sync(settings())
+
+        assertEquals("Restored page",database.dao().get(noteId)!!.title)
+        assertNull(database.dao().get("20000000-0000-4000-8000-0000000000c1"))
+        assertNotNull(database.dao().get("20000000-0000-4000-8000-0000000000d1"))
+        assertEquals(mapOf(corrupt to WebdavBlockCode.JOURNAL_CORRUPT,truncated to WebdavBlockCode.JOURNAL_TRUNCATED),client.issues(settings()).blocked.associate{it.deviceId to it.code})
     }
 
     @Test fun `private remote body and attachment decrypt and remain locked on repeated SQLite replay`() = runBlocking {

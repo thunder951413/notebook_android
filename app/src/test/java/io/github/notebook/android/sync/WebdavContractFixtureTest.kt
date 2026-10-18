@@ -26,7 +26,7 @@ class WebdavContractFixtureTest {
     companion object {
         val NAMES = listOf(
             "base-url.json", "committed-view.json", "conflict.json", "journal-compact.json", "journal-head.json",
-            "journal-parse.json", "layout.json", "privacy-envelope.json", "propfind-listing.json", "pull-order.json", "remote-path.json",
+            "journal-parse.json", "layout.json", "privacy-envelope.json", "propfind-listing.json", "pull-isolation.json", "pull-order.json", "remote-path.json",
         )
 
         fun fixtureText(name: String): String =
@@ -148,6 +148,34 @@ class WebdavContractFixtureTest {
             assertEquals(case.label(), expected.getAsJsonArray("seqs").longs(), view.seqs)
             assertEquals(case.label(), expected["reset"].asBoolean, plan.reset || view.reset)
             assertEquals(case.label(), expected["mismatch"].asBoolean, view.mismatch)
+        }
+    }
+
+    @Test fun `pull-isolation`() {
+        val value = fixture("pull-isolation.json")
+        val device = value["deviceId"].asString
+        for (case in value.cases()) {
+            val expected = case["expected"].asJsonObject
+            val headText = case["headText"].takeUnless { it.isJsonNull }?.asString
+            val head = try { headText?.let { WebdavJournalProtocol.parseHead(it, device) } } catch (error: Exception) {
+                assertEquals(case.label(), false, expected["fetch"].asBoolean)
+                assertEquals(case.label(), "head-corrupt", expected["blocked"].asString)
+                continue
+            }
+            val listed = case["listedBytes"].takeUnless { it.isJsonNull }?.asLong
+            val plan = WebdavProtocolRules.planJournalReadSized(head, case["known"].asLong, listed)
+            assertEquals(case.label(), expected["fetch"].asBoolean, plan.fetch)
+            if (!plan.fetch) {
+                assertTrue(case.label(), expected["blocked"].isJsonNull)
+                assertEquals(0, expected.getAsJsonArray("seqs").size())
+                assertEquals(case.label(), expected["reset"].asBoolean, plan.reset)
+                continue
+            }
+            val text = case["journalText"].takeUnless { it.isJsonNull }?.asString
+            val assessment = WebdavProtocolRules.assessJournal(text, head, plan.known)
+            assertEquals(case.label(), expected["blocked"].takeUnless { it.isJsonNull }?.asString, assessment.blocked?.code)
+            assertEquals(case.label(), expected.getAsJsonArray("seqs").longs(), assessment.seqs)
+            assertEquals(case.label(), expected["reset"].asBoolean, plan.reset || assessment.reset)
         }
     }
 

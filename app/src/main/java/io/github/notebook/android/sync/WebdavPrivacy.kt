@@ -21,7 +21,7 @@ internal class WebdavPrivacyCipher(private val secret:String) {
     private val salt=ByteArray(16).also(random::nextBytes)
     private val keys=mutableMapOf<String,SecretKeySpec>()
     private fun key(salt:ByteArray):SecretKeySpec {
-        require(secret.isNotEmpty()){ "请配置两端相同的隐私同步密钥" }
+        if(secret.isEmpty())throw WebdavPrivacyException(QuarantineReason.NEEDS_KEY,"请配置两端相同的隐私同步密钥")
         val name=Base64.getEncoder().encodeToString(salt)
         return keys[name]?:run {
             val spec=PBEKeySpec(secret.toCharArray(),salt,ITERATIONS,256)
@@ -50,7 +50,7 @@ internal class WebdavPrivacyCipher(private val secret:String) {
         return try{
             val cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,key,GCMParameterSpec(128,iv))
             cipher.updateAAD("notebook-webdav-private-v1\u0000$context".toByteArray(Charsets.UTF_8));cipher.doFinal(ciphertext)
-        }catch(error:java.security.GeneralSecurityException){throw IllegalArgumentException("隐私同步密钥不匹配或密文损坏；数据和同步位置已保留",error)}
+        }catch(error:java.security.GeneralSecurityException){throw WebdavPrivacyException(QuarantineReason.BAD_KEY,"隐私同步密钥不匹配或密文损坏；数据和同步位置已保留",error)}
     }
     fun encryptPayload(type:String,id:String,payload:JsonObject,operation:String="upsert",version:Long=0)=encrypt("$type:$id:$operation:$version",payload.toString().toByteArray(Charsets.UTF_8))
     fun decryptPayload(type:String,id:String,payload:JsonObject,operation:String="upsert",version:Long=0)=JsonParser.parseString(String(decrypt("$type:$id:$operation:$version",payload),Charsets.UTF_8)).asJsonObject

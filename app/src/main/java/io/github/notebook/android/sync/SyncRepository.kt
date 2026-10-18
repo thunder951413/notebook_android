@@ -273,6 +273,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
                 val copies=webdavSync.lastResolved.count{it.copyNoteId!=null}
                 if(copies>0)add("$copies 篇笔记在多台设备上同时被修改：已保留本机版本，另一版本另存为“冲突副本”")
                 if(webdavSync.lastRepublished>0)add("云端缺少本机记录，已自动重新上传全部内容")
+                val issues=webdavSync.issues(webdavSettings())
+                if(issues.quarantined.isNotEmpty())add("${issues.quarantined.size} 条云端记录暂时无法应用，详见同步状态")
+                if(issues.blocked.isNotEmpty())add("${issues.blocked.size} 台设备的云端日志异常，详见同步状态")
             }
         }
         val conflicts=dao.allNotes().count{it.conflict}
@@ -281,6 +284,12 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         if(pending>0)return (notices+"本批同步完成，仍有 $pending 条变更等待上传").joinToString("；")
         return (notices.ifEmpty{listOf("同步完成")}).joinToString("；")
     }
+    /** Set-aside remote records and devices whose journal could not be trusted (WebDAV). */
+    internal suspend fun syncIssues():WebdavSyncIssues=withContext(Dispatchers.IO){webdavSync.issues(webdavSettings())}
+    /** Try the set-aside records again; returns how many remain. */
+    suspend fun retrySyncIssues():Int=syncMutex.withLock{webdavSync.retryQuarantine(webdavSettings())}
+    /** Drop the set-aside records for good (the user confirmed). */
+    suspend fun dismissSyncIssues(){syncMutex.withLock{val s=webdavSettings();webdavSync.dismissQuarantine(s,webdavSync.issues(s).quarantined.map{it.key})}}
     fun lastSyncSuccessAt():Long?=prefs.getLong("lastSyncSuccessAt",0L).takeIf{it>0}
     /** True when a sync succeeded moments ago and nothing local is waiting to upload. */
     suspend fun shouldSkipRedundantSync():Boolean=withContext(Dispatchers.IO){

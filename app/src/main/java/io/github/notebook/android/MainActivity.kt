@@ -1113,7 +1113,10 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 @Composable private fun SyncHealthCard(repo:SyncRepository,syncing:Boolean,refreshKey:Any?,onRepair:(String)->Unit){
     var pending by remember{mutableStateOf<Int?>(null)};var copies by remember{mutableStateOf<Int?>(null)}
     var confirm by remember{mutableStateOf<String?>(null)}
-    LaunchedEffect(syncing,refreshKey){if(!syncing){pending=runCatching{repo.pendingUploadCount()}.getOrNull();copies=runCatching{repo.conflictCopyCount()}.getOrNull()}}
+    var issues by remember{mutableStateOf<io.github.notebook.android.sync.WebdavSyncIssues?>(null)}
+    var confirmDismiss by remember{mutableStateOf(false)}
+    val healthScope=rememberCoroutineScope()
+    LaunchedEffect(syncing,refreshKey){if(!syncing){pending=runCatching{repo.pendingUploadCount()}.getOrNull();copies=runCatching{repo.conflictCopyCount()}.getOrNull();issues=runCatching{repo.syncIssues()}.getOrNull()}}
     val last=repo.lastSyncSuccessAt()
     OutlinedCard(Modifier.fillMaxWidth()){Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(6.dp)){
         Text("同步状态与修复",fontWeight=FontWeight.SemiBold)
@@ -1125,7 +1128,21 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
             OutlinedButton({confirm="republish"},Modifier.weight(1f),enabled=!syncing){Text("重新上传本机",maxLines=1)}
         }
         Text("别的设备的修改没出现：重新读取云端。云端目录被清空或新设备缺笔记：重新上传本机。两者都不会删除内容，可以放心重复执行。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+        issues?.takeUnless{it.isEmpty}?.let{found->
+            HorizontalDivider()
+            Text("需要处理的同步问题",fontWeight=FontWeight.SemiBold,color=MaterialTheme.colorScheme.error)
+            found.blocked.forEach{Text("设备 ${it.deviceId.take(8)}：${when(it.code){io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_CORRUPT->"日志含有无法解析的记录";io.github.notebook.android.sync.WebdavBlockCode.HEAD_CORRUPT->"提交标记损坏";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TRUNCATED->"日志被截断，部分记录丢失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_MISSING->"日志文件缺失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TOO_LARGE->"日志超过 100 MB"}}。其余设备的同步不受影响。",style=MaterialTheme.typography.bodySmall)}
+            found.quarantined.groupBy{it.reason}.forEach{(reason,rows)->Text("${rows.size} 条：${when(reason){"needs-key"->"需要隐私同步密钥，填写后会自动读取";"bad-key"->"隐私同步密钥不匹配，请确认各设备使用同一密钥";"unknown-type"->"来自更新版本的记录，升级应用后会自动读取";"missing-object"->"云端文件缺失，请在产生该内容的设备上“重新上传本机”后重试";"object-corrupt"->"云端文件已损坏，请在产生该内容的设备上“重新上传本机”后重试";"workspace-mismatch"->"属于其他工作区，可以删除";else->"记录内容不正确，升级应用后会重试一次"}}",style=MaterialTheme.typography.bodySmall)}
+            if(found.quarantined.isNotEmpty())Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
+                OutlinedButton({healthScope.launch{runCatching{repo.retrySyncIssues()};issues=runCatching{repo.syncIssues()}.getOrNull()}},Modifier.weight(1f),enabled=!syncing){Text("重试异常记录",maxLines=1)}
+                OutlinedButton({confirmDismiss=true},Modifier.weight(1f),enabled=!syncing){Text("删除异常记录",maxLines=1)}
+            }
+        }
     }}
+    if(confirmDismiss)AlertDialog(onDismissRequest={confirmDismiss=false},title={Text("删除异常记录？")},
+        text={Text("这些云端记录将不再尝试读取，本机内容不受影响；其他设备上的原始记录不会被删除。此操作无法撤销。")},
+        confirmButton={Button({confirmDismiss=false;healthScope.launch{runCatching{repo.dismissSyncIssues()};issues=runCatching{repo.syncIssues()}.getOrNull()}}){Text("删除")}},
+        dismissButton={TextButton({confirmDismiss=false}){Text("取消")}})
     confirm?.let{kind->AlertDialog(onDismissRequest={confirm=null},
         title={Text(if(kind=="reread")"重新读取全部云端记录？" else "重新上传本机全部内容？")},
         text={Text(if(kind=="reread")"忽略本机记住的读取位置，从头核对坚果云上所有设备的记录。已有内容不会被删除或重复，记录多时会多用一些流量。" else "把本机所有笔记、附件和设置重新排队上传，作为当前版本的后续版本。其他设备会自动合并，不会产生重复笔记。")},

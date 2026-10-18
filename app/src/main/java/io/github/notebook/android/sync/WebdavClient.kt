@@ -241,6 +241,17 @@ class WebdavClient(
         listNames("$root/journal").filter { it.endsWith(".jsonl") }.map { it.removeSuffix(".jsonl") }
             .filter { WebdavJournalProtocol.validDeviceId(it) }
 
+    /** Journal device IDs plus the file sizes the server reports for them (one PROPFIND). */
+    internal fun listJournal(): WebdavJournalListing {
+        request("PROPFIND", "$root/journal", propfindBody, depth = "1").use { response ->
+            if (response.code == 404) return WebdavJournalListing(emptyList(), emptyMap())
+            if (!response.isSuccessful) throw fail(response, "读取远端目录 $root/journal 失败")
+            val items = parseWebdavListing(response.readPropfindBody("读取远端目录 $root/journal 失败"))
+                .mapNotNull { item -> webdavHrefBasename(item.href)?.takeIf { it.endsWith(".jsonl") }?.removeSuffix(".jsonl")?.takeIf(WebdavJournalProtocol::validDeviceId)?.let { it to item.size } }
+            return WebdavJournalListing(items.map { it.first }, items.mapNotNull { (name, size) -> size?.takeIf { it > 0 }?.let { name to it } }.toMap())
+        }
+    }
+
     private fun Response.readPropfindBody(context: String): String {
         val responseBody = body ?: throw IOException("$context：响应为空")
         val declaredLength = responseBody.contentLength()
@@ -271,7 +282,14 @@ private const val MAX_PROPFIND_DEPTH = 128
 private val FORBIDDEN_XML_DECLARATION = Regex("<!\\s*(?:DOCTYPE|ENTITY)\\b", RegexOption.IGNORE_CASE)
 
 /** Android's pull parser has no external resolver. Declarations are rejected before parsing. */
-internal fun parseWebdavHrefs(text: String): List<String> {
+internal data class WebdavJournalListing(val deviceIds: List<String>, val sizes: Map<String, Long>)
+
+/** One child of a PROPFIND listing: its href and `getcontentlength` when the server reports it. */
+internal data class WebdavListingItem(val href: String, val size: Long?)
+
+internal fun parseWebdavHrefs(text: String): List<String> = parseWebdavListing(text).map { it.href }
+
+internal fun parseWebdavListing(text: String): List<WebdavListingItem> {
     if (text.isBlank()) throw IOException("WebDAV 返回的目录 XML 为空")
     if (text.length > MAX_PROPFIND_CHARACTERS) throw IOException("WebDAV 返回的目录 XML 超过上限")
     if (FORBIDDEN_XML_DECLARATION.containsMatchIn(text)) {
@@ -284,6 +302,11 @@ internal fun parseWebdavHrefs(text: String): List<String> {
             setInput(StringReader(text))
         }
         val hrefs = mutableListOf<String>()
+        val items = mutableListOf<WebdavListingItem>()
+        var itemIndex = -1
+        var pendingSize: Long? = null
+        var sizeDepth = -1
+        var sizeText = StringBuilder()
         var hrefDepth = -1
         var href = StringBuilder()
         var openElements = 0
@@ -301,22 +324,39 @@ internal fun parseWebdavHrefs(text: String): List<String> {
                         }
                         rootSeen = true
                     }
+                    if (parser.name == "response") { itemIndex = -1; pendingSize = null }
                     if (parser.name == "href" && (parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
                         hrefDepth = parser.depth
                         href = StringBuilder()
                     }
-                }
-                XmlPullParser.TEXT -> if (hrefDepth >= 0) {
-                    if (href.length + parser.text.length > MAX_PROPFIND_HREF_CHARACTERS) {
-                        throw IOException("WebDAV 返回的 href 超过上限")
+                    if (parser.name == "getcontentlength" && (parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
+                        sizeDepth = parser.depth
+                        sizeText = StringBuilder()
                     }
-                    href.append(parser.text)
+                }
+                XmlPullParser.TEXT -> {
+                    if (hrefDepth >= 0) {
+                        if (href.length + parser.text.length > MAX_PROPFIND_HREF_CHARACTERS) {
+                            throw IOException("WebDAV 返回的 href 超过上限")
+                        }
+                        href.append(parser.text)
+                    }
+                    if (sizeDepth >= 0 && sizeText.length < 24) sizeText.append(parser.text)
                 }
                 XmlPullParser.END_TAG -> {
                     if (hrefDepth == parser.depth && parser.name == "href") {
-                        href.toString().trim().takeIf(String::isNotBlank)?.let(hrefs::add)
+                        href.toString().trim().takeIf(String::isNotBlank)?.let { value ->
+                            hrefs.add(value)
+                            items.add(WebdavListingItem(value, pendingSize))
+                            itemIndex = items.lastIndex
+                        }
                         if (hrefs.size > MAX_PROPFIND_HREFS) throw IOException("WebDAV 返回的 href 数量超过上限")
                         hrefDepth = -1
+                    }
+                    if (sizeDepth == parser.depth && parser.name == "getcontentlength") {
+                        val size = sizeText.toString().trim().toLongOrNull()?.takeIf { it >= 0 }
+                        if (itemIndex >= 0) items[itemIndex] = items[itemIndex].copy(size = size) else pendingSize = size
+                        sizeDepth = -1
                     }
                     openElements--
                 }
@@ -324,7 +364,7 @@ internal fun parseWebdavHrefs(text: String): List<String> {
             event = parser.next()
         }
         if (!rootSeen || openElements != 0 || hrefDepth >= 0) throw IOException("WebDAV 返回的目录 XML 格式无效")
-        return hrefs
+        return items
     } catch (error: IOException) {
         throw error
     } catch (error: XmlPullParserException) {

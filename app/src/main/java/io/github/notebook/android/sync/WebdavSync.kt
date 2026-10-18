@@ -19,6 +19,7 @@ import io.github.notebook.android.diagnostics.DiagnosticLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
 import java.time.Instant
@@ -148,7 +149,9 @@ internal object WebdavJournalProtocol {
             val id = root["id"]?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
                 .also { require(it.isNotBlank()) { "远端日志缺少实体 ID" } }
             val payload = root["payload"]?.takeIf { it.isJsonObject }?.asJsonObject ?: error("远端日志缺少内容")
-            SyncEntityIdentityContract.requireChange(type, id, payload)
+            // Entity identity (type, id, references) is checked per record when it
+            // is read for applying, so one bad record can be set aside instead
+            // of rejecting the whole journal.
             val seq = root["seq"]?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong ?: error("远端日志缺少序号")
             require(seq >= 0) { "远端日志序号不合法" }
             val ver = root["ver"]?.takeUnless { it.isJsonNull }?.let { value ->
@@ -173,7 +176,13 @@ internal object WebdavJournalProtocol {
 internal data class CompactedJournal(val entries: List<WebdavJournalEntry>, val stateEntries: Int, val historyEntries: Int)
 
 /** Records a reader exposes from one downloaded peer journal (fixture: committed-view.json). */
-internal data class CommittedView(val known: Long, val reset: Boolean, val mismatch: Boolean, val seqs: List<Long>)
+internal data class CommittedView(val known: Long, val reset: Boolean, val mismatch: Boolean, val seqs: List<Long>, val truncated: Boolean = false, val journalLastSeq: Long = 0L)
+
+/** What one fetched peer journal yields (fixture: pull-isolation.json). */
+internal data class DeviceAssessment(
+    val known: Long, val reset: Boolean, val mismatch: Boolean, val blocked: WebdavBlockCode?,
+    val journalLastSeq: Long, val seqs: List<Long>, val entries: List<WebdavJournalEntry>,
+)
 
 /** Decision taken before downloading a peer journal (fixture: committed-view.json). */
 internal data class JournalReadPlan(val known: Long, val reset: Boolean, val fetch: Boolean)
@@ -230,7 +239,41 @@ internal object WebdavProtocolRules {
         val bytes = text.toByteArray(Charsets.UTF_8)
         val mismatch = head != null && (bytes.size != head.journalBytes || !WebdavJournalProtocol.sha256(bytes).equals(head.journalSha256, ignoreCase = true))
         val seqs = entries.map { it.seq }.filter { it > cursor && it <= (head?.lastSeq ?: Long.MAX_VALUE) }
-        return CommittedView(cursor, reset, mismatch, seqs)
+        return CommittedView(cursor, reset, mismatch, seqs, truncated = head != null && journalLastSeq < head.lastSeq, journalLastSeq = journalLastSeq)
+    }
+
+    /**
+     * Like [planJournalRead], but a journal listed as shorter than the bytes the
+     * marker committed is fetched even when the cursor is at the marker: it is
+     * either mid-compaction or truncated, and only its last sequence tells which
+     * (fixture: pull-isolation.json).
+     */
+    fun planJournalReadSized(head: WebdavJournalHead?, known: Long, listedBytes: Long?): JournalReadPlan {
+        val plan = planJournalRead(head?.lastSeq, known)
+        val suspicious = !plan.fetch && head != null && listedBytes != null && listedBytes < head.journalBytes
+        return if (suspicious) plan.copy(fetch = true) else plan
+    }
+
+    /**
+     * Judges a downloaded journal body against its (already parsed) marker. A
+     * journal that fails to parse exposes nothing; a truncated one still
+     * exposes its complete committed rows but is reported so nobody trusts the
+     * gap. [text] is null when the file is gone.
+     */
+    fun assessJournal(text: String?, head: WebdavJournalHead?, known: Long): DeviceAssessment {
+        fun withoutRows(blocked: WebdavBlockCode?) = DeviceAssessment(known, false, false, blocked, 0L, emptyList(), emptyList())
+        // Gone between the listing and the read: only a problem when the marker
+        // committed records this reader has not seen yet.
+        if (text == null) return withoutRows(if (head != null && head.lastSeq > known) WebdavBlockCode.JOURNAL_MISSING else null)
+        if (text.toByteArray(Charsets.UTF_8).size > WebdavJournalProtocol.MAX_LOG_BYTES) return withoutRows(WebdavBlockCode.JOURNAL_TOO_LARGE)
+        val entries = try {
+            WebdavJournalProtocol.parseJournal(text)
+        } catch (error: Exception) {
+            if (error is IOException || error is kotlin.coroutines.cancellation.CancellationException) throw error
+            return withoutRows(WebdavBlockCode.JOURNAL_CORRUPT)
+        }
+        val view = committedView(entries, text, head, known)
+        return DeviceAssessment(view.known, view.reset, view.mismatch, if (view.truncated) WebdavBlockCode.JOURNAL_TRUNCATED else null, view.journalLastSeq, view.seqs, entries)
     }
 
     /** Devices are replayed in code point order of their id, records by seq (fixture: pull-order.json). */
@@ -247,6 +290,11 @@ internal fun webdavDeviceId(prefs: SharedPreferences): String =
  * ApiSync outbox/version tables so switching backends never loses queued
  * changes. Payload shapes match the /v1/sync API contract.
  */
+/** What still needs attention after a sync that otherwise succeeded. */
+internal data class WebdavSyncIssues(val quarantined: List<QuarantinedRecord>, val blocked: List<WebdavBlockedDevice>) {
+    val isEmpty get() = quarantined.isEmpty() && blocked.isEmpty()
+}
+
 /** A concurrent edit settled during the last sync: local kept, remote body copied when different. */
 data class ResolvedWebdavConflict(val entityType: String, val entityId: String, val pageId: String?, val copyNoteId: String?)
 
@@ -269,6 +317,9 @@ class WebdavSyncClient(
     @Volatile var lastRepublished: Int = 0
         private set
     private val resolved = mutableListOf<ResolvedWebdavConflict>()
+    /** Devices whose journal could not be trusted in the latest [sync]. */
+    @Volatile internal var lastBlocked: List<WebdavBlockedDevice> = emptyList()
+        private set
 
     fun fingerprint(settings: WebdavSettings) = "${settings.baseUrl.trim()}|${settings.username.trim()}|${settings.remotePath.trim()}"
 
@@ -301,6 +352,7 @@ class WebdavSyncClient(
             resolved.clear()
             lastResolved = emptyList()
             lastRepublished = 0
+            lastBlocked = emptyList()
             privacyCipher=WebdavPrivacyCipher(settings.syncPassword)
             if(settings.syncPassword.isNotEmpty()) queuePrivateSnapshot(settings)
             val budget = RemoteTransferLimits.Budget()
@@ -309,6 +361,9 @@ class WebdavSyncClient(
             // the full local library (equivalent to the desktop migration).
             val client = client(settings)
             onProgress("正在读取云端更改…")
+            // Records set aside earlier may be readable now (key configured, app
+            // upgraded, object re-uploaded). A failure here must not stop the sync.
+            runCatching { retryQuarantine(settings, automatic = true) }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
             val deviceIds = pull(settings, client, budget)
             val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
             val ownId = webdavDeviceId(prefs)
@@ -377,25 +432,40 @@ class WebdavSyncClient(
 
     private suspend fun pull(settings: WebdavSettings, client: WebdavClient, budget: RemoteTransferLimits.Budget): List<String> {
         client.ensureDirectory("${settings.remotePath.trim()}/journal")
-        val deviceIds = WebdavProtocolRules.pullOrder(client.listJournalNames(), { it }, { 0L })
+        val listing = client.listJournal()
+        val deviceIds = WebdavProtocolRules.pullOrder(listing.deviceIds, { it }, { 0L })
         val seqs = knownSeqs(settings)
         val journals=mutableListOf<JournalReplay>()
         val bootstrap=seqs.isEmpty() && dao.allNotes().isEmpty()
         val ownId=webdavDeviceId(prefs)
+        val blocked = mutableListOf<WebdavBlockedDevice>()
+        val setAside = mutableListOf<QuarantinedRecord>()
         // Records applied beyond a cursor that is held back (by a record still
         // waiting for its note) must not be replayed as if they were new: a
         // replay of an old body over a newer local edit would look like a conflict.
         val appliedKey="webdav-applied:${fingerprint(settings)}"
         val appliedBeyond=runCatching{JsonParser.parseString(prefs.getString(appliedKey,"{}")).asJsonObject}.getOrDefault(JsonObject())
             .entrySet().associate{(device,values)->device to (runCatching{values.asJsonArray.map{it.asLong}.toSet()}.getOrDefault(emptySet()))}
+        // Only the failure of one device's *data* is isolated. Network and
+        // authentication errors (IOException) still fail the pull: they say
+        // nothing about that device and hiding them would make every device
+        // look healthy.
         for (deviceId in deviceIds) {
             var known = seqs[deviceId] ?: 0L
-            val head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
-                ?.let { WebdavJournalProtocol.parseHead(it, deviceId) }
+            var head: WebdavJournalHead? = null
+            try {
+                head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
+                    ?.let { WebdavJournalProtocol.parseHead(it, deviceId) }
+            } catch (error: Exception) {
+                if (error is IOException || error is kotlin.coroutines.cancellation.CancellationException) throw error
+                blocked.add(WebdavBlockedDevice(deviceId, WebdavBlockCode.HEAD_CORRUPT, error.message.orEmpty(), known))
+                continue
+            }
             // A marker behind our cursor means the journal was deleted and
             // recreated; skipping it would hide every new record. A marker at
-            // or below the cursor means there is nothing new to download.
-            val plan = WebdavProtocolRules.planJournalRead(head?.lastSeq, known)
+            // or below the cursor means there is nothing new to download,
+            // unless the listed size says the journal is shorter than committed.
+            val plan = WebdavProtocolRules.planJournalReadSized(head, known, listing.sizes[deviceId])
             if (plan.reset) {
                 DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_REPOSITORY_RESET,resourceId=deviceId,counts=mapOf("known" to known,"remote" to (head?.lastSeq ?: 0L)))
                 known = 0L
@@ -403,36 +473,52 @@ class WebdavSyncClient(
             }
             if (!plan.fetch) continue
             // No head is a legacy v4 journal; retain its full-read compatibility.
-            val text = client.getText(client.journalPath(deviceId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES) ?: continue
-            val journalBytes=utf8Size(text).toLong()
-            budget.consume(journalBytes,journalBytes)
-            val entries = WebdavJournalProtocol.parseJournal(text)
-            val view = WebdavProtocolRules.committedView(entries, text, head, known)
-            if (view.reset) {
+            val text = client.getText(client.journalPath(deviceId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES)
+            if (text != null) {
+                val journalBytes=utf8Size(text).toLong()
+                budget.consume(journalBytes,journalBytes)
+            }
+            val assessment = WebdavProtocolRules.assessJournal(text, head, known)
+            if (assessment.reset) {
                 known = 0L
                 seqs[deviceId] = 0L
             }
-            val visible = view.seqs.toHashSet()
+            assessment.blocked?.let { code ->
+                val message = when (code) {
+                    WebdavBlockCode.JOURNAL_CORRUPT -> "远端日志 $deviceId.jsonl 含有无法解析的记录"
+                    WebdavBlockCode.JOURNAL_TRUNCATED -> "远端日志 $deviceId.jsonl 被截断（日志序号 ${assessment.journalLastSeq}，提交标记 ${head?.lastSeq ?: 0}）"
+                    WebdavBlockCode.JOURNAL_MISSING -> "远端日志 $deviceId.jsonl 不存在，但提交标记指向序号 ${head?.lastSeq ?: 0}"
+                    WebdavBlockCode.JOURNAL_TOO_LARGE -> "远端日志 $deviceId.jsonl 超过 100 MB 上限"
+                    WebdavBlockCode.HEAD_CORRUPT -> ""
+                }
+                blocked.add(WebdavBlockedDevice(deviceId, code, message, known, head?.lastSeq, if (code == WebdavBlockCode.JOURNAL_TRUNCATED) assessment.journalLastSeq else null))
+            }
+            val entries = assessment.entries
+            val visible = assessment.seqs.toHashSet()
+            if (visible.isEmpty()) continue
             // A journal whose marker PUT failed (or an old writer without
             // markers) still contains only complete JSON rows. Expose the
             // committed sequence range instead of blocking every device until
             // the writer comes back; its unacknowledged rows are republished.
-            
+
             val alreadyApplied=appliedBeyond[deviceId].orEmpty()
+            val quarantinedSeqs = mutableSetOf<Long>()
             val decoded=entries.filter { it.seq in visible }.map { entry ->
                 if(entry.seq in alreadyApplied)return@map entry
-                var payload=entry.payload
-                payload[WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER]?.takeIf{it.isJsonPrimitive}?.asString?.let { marker ->
-                    val hash=WebdavJournalProtocol.requireHash(marker)
-                    payload=JsonParser.parseString(String(downloadObjectBytes(client,hash,budget),Charsets.UTF_8)).asJsonObject
+                try {
+                    decodeEntry(client, entry, budget)
+                } catch (error: Exception) {
+                    // A record that cannot be read (object gone, no key, damaged)
+                    // is set aside with its position instead of failing the
+                    // sync; everything else in the journal still applies.
+                    val failure = classifyMaterializeFailure(error) ?: throw error
+                    setAside.add(quarantinedRecord(deviceId, entry, failure))
+                    quarantinedSeqs.add(entry.seq)
+                    entry
                 }
-                val encrypted=WebdavPrivacyCipher.isEncrypted(payload)
-                if(encrypted)payload=privacyCipher.decryptPayload(entry.type,entry.id,payload,entry.op,entry.ver)
-                SyncEntityIdentityContract.requireChange(entry.type,entry.id,payload)
-                entry.copy(payload=payload,encrypted=encrypted)
             }
             journals.add(JournalReplay(deviceId,decoded,deviceId==ownId).apply{
-                decoded.forEachIndexed{index,entry->if(entry.seq in alreadyApplied)applied[index]=true}
+                decoded.forEachIndexed{index,entry->if(entry.seq in alreadyApplied || entry.seq in quarantinedSeqs)applied[index]=true}
             })
         }
         val bootstrapParents=if(bootstrap)journals.flatMap{it.entries}.groupBy{it.type to it.id}.mapValues{(_,rows)->rows.maxOf{it.ver}} else emptyMap()
@@ -457,7 +543,7 @@ class WebdavSyncClient(
                         blockedEntities.add(entity)
                         continue
                     }
-                    if(!applyJournalEntry(client,entry,budget,journal.own)) {
+                    if(!applyIsolated(client,entry,budget,journal.own,journal.deviceId,setAside)) {
                         journal.limit=index
                         break
                     }
@@ -481,7 +567,7 @@ class WebdavSyncClient(
                 if(entry.type!="page" || entry.op!="upsert" || entry.id !in missingParents || dao.getNoteHeader(entry.id)!=null)continue
                 val knownPage=dao.apiVersion(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,"page",entry.id))
                 if(knownPage!=null && dao.apiPage(entry.id)==null)continue
-                if(applyJournalEntry(client,entry,budget,journal.own)) {
+                if(applyIsolated(client,entry,budget,journal.own,journal.deviceId,setAside)) {
                     journal.applied[index]=true
                     progressed=true
                 }
@@ -521,6 +607,8 @@ class WebdavSyncClient(
             val since=firstSeen[key]?.takeIf{it.isJsonPrimitive}?.asLong?:now
             if(now-since>ORPHAN_GRACE_MS) {
                 DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_FAILURE,operationId="orphan-record-skipped",resourceId=entry.id,counts=mapOf("seq" to entry.seq))
+                // Not silently dropped: kept in the quarantine so it can be retried.
+                setAside.add(quarantinedRecord(journal.deviceId, entry, MaterializeFailure(QuarantineReason.INVALID_PAYLOAD, "所属笔记 48 小时内没有出现")))
                 journal.applied[index]=true
             } else stillWaiting.addProperty(key,since)
         }
@@ -541,8 +629,94 @@ class WebdavSyncClient(
             }
             seqs[journal.deviceId]=committed
         }
+        // Set-aside records are stored before the read position moves past
+        // them: a crash in between re-reads them (idempotent) instead of
+        // losing them.
+        quarantine(settings).put(setAside)
+        for (record in setAside) DiagnosticLogger.log(DiagnosticLevel.WARN, DiagnosticEvent.SYNC_FAILURE, operationId = "record-quarantined", resourceId = record.id, counts = mapOf("seq" to record.seq))
+        for (device in blocked) DiagnosticLogger.log(DiagnosticLevel.WARN, DiagnosticEvent.SYNC_FAILURE, operationId = "device-blocked:${device.code.code}", resourceId = device.deviceId)
+        lastBlocked = blocked.filterNot { it.deviceId == ownId && it.code == WebdavBlockCode.JOURNAL_MISSING }
         saveKnownSeqs(settings, seqs)
         return deviceIds
+    }
+
+    private fun quarantine(settings: WebdavSettings) = WebdavQuarantineStore(prefs, fingerprint(settings))
+
+    private fun quarantinedRecord(deviceId: String, entry: WebdavJournalEntry, failure: MaterializeFailure) = QuarantinedRecord(
+        deviceId = deviceId, seq = entry.seq, type = entry.type, id = entry.id, op = entry.op, ver = entry.ver,
+        reason = failure.reason, message = failure.message, payload = entry.payload, hash = entry.hash, encrypted = entry.encrypted,
+    )
+
+    /** Download, decrypt and verify everything one journal record needs before it is applied. */
+    private fun decodeEntry(client: WebdavClient, entry: WebdavJournalEntry, budget: RemoteTransferLimits.Budget): WebdavJournalEntry {
+        if (entry.type !in SUPPORTED_TYPES) throw UnknownRecordTypeException(entry.type)
+        var payload=entry.payload
+        payload[WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER]?.takeIf{it.isJsonPrimitive}?.asString?.let { marker ->
+            val hash=WebdavJournalProtocol.requireHash(marker)
+            payload=JsonParser.parseString(String(downloadObjectBytes(client,hash,budget),Charsets.UTF_8)).asJsonObject
+        }
+        val encrypted=WebdavPrivacyCipher.isEncrypted(payload)
+        if(encrypted)payload=privacyCipher.decryptPayload(entry.type,entry.id,payload,entry.op,entry.ver)
+        SyncEntityIdentityContract.requireChange(entry.type,entry.id,payload)
+        return entry.copy(payload=payload,encrypted=entry.encrypted||encrypted)
+    }
+
+    /**
+     * Applies one record; trouble with the record's own data sets it aside
+     * (counted as consumed) instead of failing the sync. False still means a
+     * conflict that holds the cursor.
+     */
+    private suspend fun applyIsolated(client: WebdavClient, entry: WebdavJournalEntry, budget: RemoteTransferLimits.Budget, own: Boolean, deviceId: String, setAside: MutableList<QuarantinedRecord>): Boolean {
+        if (entry.type !in SUPPORTED_TYPES) {
+            setAside.add(quarantinedRecord(deviceId, entry, MaterializeFailure(QuarantineReason.UNKNOWN_TYPE, "不支持的记录类型：${entry.type}")))
+            return true
+        }
+        return try {
+            applyJournalEntry(client, entry, budget, own)
+        } catch (error: Exception) {
+            val failure = classifyMaterializeFailure(error, applying = true) ?: throw error
+            setAside.add(quarantinedRecord(deviceId, entry, failure))
+            true
+        }
+    }
+
+    /** Set-aside records and the devices whose journal could not be trusted, as of the latest sync. */
+    internal fun issues(settings: WebdavSettings) = WebdavSyncIssues(quarantine(settings).list(), lastBlocked)
+
+    /** Drop set-aside records the user chose not to keep. */
+    fun dismissQuarantine(settings: WebdavSettings, keys: Collection<String>) = quarantine(settings).remove(keys)
+
+    /** Try set-aside records again (all of them, or only those whose cause may be gone); returns how many remain. */
+    suspend fun retryQuarantine(settings: WebdavSettings, automatic: Boolean = false): Int = withContext(Dispatchers.IO) {
+        validate(settings)
+        privacyCipher=WebdavPrivacyCipher(settings.syncPassword)
+        val store = quarantine(settings)
+        if (store.count() == 0) return@withContext 0
+        val client = client(settings)
+        val budget = RemoteTransferLimits.Budget()
+        val ownId = webdavDeviceId(prefs)
+        for (record in store.list()) {
+            if (automatic && !shouldRetryAutomatically(record, settings.syncPassword.isNotEmpty())) continue
+            val raw = WebdavJournalEntry(record.seq, "", record.op, record.type, record.id, record.ver, record.hash, record.payload, record.encrypted)
+            try {
+                val again = mutableListOf<QuarantinedRecord>()
+                val consumed = applyIsolated(client, decodeEntry(client, raw, budget), budget, record.deviceId == ownId, record.deviceId, again)
+                if (again.isNotEmpty()) store.put(again) else if (consumed) store.remove(listOf(record.key))
+            } catch (error: Exception) {
+                val failure = classifyMaterializeFailure(error) ?: throw error
+                store.put(listOf(quarantinedRecord(record.deviceId, raw, failure)))
+            }
+        }
+        store.count()
+    }
+
+    private fun shouldRetryAutomatically(record: QuarantinedRecord, hasKey: Boolean): Boolean = when (record.reason) {
+        QuarantineReason.NEEDS_KEY, QuarantineReason.BAD_KEY -> hasKey && record.attempts < AUTOMATIC_RETRY_ATTEMPTS
+        QuarantineReason.UNKNOWN_TYPE -> record.type in SUPPORTED_TYPES
+        QuarantineReason.MISSING_OBJECT, QuarantineReason.OBJECT_CORRUPT -> record.attempts < AUTOMATIC_RETRY_ATTEMPTS
+        // A newer app version may accept what an older one rejected: once per launch.
+        QuarantineReason.INVALID_PAYLOAD -> retriedThisLaunch.add(record.key)
+        else -> false
     }
 
     /** Returns false for a conflict so the caller can keep the cursor at the committed prefix. */
@@ -1061,6 +1235,9 @@ class WebdavSyncClient(
 
 /** How long a record may wait for its note to arrive before it is skipped. */
 private const val ORPHAN_GRACE_MS = 48L * 60 * 60 * 1000
+private const val AUTOMATIC_RETRY_ATTEMPTS = 5
+private val retriedThisLaunch = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+private val SUPPORTED_TYPES = setOf("notebook", "section", "page", "document", "tag", "task_step", "asset", "page_link", "reading_position", "revision", "page_tag")
 
 private fun JsonObject.string(key: String, default: String = "") = get(key)?.takeUnless { it.isJsonNull }?.asString ?: default
 private fun JsonObject.optionalString(key: String) = get(key)?.takeUnless { it.isJsonNull }?.asString
