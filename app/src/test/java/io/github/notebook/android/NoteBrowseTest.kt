@@ -64,4 +64,14 @@ class NoteBrowseTest {
             PinyinMatcher.install(null)
         }
     }
+
+    @Test fun `swipe action follows the item type and state`() {
+        val note = summary("n", "笔记")
+        val todo = note.copy(itemType = "todo")
+        assertEquals(RowSwipe.Delete, rowSwipe(note, selecting = false))
+        assertEquals(RowSwipe.Complete, rowSwipe(todo, selecting = false))
+        assertEquals(RowSwipe.Reopen, rowSwipe(todo.copy(completedAt = 1L), selecting = false))
+        assertEquals(RowSwipe.None, rowSwipe(note.copy(deletedAt = 1L), selecting = false))
+        assertEquals(RowSwipe.None, rowSwipe(note, selecting = true))
+    }
 }

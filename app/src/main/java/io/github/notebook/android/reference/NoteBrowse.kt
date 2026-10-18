@@ -465,15 +465,31 @@ internal fun SearchTagShortcuts(tags: List<Pair<String, Int>>, onTag: (String) -
     }
 }
 
+/** What swiping a list row to the left does; [None] rows are not swipeable. */
+internal enum class RowSwipe(val label: String, val testTag: String) {
+    None("", ""),
+    Complete("完成", "swipe-complete"),
+    Reopen("变回待办", "swipe-reopen"),
+    Delete("删除", "swipe-delete"),
+}
+
+internal fun rowSwipe(note: NoteSummary, selecting: Boolean): RowSwipe = when {
+    selecting || note.deletedAt != null -> RowSwipe.None
+    note.itemType == "todo" -> if (note.completedAt == null) RowSwipe.Complete else RowSwipe.Reopen
+    else -> RowSwipe.Delete
+}
+
 /**
- * Swipe an open todo to the left to complete it. [onComplete] must run the save
- * in a scope that outlives this row (the row leaves the list as soon as the
- * todo is done) and report back through `done`; on failure the row springs back.
+ * Swipe a row to the left: complete an open todo, turn a completed one back
+ * into a todo, or delete a note. [onTrigger] must run any save in a scope that
+ * outlives this row (the row leaves the list as soon as the item changes) and
+ * report back through `done`; a `false` (failure, or a pending confirmation)
+ * springs the row back.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: (done: (Boolean) -> Unit) -> Unit, content: @Composable () -> Unit) {
-    if (!enabled) {
+internal fun SwipeActionRow(action: RowSwipe, onTrigger: (done: (Boolean) -> Unit) -> Unit, content: @Composable () -> Unit) {
+    if (action == RowSwipe.None) {
         content()
         return
     }
@@ -482,27 +498,38 @@ internal fun SwipeToCompleteRow(enabled: Boolean, onComplete: (done: (Boolean) -
     state = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
             if (value == SwipeToDismissBoxValue.EndToStart) {
-                onComplete { ok -> if (!ok) scope.launch { state.reset() } }
+                onTrigger { ok -> if (!ok) scope.launch { state.reset() } }
                 true
             } else false
         },
         positionalThreshold = { distance -> distance * .4f },
     )
+    val destructive = action == RowSwipe.Delete
+    val container = if (destructive) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer
+    val onContainer = if (destructive) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onPrimaryContainer
     SwipeToDismissBox(
         state,
-        modifier = Modifier.testTag("swipe-complete"),
+        modifier = Modifier.testTag(action.testTag),
         enableDismissFromStartToEnd = false,
         backgroundContent = {
             // Only paint while the row is actually being dragged; otherwise the
             // colour peeks out around the card's rounded corners.
             if (state.dismissDirection == SwipeToDismissBoxValue.EndToStart)
                 Box(
-                    Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp)).background(MaterialTheme.colorScheme.primaryContainer).padding(end = 20.dp),
+                    Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp)).background(container).padding(end = 20.dp),
                     contentAlignment = Alignment.CenterEnd,
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
-                        Text("完成", Modifier.padding(start = 6.dp), color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Medium)
+                        Icon(
+                            when (action) {
+                                RowSwipe.Delete -> Icons.Default.Delete
+                                RowSwipe.Reopen -> Icons.Default.Replay
+                                else -> Icons.Default.Check
+                            },
+                            null,
+                            tint = onContainer,
+                        )
+                        Text(action.label, Modifier.padding(start = 6.dp), color = onContainer, fontWeight = FontWeight.Medium)
                     }
                 }
         },

@@ -188,6 +188,7 @@ internal fun ReferenceHome(
     var moving by remember { mutableStateOf(false) }
     var existingPicker by remember { mutableStateOf(false) }
     var confirmAction by remember { mutableStateOf<String?>(null) }
+    var swipeDelete by remember { mutableStateOf<NoteSummary?>(null) }
     var busy by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val preferences = remember(context) { context.getSharedPreferences("editor_preferences", 0) }
@@ -407,26 +408,32 @@ internal fun ReferenceHome(
             selecting = true
             selected = selected + note.id
         }
-        // Save from the screen's scope: this row is disposed as soon as the todo
+        val swipe = rowSwipe(note, selecting)
+        // Save from the screen's scope: this row is disposed as soon as the item
         // leaves the list, which would cancel a row-scoped save halfway.
-        val complete: (done: (Boolean) -> Unit) -> Unit = { done ->
-            scope.launch {
-                val ok = runCatching { repo.loadNote(note.id)?.let { repo.save(it.copy(completedAt = System.currentTimeMillis())) } }
-                    .onSuccess { onStatus("已完成「${note.title.ifBlank { "无标题待办" }}」") }
+        val onSwipe: (done: (Boolean) -> Unit) -> Unit = { done ->
+            if (swipe == RowSwipe.Delete) {
+                // Deleting asks first; the row springs back behind the dialog.
+                swipeDelete = note
+                done(false)
+            } else scope.launch {
+                val reopen = swipe == RowSwipe.Reopen
+                val name = note.title.ifBlank { "无标题待办" }
+                val ok = runCatching { repo.loadNote(note.id)?.let { repo.save(it.copy(completedAt = if (reopen) null else System.currentTimeMillis())) } }
+                    .onSuccess { onStatus(if (reopen) "已变回待办「$name」" else "已完成「$name」") }
                     .onFailure { onStatus("操作失败：${it.localizedMessage}") }
                     .isSuccess
                 done(ok)
             }
         }
-        val swipeable = note.isOpenTodo() && !selecting
         if (compact)
-            SwipeToCompleteRow(swipeable, complete) {
+            SwipeActionRow(swipe, onSwipe) {
                 Box(Modifier.onGloballyPositioned { coordinates[0] = it }) {
                     CompactNoteRow(note, preview, highlightTerms, isPinned, selecting, note.id in selected, path, click, longClick)
                 }
             }
         else
-          SwipeToCompleteRow(swipeable, complete) {
+          SwipeActionRow(swipe, onSwipe) {
             ReferenceNoteCard(
                 note,
                 preview,
@@ -1365,6 +1372,26 @@ internal fun ReferenceHome(
                     TextButton({ deleteLibrary = null }) { Text("取消") }
                 }
             },
+        )
+    }
+    swipeDelete?.let { note ->
+        val children = hierarchyIndex.counts[note.id] ?: 0
+        AlertDialog(
+            onDismissRequest = { swipeDelete = null },
+            title = { Text("删除“${note.title.ifBlank { "无标题" }}”？") },
+            text = { Text(if (children > 0) "此页面及其子页面会移入最近删除，可以稍后恢复。" else "笔记会移入最近删除，可以稍后恢复。") },
+            confirmButton = {
+                Button(
+                    {
+                        swipeDelete = null
+                        perform("已移入最近删除") { repo.moveToTrash(note.id) }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                ) {
+                    Text("删除")
+                }
+            },
+            dismissButton = { TextButton({ swipeDelete = null }) { Text("取消") } },
         )
     }
     confirmAction?.let { action ->
