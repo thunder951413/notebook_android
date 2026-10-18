@@ -983,7 +983,34 @@ internal fun imageAspectRatio(asset:AssetEntity,file:java.io.File):Float?{
 private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024->String.format(Locale.getDefault(),"%.1f KB",bytes/1024.0);else->String.format(Locale.getDefault(),"%.1f MB",bytes/(1024.0*1024.0))}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ReminderDialog(current:Long?,currentRule:String,onDismiss:()->Unit,onConfirm:(Long?,String)->Unit){val base=current?:System.currentTimeMillis()+3_600_000;val cal=remember(base){Calendar.getInstance().apply{timeInMillis=base}};val date=rememberDatePickerState(initialSelectedDateMillis=base);val time=rememberTimePickerState(cal.get(Calendar.HOUR_OF_DAY),cal.get(Calendar.MINUTE),true);var rule by remember{mutableStateOf(currentRule)};AlertDialog(onDismissRequest=onDismiss,title={Text("设置提醒")},text={Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())){DatePicker(date);TimePicker(time);Text("重复",fontWeight=FontWeight.Medium);SingleChoiceSegmentedButtonRow{listOf("none" to "一次","daily" to "每天","weekly" to "每周","monthly" to "每月").forEachIndexed{i,p->SegmentedButton(selected=rule==p.first,onClick={rule=p.first},shape=SegmentedButtonDefaults.itemShape(i,4)){Text(p.second)}}}}},confirmButton={Button({val selected=date.selectedDateMillis;if(selected==null)onConfirm(null,"none")else{val c=Calendar.getInstance().apply{timeInMillis=selected;set(Calendar.HOUR_OF_DAY,time.hour);set(Calendar.MINUTE,time.minute);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0)};onConfirm(c.timeInMillis,rule)}}){Text("确定")}},dismissButton={Row{TextButton({onConfirm(null,"none")}){Text("清除")};TextButton(onDismiss){Text("取消")}}})}
+/** Date, time and repeat for a reminder. A plain dialog (not AlertDialog): the calendar needs 360dp, more than AlertDialog's padded content leaves on a phone. */
+@Composable private fun ReminderDialog(current:Long?,currentRule:String,onDismiss:()->Unit,onConfirm:(Long?,String)->Unit){
+    val base=current?:System.currentTimeMillis()+3_600_000
+    val cal=remember(base){Calendar.getInstance().apply{timeInMillis=base}}
+    val date=rememberDatePickerState(initialSelectedDateMillis=base)
+    val time=rememberTimePickerState(cal.get(Calendar.HOUR_OF_DAY),cal.get(Calendar.MINUTE),true)
+    var rule by remember{mutableStateOf(currentRule)}
+    androidx.compose.ui.window.Dialog(onDismissRequest=onDismiss,properties=androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth=false)){
+        Surface(Modifier.fillMaxWidth().widthIn(max=420.dp).heightIn(max=(androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp-72).dp).padding(horizontal=8.dp),shape=androidx.compose.foundation.shape.RoundedCornerShape(28.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh){
+            Column(Modifier.padding(vertical=16.dp)){
+              // Everything but the buttons scrolls on short screens; the buttons stay visible.
+              Column(Modifier.weight(1f,fill=false).verticalScroll(androidx.compose.foundation.rememberScrollState())){
+                Text("设置提醒",style=MaterialTheme.typography.headlineSmall,modifier=Modifier.padding(horizontal=24.dp,vertical=8.dp))
+                DatePicker(date,title=null,headline=null,showModeToggle=false,colors=DatePickerDefaults.colors(containerColor=MaterialTheme.colorScheme.surfaceContainerHigh))
+                Box(Modifier.fillMaxWidth(),contentAlignment=androidx.compose.ui.Alignment.Center){TimePicker(time)}
+                Text("重复",fontWeight=FontWeight.Medium,modifier=Modifier.padding(horizontal=24.dp,vertical=8.dp))
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal=24.dp)){listOf("none" to "一次","daily" to "每天","weekly" to "每周","monthly" to "每月").forEachIndexed{i,p->SegmentedButton(selected=rule==p.first,onClick={rule=p.first},shape=SegmentedButtonDefaults.itemShape(i,4)){Text(p.second)}}}
+              }
+                Row(Modifier.fillMaxWidth().padding(start=24.dp,end=24.dp,top=16.dp),horizontalArrangement=Arrangement.End,verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
+                    TextButton({onConfirm(null,"none")}){Text("清除")}
+                    TextButton(onDismiss){Text("取消")}
+                    Spacer(Modifier.width(8.dp))
+                    Button({val selected=date.selectedDateMillis;if(selected==null)onConfirm(null,"none")else{val c=Calendar.getInstance().apply{timeInMillis=selected;set(Calendar.HOUR_OF_DAY,time.hour);set(Calendar.MINUTE,time.minute);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0)};onConfirm(c.timeInMillis,rule)}}){Text("确定")}
+                }
+            }
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
