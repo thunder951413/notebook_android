@@ -139,7 +139,7 @@ class MainActivityTest {
         val app=rule.activity.application as NotebookApp;runBlocking{app.database.dao().putFolder(FolderEntity("todo-list-test","工作提醒",0,"todoList"));app.database.dao().put(NoteEntity("todo-in-list",title="列表中的待办",itemType="todo",folderId="todo-list-test",folderName="工作提醒"))};rule.activityRule.scenario.recreate()
         openNavigation()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("工作提醒"));rule.onNodeWithText("工作提醒").assertIsDisplayed().performClick();rule.onNodeWithText("列表中的待办").assertIsDisplayed()
-        createNote();rule.onNodeWithTag("body-field").assertIsDisplayed();rule.onNodeWithText("已完成").assertIsDisplayed()
+        createNote();rule.onNodeWithTag("todo-item-field").assertIsDisplayed();rule.onNodeWithContentDescription("完成待办").assertIsDisplayed();rule.onNodeWithTag("todo-step-draft").assertIsDisplayed()
     }
 
     @Test fun permanentDeleteFromConflictDetailClosesAndSurvivesRecreation(){

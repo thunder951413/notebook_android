@@ -493,7 +493,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     val context=LocalContext.current;val lifecycleOwner=LocalLifecycleOwner.current;val audioRecorder=remember{AudioRecorder(context)};var recording by remember{mutableStateOf(false)};var recordingFile by remember{mutableStateOf<java.io.File?>(null)}
     val editorFocus=androidx.compose.ui.platform.LocalFocusManager.current
     val folders by repo.folders.collectAsState(initial=emptyList());val tags by repo.tags.collectAsState(initial=emptyList());var folderMenu by remember{mutableStateOf(false)};var parentMenu by remember{mutableStateOf(false)}
-    val steps by repo.steps(n.id).collectAsState(initial=emptyList());var newStep by remember{mutableStateOf("")}
+    val steps by repo.steps(n.id).collectAsState(initial=emptyList())
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.GetContent()){uri->uri?.let{source->scope.launch{
         runCatching{repo.flushDraft(latestDraft.value).join();check(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){"请先保存笔记"};repo.attach(n.id,source)}.onSuccess{asset->
             if(asset.kind=="image"){
@@ -514,11 +514,14 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         if(granted)scope.launch{runCatching{repo.flushDraft(latestDraft.value).join();check(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){"请先保存笔记"};repo.recordingFile(n.id).also{recordingFile=it;audioRecorder.start(it);recording=true}}.onFailure{editorMessage="无法开始录音：${it.localizedMessage}"}}
         else editorMessage="未获得麦克风权限，录音未开始"
     }
-    val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){}
+    fun notificationsGranted()=android.os.Build.VERSION.SDK_INT<33||context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==android.content.pm.PackageManager.PERMISSION_GRANTED
+    var notificationsAllowed by remember{mutableStateOf(notificationsGranted())}
+    val notificationPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){notificationsAllowed=notificationsGranted()}
+    fun requestNotifications(){if(android.os.Build.VERSION.SDK_INT>=33)notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)}
 
     var reminderDialog by remember{mutableStateOf(false)};var deleteDialog by remember{mutableStateOf(false)};var historyDialog by remember{mutableStateOf(false)};var historyRevisions by remember(original.id){mutableStateOf<List<NoteRevisionSummary>>(emptyList())};var showSavedCheck by remember(original.id){mutableStateOf(false)}
     var referencePicker by remember(original.id){mutableStateOf(false)}
-    var editMode by remember(original.id){mutableStateOf(initiallyEditing)}
+    var editMode by remember(original.id){mutableStateOf(initiallyEditing&&original.itemType!="todo")}
     LaunchedEffect(editMode){onEditModeChanged(editMode)}
     val initialEditableKey=remember(original.id,original.version){editableKey(original)}
     LaunchedEffect(saveState){if(saveState==NoteSaveState.Saved){showSavedCheck=true;delay(600);showSavedCheck=false;repo.acknowledgeSaved(n.id)}else showSavedCheck=false}
@@ -545,6 +548,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     DisposableEffect(lifecycleOwner,original.id,original.version){
         val observer=LifecycleEventObserver{_,event->
             val latest=latestDraft.value
+            if(event==Lifecycle.Event.ON_RESUME)notificationsAllowed=notificationsGranted()
             if(event==Lifecycle.Event.ON_STOP){stopRecording();if(editableKey(latest)!=initialEditableKey)repo.flushDraft(latest)}
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -562,6 +566,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         scope.launch{
             stopRecording()?.join()
             val latest=latestDraft.value
+            if(latest.itemType=="todo"&&latest.title.isBlank()&&latest.body.isBlank()&&steps.isEmpty()&&attachments.isEmpty()&&!repo.hasStoredNote(latest.id)){repo.discardUnsavedMarker(latest.id);onDone(latest);return@launch}
             repo.flushDraft(latest).join()
             if(repo.noteSaveStates.value[latest.id]==NoteSaveState.Failed){leaving=false;return@launch}
             onDone(latest)
@@ -598,42 +603,50 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
             }else{
                 if(n.deletedAt!=null)Text("最近删除",Modifier.weight(1f).padding(start=8.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)else Spacer(Modifier.weight(1f))
                 // Editing sits with the other tools instead of a large bar over the text.
-                if(n.deletedAt==null)TextButton({editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.testTag("edit-mode"),shape=androidx.compose.foundation.shape.CircleShape,colors=ButtonDefaults.textButtonColors(containerColor=MaterialTheme.colorScheme.surface,contentColor=MaterialTheme.colorScheme.onSurface),contentPadding=PaddingValues(horizontal=14.dp)){Icon(Icons.Default.Edit,null,Modifier.size(18.dp));Spacer(Modifier.width(6.dp));Text(if(n.itemType=="todo")"编辑计划" else "编辑")}
-                RoundTool(Icons.Default.Toc,"目录",{readerAction="outline"})
+                if(n.deletedAt==null&&n.itemType!="todo")TextButton({editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.testTag("edit-mode"),shape=androidx.compose.foundation.shape.CircleShape,colors=ButtonDefaults.textButtonColors(containerColor=MaterialTheme.colorScheme.surface,contentColor=MaterialTheme.colorScheme.onSurface),contentPadding=PaddingValues(horizontal=14.dp)){Icon(Icons.Default.Edit,null,Modifier.size(18.dp));Spacer(Modifier.width(6.dp));Text("编辑")}
+                if(n.itemType!="todo")RoundTool(Icons.Default.Toc,"目录",{readerAction="outline"})
                 RoundTool(Icons.Default.IosShare,"分享与导出",{exportSheet=true})
                 Box{RoundTool(Icons.Default.MoreVert,"笔记更多",{moreMenu=true});DropdownMenu(moreMenu,{moreMenu=false}){
-                    DropdownMenuItem({Text("文档内查找")},{moreMenu=false;readerAction="find"})
-                    DropdownMenuItem({Text("反向链接")},{moreMenu=false;readerAction="backlinks"},leadingIcon={Icon(Icons.Default.Link,null)})
-                    DropdownMenuItem({Text("阅读设置")},{moreMenu=false;readerAction="settings"},leadingIcon={Icon(Icons.Default.TextFields,null)})
+                    if(n.itemType!="todo"){
+                        DropdownMenuItem({Text("文档内查找")},{moreMenu=false;readerAction="find"})
+                        DropdownMenuItem({Text("反向链接")},{moreMenu=false;readerAction="backlinks"},leadingIcon={Icon(Icons.Default.Link,null)})
+                        DropdownMenuItem({Text("阅读设置")},{moreMenu=false;readerAction="settings"},leadingIcon={Icon(Icons.Default.TextFields,null)})
+                    }
                     DropdownMenuItem({Text("版本历史")},{moreMenu=false;scope.launch{repo.flushDraft(n).join();historyRevisions=repo.revisions(n.id);historyDialog=true}},leadingIcon={Icon(Icons.Default.History,"版本历史")})
                     if(n.deletedAt==null){
                         if(!repo.isEncrypted(n))DropdownMenuItem({Text("标签")},{moreMenu=false;tagsSheet=true})
-                        DropdownMenuItem({Text("笔记库与上级页面")},{moreMenu=false;folderMenu=true})
+                        DropdownMenuItem({Text(if(n.itemType=="todo")"移到其他列表" else "笔记库与上级页面")},{moreMenu=false;folderMenu=true})
                         if(n.itemType=="note")DropdownMenuItem({Text("新建子页面")},{moreMenu=false;scope.launch{repo.flushDraft(n).join();onNewChild(n)}})
                         DropdownMenuItem({Text("创建副本")},{moreMenu=false;scope.launch{runCatching{repo.duplicateNote(n.id)}.onSuccess{onOpenNote(it.id)}.onFailure{editorMessage=it.localizedMessage}}})
-                        DropdownMenuItem({Text("删除笔记")},{moreMenu=false;deleteDialog=true},modifier=Modifier.testTag("delete-item"),leadingIcon={Icon(Icons.Default.DeleteOutline,null)})
+                        DropdownMenuItem({Text(if(n.itemType=="todo")"删除待办" else "删除笔记")},{moreMenu=false;deleteDialog=true},modifier=Modifier.testTag("delete-item"),leadingIcon={Icon(Icons.Default.DeleteOutline,null)})
                     }
                 }}
             }
         }
         if(n.itemType=="note"&&n.deletedAt==null)NoteBreadcrumb(n,hierarchyNotes,{onOpenNote(it)},{editorKeyboard?.hide();editorFocus.clearFocus();scope.launch{repo.flushDraft(latestDraft.value).join();if(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){showHierarchy=true}}})
         if(!editMode){
-            if(emptyParent!=null)ChildNotesOverview(n.title,n.icon,emptyParent.first,emptyParent.second,onOpenNote,{editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp))else ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
+            if(n.itemType=="todo")TodoDetail(
+                note=n,steps=steps,attachments=attachments,
+                libraryName=folders.firstOrNull{it.id==n.folderId}?.name?:n.folderName.ifBlank{"未分类"},
+                notificationsAllowed=notificationsAllowed,
+                onChange=::updateNote,
+                onSaveSteps={list->repo.saveStepsAsync(n.id,list,latestDraft.value)},
+                onPickLibrary={folderMenu=true},
+                onRequestNotifications=::requestNotifications,
+                onOpenNotificationSettings={runCatching{context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,context.packageName))}},
+                modifier=Modifier.fillMaxWidth().weight(1f),
+            )else if(emptyParent!=null)ChildNotesOverview(n.title,n.icon,emptyParent.first,emptyParent.second,onOpenNote,{editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp))else ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
             if(n.deletedAt!=null)FloatingPill(Modifier.align(androidx.compose.ui.Alignment.CenterHorizontally).padding(horizontal=24.dp,vertical=16.dp)){
                 run {TextButton({scope.launch{runCatching{repo.restore(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it}}.onFailure{editorMessage=it.localizedMessage}}}){Text("恢复")};TextButton({permanentConfirm=true}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}
             }
         }else Box(Modifier.weight(1f)){
             ReferenceEditorBody(n.title,::changeTitle,bodyValue,{changeBody(it,true)},{referencePicker=true},{picker.launch("image/*")},{picker.launch("*/*")},{if(recording)stopRecording()else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)},recording,surface=surface,onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},onCommand={changeBody(it,false)},assets=attachments,timestamp=java.text.SimpleDateFormat("yyyy/M/d HH:mm",Locale.CHINA).format(Date(n.createdAt)),afterTitle={if(!repo.isEncrypted(n))ReferenceMetaChip(if(n.tagIds.isBlank())"添加标签" else "标签",Icons.Default.Add){tagsSheet=true}},titles=linkTitles,onCaret={at->bodyValue=bodyValue.copy(selection=TextRange(at.coerceIn(0,bodyValue.text.length)),composition=null)}){
-                if(n.itemType=="todo"){
-                    Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(n.completedAt!=null,{updateNote(n.copy(completedAt=if(it)System.currentTimeMillis()else null))});Text("已完成");Checkbox(n.important,{updateNote(n.copy(important=it))});Text("重要")}
-                    steps.forEach{step->Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(step.checked,{checked->scope.launch{repo.saveStep(step.copy(checked=checked))}});Text(step.text,Modifier.weight(1f));IconButton({scope.launch{repo.deleteStep(step.id)}}){Icon(Icons.Default.Close,"删除步骤")}}}
-                    Row{TextField(newStep,{newStep=it},Modifier.weight(1f),singleLine=true,placeholder={Text("添加步骤")});IconButton({if(newStep.isNotBlank()){val text=newStep.trim();newStep="";scope.launch{repo.saveStep(TodoStepEntity(UUID.randomUUID().toString(),n.id,text,sortOrder=steps.size))}}}){Icon(Icons.Default.Add,"添加步骤")}}
-                }
                 attachments.filter{it.id !in NotebookAssetSyntax.images(n.body).map{image->image.assetId}}.forEach{AttachmentView(it)}
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                     ReferenceMetaChip(folders.firstOrNull{it.id==n.folderId}?.name?:n.folderName,Icons.Default.Folder){folderMenu=true}
 
-                    ReferenceMetaChip(if(n.reminderAt==null)"提醒" else "已设提醒",Icons.Default.NotificationsNone){reminderDialog=true}
+                    // New reminders belong to todos; a note keeps showing one it already has so it can be changed or cleared.
+                    n.reminderAt?.let{at->ReferenceMetaChip("提醒 "+scheduleLabel(at,System.currentTimeMillis(),allDay=false),Icons.Default.NotificationsNone){reminderDialog=true}}
                     if(recording)AssistChip({stopRecording()},{Text("正在录音 · 点击停止")},leadingIcon={Icon(Icons.Default.Mic,null,tint=MaterialTheme.colorScheme.error)})
                 }
 
@@ -686,7 +699,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
             }
         }
     )
-    if(reminderDialog)ReminderDialog(n.reminderAt,n.recurrence,{reminderDialog=false},{at,rule->updateNote(n.copy(reminderAt=at,recurrence=rule));if(at!=null&&android.os.Build.VERSION.SDK_INT>=33)notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS);reminderDialog=false})
+    if(reminderDialog)ScheduleDialog("提醒",n.reminderAt,System.currentTimeMillis()+3_600_000,allowAllDay=false,repeat=n.recurrence,onDismiss={reminderDialog=false}){at,rule->updateNote(n.copy(reminderAt=at,recurrence=rule?:"none"));if(!notificationsAllowed)requestNotifications();reminderDialog=false}
     if(deleteDialog){val itemLabel=if(n.itemType=="todo")"计划" else "笔记";val hasChildren=allNotes.any{it.parentPageId==n.id};AlertDialog(onDismissRequest={deleteDialog=false},icon={Icon(Icons.Default.Delete,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除$itemLabel？")},text={Text(if(hasChildren)"此页面及全部子页面会一起移入回收站，可以稍后恢复。" else "删除后会移入回收站，可以稍后恢复。")},confirmButton={Button({deleteDialog=false;scope.launch{repo.flushDraft(n).join();repo.moveToTrash(n.id);onDone(n.copy(deletedAt=System.currentTimeMillis()))}},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({deleteDialog=false}){Text("取消")}})}
 }
 
@@ -988,36 +1001,6 @@ internal fun imageAspectRatio(asset:AssetEntity,file:java.io.File):Float?{
 @Composable internal fun AttachmentView(asset:AssetEntity,caption:String?=asset.caption){val context=LocalContext.current;val file=asset.localPath?.let{java.io.File(it)};fun open(){if(file?.isFile!=true)return;val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file);runCatching{context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri,asset.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}};if(asset.kind=="image"&&file?.isFile==true)Column(Modifier.fillMaxWidth().padding(vertical=6.dp),horizontalAlignment=when(asset.alignment){"center"->androidx.compose.ui.Alignment.CenterHorizontally;"right"->androidx.compose.ui.Alignment.End;else->androidx.compose.ui.Alignment.Start}){AsyncImage(file,asset.filename,Modifier.fillMaxWidth().then(asset.displayWidth?.let{Modifier.widthIn(max=it.coerceIn(80,1200).dp)}?:Modifier).heightIn(max=720.dp).then(imageAspectRatio(asset,file)?.let{Modifier.aspectRatio(it)}?:Modifier).clickable{open()},contentScale=androidx.compose.ui.layout.ContentScale.Fit);caption?.takeIf(String::isNotBlank)?.let{Text(it,style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}}else ListItem(headlineContent={Text(asset.filename,maxLines=1)},supportingContent={Text(if(file?.isFile==true)formatBytes(asset.size) else "等待下载")},leadingContent={Icon(if(asset.kind=="audio")Icons.Default.AudioFile else Icons.Default.AttachFile,null)},modifier=Modifier.clickable{open()})}
 
 private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024->String.format(Locale.getDefault(),"%.1f KB",bytes/1024.0);else->String.format(Locale.getDefault(),"%.1f MB",bytes/(1024.0*1024.0))}
-
-@OptIn(ExperimentalMaterial3Api::class)
-/** Date, time and repeat for a reminder. A plain dialog (not AlertDialog): the calendar needs 360dp, more than AlertDialog's padded content leaves on a phone. */
-@Composable private fun ReminderDialog(current:Long?,currentRule:String,onDismiss:()->Unit,onConfirm:(Long?,String)->Unit){
-    val base=current?:System.currentTimeMillis()+3_600_000
-    val cal=remember(base){Calendar.getInstance().apply{timeInMillis=base}}
-    val date=rememberDatePickerState(initialSelectedDateMillis=base)
-    val time=rememberTimePickerState(cal.get(Calendar.HOUR_OF_DAY),cal.get(Calendar.MINUTE),true)
-    var rule by remember{mutableStateOf(currentRule)}
-    androidx.compose.ui.window.Dialog(onDismissRequest=onDismiss,properties=androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth=false)){
-        Surface(Modifier.fillMaxWidth().widthIn(max=420.dp).heightIn(max=(androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp-72).dp).padding(horizontal=8.dp),shape=androidx.compose.foundation.shape.RoundedCornerShape(28.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh){
-            Column(Modifier.padding(vertical=16.dp)){
-              // Everything but the buttons scrolls on short screens; the buttons stay visible.
-              Column(Modifier.weight(1f,fill=false).verticalScroll(androidx.compose.foundation.rememberScrollState())){
-                Text("设置提醒",style=MaterialTheme.typography.headlineSmall,modifier=Modifier.padding(horizontal=24.dp,vertical=8.dp))
-                DatePicker(date,title=null,headline=null,showModeToggle=false,colors=DatePickerDefaults.colors(containerColor=MaterialTheme.colorScheme.surfaceContainerHigh))
-                Box(Modifier.fillMaxWidth(),contentAlignment=androidx.compose.ui.Alignment.Center){TimePicker(time)}
-                Text("重复",fontWeight=FontWeight.Medium,modifier=Modifier.padding(horizontal=24.dp,vertical=8.dp))
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal=24.dp)){listOf("none" to "一次","daily" to "每天","weekly" to "每周","monthly" to "每月").forEachIndexed{i,p->SegmentedButton(selected=rule==p.first,onClick={rule=p.first},shape=SegmentedButtonDefaults.itemShape(i,4)){Text(p.second)}}}
-              }
-                Row(Modifier.fillMaxWidth().padding(start=24.dp,end=24.dp,top=16.dp),horizontalArrangement=Arrangement.End,verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
-                    TextButton({onConfirm(null,"none")}){Text("清除")}
-                    TextButton(onDismiss){Text("取消")}
-                    Spacer(Modifier.width(8.dp))
-                    Button({val selected=date.selectedDateMillis;if(selected==null)onConfirm(null,"none")else{val c=Calendar.getInstance().apply{timeInMillis=selected;set(Calendar.HOUR_OF_DAY,time.hour);set(Calendar.MINUTE,time.minute);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0)};onConfirm(c.timeInMillis,rule)}}){Text("确定")}
-                }
-            }
-        }
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}

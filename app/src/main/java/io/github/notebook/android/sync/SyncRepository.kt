@@ -662,6 +662,31 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun assets(noteId:String)=dao.observeAssets(noteId)
     suspend fun assetList(noteId:String)=dao.assets(noteId)
     suspend fun saveStep(step:TodoStepEntity){dao.putStep(step);if(syncBackend()!=SyncBackend.SSH)apiSync.queueStep(syncWorkspaceId(),step);loadEditable(step.noteId)?.let{save(it)};requestSyncIfConfigured()}
+    private val stepsLock=Mutex()
+    private val pendingStepLists=java.util.concurrent.ConcurrentHashMap<String,Pair<List<TodoStepEntity>,NoteEntity>>()
+    /**
+     * Makes [steps] the todo's complete step list: blank steps are dropped and the order is renumbered.
+     * Only changed or removed steps are queued for sync, and the todo is republished once from [note]
+     * (the editor's latest draft) so a pending title edit is not overwritten by the stored copy.
+     * Calls are serialized; when several are waiting, only the latest list for a todo is written.
+     */
+    fun saveStepsAsync(noteId:String,steps:List<TodoStepEntity>,note:NoteEntity):Job{
+        pendingStepLists[noteId]=steps to note
+        return appScope.launch{stepsLock.withLock{
+            val (latest,latestNote)=pendingStepLists.remove(noteId)?:return@withLock
+            runCatching{saveSteps(noteId,latest,latestNote)}.onFailure{_saveError.value="保存步骤失败：${it.localizedMessage?:"请重试"}"}
+        }}
+    }
+    private suspend fun saveSteps(noteId:String,steps:List<TodoStepEntity>,note:NoteEntity){
+        val next=steps.filter{it.text.isNotBlank()}.mapIndexed{index,step->step.copy(noteId=noteId,sortOrder=index)}
+        val previous=dao.steps(noteId);val previousById=previous.associateBy{it.id};val nextIds=next.mapTo(HashSet()){it.id}
+        val changed=next.filter{previousById[it.id]!=it};val removed=previous.filter{it.id !in nextIds}
+        if(changed.isEmpty()&&removed.isEmpty())return
+        val workspace=if(syncBackend()!=SyncBackend.SSH)syncWorkspaceId()else null
+        changed.forEach{dao.putStep(it);if(workspace!=null)apiSync.queueStep(workspace,it)}
+        removed.forEach{if(workspace!=null)apiSync.queueDelete(workspace,"task_step",it.id);dao.deleteStep(it.id)}
+        save(note);requestSyncIfConfigured()
+    }
     suspend fun deleteStep(id:String){val noteId=dao.getStep(id)?.noteId;if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"task_step",id);dao.deleteStep(id);noteId?.let{loadEditable(it)?.let{n->save(n)}}}
     suspend fun attach(noteId:String,uri:android.net.Uri):AssetEntity=withContext(Dispatchers.IO){
         val resolver=appContext.contentResolver;val id=UUID.randomUUID().toString();val mime=resolver.getType(uri)?:"application/octet-stream"
