@@ -1,6 +1,9 @@
 package io.github.notebook.android.sync
 
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
@@ -255,7 +258,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     private val privacy=PrivateNoteIndex(prefs,gson)
     private val apiSync=ApiSyncClient(appContext,dao)
     private val webdavSync=WebdavSyncClient(appContext,dao,prefs,apiSync,privacy=privacy)
-    val notes=dao.observeNoteSummaries()
+    /** Desktop root page id per library id; see [libraryRootSectionId]. */
+    val libraryRootPages=dao.observeApiPagesWithLibraryRootMarker().map{rows->rows.mapNotNull{row->libraryRootSectionId(row.payloadJson)?.let{it to row.pageId}}.toMap()}.distinctUntilChanged()
+    val notes=combine(dao.observeNoteSummaries(),libraryRootPages){list,roots->withoutLibraryRoots(list,roots)}
     val folders=dao.observeFolders()
     val tags=dao.observeTags()
     fun backlinks(noteId:String)=dao.observeBacklinks(noteId)

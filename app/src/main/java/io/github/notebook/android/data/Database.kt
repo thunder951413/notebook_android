@@ -283,6 +283,8 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Upsert suspend fun putApiDocument(document:ApiDocumentEntity)
     @Query("DELETE FROM api_documents WHERE pageId=:pageId") suspend fun deleteApiDocument(pageId:String)
     @Query("SELECT * FROM api_pages WHERE pageId=:pageId") suspend fun apiPage(pageId:String):ApiPageEntity?
+    @Query("SELECT * FROM api_pages WHERE payloadJson LIKE '%notebookRootSectionId%'") suspend fun apiPagesWithLibraryRootMarker():List<ApiPageEntity>
+    @Query("SELECT * FROM api_pages WHERE payloadJson LIKE '%notebookRootSectionId%'") fun observeApiPagesWithLibraryRootMarker():Flow<List<ApiPageEntity>>
     @Upsert suspend fun putApiPage(page:ApiPageEntity)
     @Query("DELETE FROM api_pages WHERE pageId=:pageId") suspend fun deleteApiPage(pageId:String)
     @Query("SELECT * FROM api_notebooks ORDER BY sortOrder") suspend fun apiNotebooks():List<ApiNotebookEntity>

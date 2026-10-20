@@ -201,13 +201,16 @@ class ApiSyncClient(
         dao.putApiOutbox(ApiSyncOutboxEntity(UUID.randomUUID().toString(),workspaceId,type,id,expected,operation,gson.toJson(payload)))
     }
 
+    private suspend fun libraryRootPageId(folderId:String)=dao.apiPagesWithLibraryRootMarker().firstOrNull{libraryRootSectionId(it.payloadJson)==folderId}?.pageId
     suspend fun queueNote(workspaceId:String,note:NoteEntity) {
         val page=dao.apiPage(note.id)?.payloadJson?.let{runCatching{JsonParser.parseString(it).asJsonObject.deepCopy()}.getOrNull()}?:JsonObject()
         page.apply{
             addProperty("id",note.id);addProperty("workspaceId",workspaceId)
             if(note.folderId!=null)addProperty("sectionId",note.folderId)else remove("sectionId")
             if(note.icon!=null)addProperty("icon",note.icon)else remove("icon")
-            if(note.parentPageId!=null)addProperty("parentPageId",note.parentPageId)else remove("parentPageId")
+            // A top-level note of a library belongs under the library's desktop root page.
+            val parent=note.parentPageId?:note.folderId?.takeIf{note.itemType=="note"}?.let{libraryRootPageId(it)}?.takeIf{it!=note.id}
+            if(parent!=null)addProperty("parentPageId",parent)else remove("parentPageId")
             addProperty("sortOrder",note.sortOrder);addProperty("treeUpdatedAt",iso(note.treeUpdatedAt))
             addProperty("kind",if(note.itemType=="todo")"task" else string("kind","document"))
             addProperty("title",note.title);addProperty("preview",note.previewText)
