@@ -572,6 +572,13 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         try{events.collect{onBackProgress(it.progress)};flushLatestAndFinish()}
         catch(cancelled:kotlinx.coroutines.CancellationException){onBackProgress(0f);throw cancelled}
     }
+    // A note with no body but sub-notes opens as a list of them instead of a blank page.
+    val emptyParent=remember(hierarchyNotes,n.id,n.itemType,n.deletedAt,n.body.isBlank()){
+        if(n.itemType=="note"&&n.deletedAt==null&&n.body.isBlank()){
+            val index=NoteHierarchyIndex(hierarchyNotes)
+            index.children[n.id].orEmpty().takeIf{it.isNotEmpty()}?.let{kids->kids to index.children.mapNotNull{(parent,list)->parent?.let{it to list.size}}.toMap()}
+        }else null
+    }
     Column(Modifier.fillMaxSize().background(notePageBackground()).statusBarsPadding().navigationBarsPadding()){
         saveError?.let{Text(it,Modifier.padding(16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
         editorMessage?.let{Text(it,Modifier.padding(16.dp).clickable{editorMessage=null},color=MaterialTheme.colorScheme.error)}
@@ -611,7 +618,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
         }
         if(n.itemType=="note"&&n.deletedAt==null)NoteBreadcrumb(n,hierarchyNotes,{onOpenNote(it)},{editorKeyboard?.hide();editorFocus.clearFocus();scope.launch{repo.flushDraft(latestDraft.value).join();if(repo.noteSaveStates.value[n.id]!=NoteSaveState.Failed){showHierarchy=true}}})
         if(!editMode){
-            ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
+            if(emptyParent!=null)ChildNotesOverview(n.title,n.icon,emptyParent.first,emptyParent.second,onOpenNote,{editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp))else ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
             if(n.deletedAt!=null)FloatingPill(Modifier.align(androidx.compose.ui.Alignment.CenterHorizontally).padding(horizontal=24.dp,vertical=16.dp)){
                 run {TextButton({scope.launch{runCatching{repo.restore(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it}}.onFailure{editorMessage=it.localizedMessage}}}){Text("恢复")};TextButton({permanentConfirm=true}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}
             }

@@ -392,7 +392,9 @@ internal fun ReferenceHome(
     val noteEntry: @Composable (NoteSummary, Boolean) -> Unit = { note, isPinned ->
         val raw = searchSnippets[note.id] ?: note.preview
         // Markdown-to-plain conversion is not free; do it once per text.
-        val preview = remember(note.id, raw) { cardPreview(raw) }
+        val plainPreview = remember(note.id, raw) { cardPreview(raw) }
+        // A note with no body but sub-notes says how many it holds, not nothing.
+        val preview = childAwarePreview(plainPreview, hierarchyIndex.children[note.id].orEmpty().size)
         val coordinates = remember(note.id) { arrayOfNulls<androidx.compose.ui.layout.LayoutCoordinates>(1) }
         val path = hierarchyIndex.path(note.id, false).takeIf { search || note.parentPageId != null }
         val click = {
