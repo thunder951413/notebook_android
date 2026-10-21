@@ -55,9 +55,12 @@ data class TtsState(
     val total: Int = 0,
     val speed: Float = 1f,
     val error: String? = null,
+    /** The note being read and the Markdown offset the current piece starts at (-1 when unknown), so the reader can follow along. */
+    val noteId: String? = null,
+    val position: Int = -1,
 )
 
-internal class TtsQueue(val title: String, val segments: List<String>, val settings: TtsSettings)
+internal class TtsQueue(val title: String, val segments: List<String>, val settings: TtsSettings, val noteId: String? = null, val offsets: List<Int> = emptyList())
 
 /** The reader's handle on reading aloud; the work itself runs in [TtsPlaybackService]. */
 object TtsPlayer {
@@ -69,10 +72,11 @@ object TtsPlayer {
 
     internal fun publish(update: (TtsState) -> TtsState) = mutableState.update(update)
 
-    fun start(context: Context, title: String, segments: List<String>, settings: TtsSettings) {
+    /** [offsets] gives, for each piece, where in note [noteId]'s Markdown it starts. */
+    fun start(context: Context, title: String, segments: List<String>, settings: TtsSettings, noteId: String? = null, offsets: List<Int> = emptyList()) {
         if (segments.isEmpty()) return
-        pending = TtsQueue(title, segments, settings)
-        mutableState.value = TtsState(TtsPhase.Loading, title, 0, segments.size, settings.speed)
+        pending = TtsQueue(title, segments, settings, noteId, offsets)
+        mutableState.value = TtsState(TtsPhase.Loading, title, 0, segments.size, settings.speed, noteId = noteId, position = offsets.firstOrNull() ?: -1)
         context.applicationContext.startForegroundService(
             Intent(context.applicationContext, TtsPlaybackService::class.java).setAction(TtsPlaybackService.ACTION_START),
         )
@@ -318,7 +322,7 @@ class TtsPlaybackService : Service() {
     private fun publish() {
         val current = queue ?: return
         val phase = phase()
-        TtsPlayer.publish { it.copy(phase = phase, title = current.title, index = index, total = current.segments.size, speed = speed, error = null) }
+        TtsPlayer.publish { it.copy(phase = phase, title = current.title, index = index, total = current.segments.size, speed = speed, error = null, noteId = current.noteId, position = current.offsets.getOrElse(index) { -1 }) }
         updateSession(phase, current)
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(current.title, phase))
     }

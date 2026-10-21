@@ -57,4 +57,21 @@ class TtsTextTest {
         assertTrue(TtsText.split("\n\n ... \n").isEmpty())
         assertTrue(TtsText.split("").isEmpty())
     }
+
+    @Test fun `each piece reports where it starts in the text`() {
+        val text = "第一句。第二句！\n第三句？"
+        val pieces = TtsText.splitWithStarts(text, firstMax = 4, max = 5)
+        assertEquals(listOf("第一句。", "第二句！", "第三句？"), pieces.map { it.text })
+        assertEquals(listOf(0, 4, 9), pieces.map { it.start })
+        pieces.forEach { assertTrue(text.startsWith(it.text.take(2), it.start)) }
+    }
+
+    @Test fun `spoken text maps back to the markdown it came from`() {
+        val spans = listOf(SpokenSpan(0, 0, 0), SpokenSpan(3, 100, 40), SpokenSpan(13, 200, 10))
+        assertEquals(0, spans.sourceOffsetAt(20, 0))
+        assertEquals(100, spans.sourceOffsetAt(20, 3))
+        assertEquals(120, spans.sourceOffsetAt(20, 8))
+        assertEquals(200, spans.sourceOffsetAt(20, 13))
+        assertEquals(-1, emptyList<SpokenSpan>().sourceOffsetAt(20, 5))
+    }
 }

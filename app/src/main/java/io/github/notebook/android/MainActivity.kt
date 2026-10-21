@@ -99,8 +99,11 @@ import io.github.notebook.android.update.AppUpdateViewModel
 import io.github.notebook.android.update.DownloadProgress
 import io.github.notebook.android.update.UpdatePhase
 import io.github.notebook.android.diagnostics.DiagnosticLogger
+import io.github.notebook.android.tts.TtsPhase
 import io.github.notebook.android.tts.TtsPlayer
 import io.github.notebook.android.tts.TtsReaderBar
+import io.github.notebook.android.tts.SpokenSpan
+import io.github.notebook.android.tts.sourceOffsetAt
 import io.github.notebook.android.tts.TtsText
 import io.github.notebook.android.tts.installSpeakMenu
 
@@ -885,18 +888,27 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         val selStart=(view?.selectionStart?:0).coerceIn(0,rendered.length)
         val selEnd=(view?.selectionEnd?:rendered.length).coerceIn(selStart,rendered.length)
         val firstText=if(view==null)"" else if(selectionOnly&&selEnd>selStart)rendered.substring(selStart,selEnd)else rendered.substring(selStart)
-        val rest=if(selectionOnly&&view!=null)emptyList()else document.blocks.drop(if(view==null)fromBlock else fromBlock+1).filter{it.kind!=MarkdownBlockKind.Blank}.map{it.text}
+        // Where each block's text sits in the spoken text and in the Markdown, to follow the voice through the note.
+        val spans=ArrayList<SpokenSpan>()
+        val sourceOfView=if(view!=null)blocks.getOrNull(fromBlock)?.let{b->b.startUtf16+(selStart.toDouble()/rendered.length.coerceAtLeast(1)*b.text.length).roundToInt()} else null
+        val sourceEndOfView=if(view!=null)blocks.getOrNull(fromBlock)?.endUtf16 else null
         withNotifications{scope.launch{
-            val segments=withContext(Dispatchers.Default){
+            val pieces=withContext(Dispatchers.Default){
                 val text=buildString{
-                    if(view==null&&note.title.isNotBlank())append(note.title).append("。\n")
+                    if(view==null&&note.title.isNotBlank()){spans+=SpokenSpan(0,0,0);append(note.title).append("。\n")}
+                    if(sourceOfView!=null&&sourceEndOfView!=null)spans+=SpokenSpan(length,sourceOfView,sourceEndOfView-sourceOfView)
                     append(firstText).append('\n')
-                    rest.forEach{append(TtsText.plainText(NotebookAssetSyntax.withoutImages(it))).append('\n')}
+                    val restBlocks=document.blocks.drop(if(view==null)fromBlock else fromBlock+1).filter{it.kind!=MarkdownBlockKind.Blank}
+                    if(selectionOnly&&view!=null)Unit else restBlocks.forEach{b->
+                        spans+=SpokenSpan(length,b.startUtf16,b.endUtf16-b.startUtf16)
+                        append(TtsText.plainText(NotebookAssetSyntax.withoutImages(b.text))).append('\n')
+                    }
                 }
-                TtsText.split(text,max=settings.api.chunkLimit)
+                TtsText.splitWithStarts(text,max=settings.api.chunkLimit).map{it to spans.sourceOffsetAt(text.length,it.start)}
             }
+            val segments=pieces.map{it.first.text}
             if(segments.isEmpty())android.widget.Toast.makeText(speechContext,"没有可朗读的文字",android.widget.Toast.LENGTH_SHORT).show()
-            else{TtsPlayer.dismissError();TtsPlayer.start(speechContext,note.title.ifBlank{"无标题"},segments,settings)}
+            else{TtsPlayer.dismissError();TtsPlayer.start(speechContext,note.title.ifBlank{"无标题"},segments,settings,note.id,pieces.map{it.second})}
         }}
     }
     LaunchedEffect(readerAction){when(readerAction){"speak"->speak(0,null,false);"outline"->showingOutline=true;"find"->showingSearch=true;"backlinks"->showingBacklinks=true;"settings"->showingSettings=true};if(readerAction!=null)onActionConsumed()}
@@ -919,6 +931,26 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     }
     LaunchedEffect(note.id,restored,blocks){if(restored)snapshotFlow{state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset}.collectLatest{delay(450);val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}
     DisposableEffect(note.id){onDispose{if(latestRestored){val (anchor,fraction)=capturedPosition();repo.recordReadingPosition(note.id,anchor,fraction)}}}
+    // Read aloud, the page follows the voice and the spoken place counts as the place seen (so it syncs as the reading position).
+    val spoken by TtsPlayer.state.collectAsState()
+    val followed=if(spoken.noteId==note.id&&spoken.phase!=TtsPhase.Idle)spoken.position else -1
+    LaunchedEffect(note.id,followed,restored,blocks){
+        if(followed<0||!restored||blocks.isEmpty())return@LaunchedEffect
+        val anchor=followed.coerceIn(0,note.body.length)
+        repo.recordReadingPosition(note.id,anchor,0.0)
+        if(state.isScrollInProgress)return@LaunchedEffect
+        val blockIndex=blocks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+blockIndex
+        state.scrollToItem(itemIndex)
+        for(attempt in 0 until 30){
+            val view=views[blockIndex];val layout=view?.layout
+            if(layout!=null&&view.text.isNotEmpty()){
+                val block=blocks[blockIndex];val sourceLocal=(anchor-block.startUtf16).coerceIn(0,block.text.length)
+                val rendered=(sourceLocal.toDouble()/block.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1))
+                state.scrollToItem(itemIndex,layout.getLineTop(layout.getLineForOffset(rendered)).coerceAtLeast(0));break
+            }
+            delay(16)
+        }
+    }
     Box(modifier){LazyColumn(Modifier.fillMaxSize(),state=state,contentPadding=PaddingValues(top=if(showingSearch)64.dp else 0.dp,bottom=36.dp),horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){
         item(key="reader-tools"){Text(java.text.SimpleDateFormat("yyyy/M/d HH:mm",Locale.CHINA).format(Date(note.createdAt)),Modifier.fillMaxWidth().padding(top=8.dp),fontSize=13.sp,lineHeight=18.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}
         item(key="note-title"){Text(note.title.ifBlank{"无标题"},fontSize=32.sp,lineHeight=42.sp,fontWeight=FontWeight.Bold,modifier=Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(top=8.dp,bottom=4.dp).testTag("reader-note-${note.id}"))}
