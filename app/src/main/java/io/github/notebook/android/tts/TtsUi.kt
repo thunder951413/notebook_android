@@ -16,7 +16,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.util.Locale
 
 private const val SPEAK_FROM_HERE = 0x7701
 private const val SPEAK_SELECTION = 0x7702
@@ -73,7 +72,7 @@ fun TtsReaderBar(modifier: Modifier = Modifier, onSpeedChosen: (Float) -> Unit) 
                 val next = TtsSettings.SPEEDS.firstOrNull { it > state.speed + 0.01f } ?: TtsSettings.SPEEDS.first()
                 TtsPlayer.setSpeed(next)
                 onSpeedChosen(next)
-            }) { Text(String.format(Locale.ROOT, "%.2g×", state.speed).replace(".0×", "×")) }
+            }) { Text(state.speed.toBigDecimal().setScale(2, java.math.RoundingMode.HALF_UP).stripTrailingZeros().toPlainString() + "×") }
             IconButton(TtsPlayer::previous) { Icon(Icons.Default.SkipPrevious, "上一段") }
             IconButton(TtsPlayer::toggle) {
                 Icon(if (state.phase == TtsPhase.Paused) Icons.Default.PlayArrow else Icons.Default.Pause, if (state.phase == TtsPhase.Paused) "继续" else "暂停")

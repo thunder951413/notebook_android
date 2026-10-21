@@ -46,6 +46,47 @@ class TtsClientTest {
         assertTrue(!input.has("language_type"))
     }
 
+    @Test fun `千问AI平台 uses the audio request shape on its own host`() {
+        assertEquals("https://cn-beijing.maas.qianwenaiapi.com/api/v1/services/audio/tts/SpeechSynthesizer", TtsApi.QianwenAudio.defaultEndpoint)
+        val request = TtsClient.buildRequest(
+            settings(TtsApi.QianwenAudio).copy(model = "qwen-audio-3.0-tts-flash", voice = "longanhuan_v3.6"), "你好",
+        )
+        val buffer = okio.Buffer().also { request.body!!.writeTo(it) }
+        val body = JsonParser.parseString(buffer.readUtf8()).asJsonObject
+        assertEquals("qwen-audio-3.0-tts-flash", body["model"].asString)
+        val input = body.getAsJsonObject("input")
+        assertEquals("longanhuan_v3.6", input["voice"].asString)
+        assertEquals("mp3", input["format"].asString)
+        assertTrue(!input.has("language_type"))
+    }
+
+    @Test fun `voices follow the model`() {
+        assertEquals(68, TtsVoices.of(TtsApi.QianwenAudio, "qwen-audio-3.1-tts-flash").size)
+        assertEquals(12, TtsVoices.of(TtsApi.QianwenAudio, "qwen-audio-3.0-tts-flash").size)
+        assertEquals(2, TtsVoices.of(TtsApi.QianwenAudio, "qwen-audio-3.0-tts-plus").size)
+        assertEquals(48, TtsVoices.of(TtsApi.Qwen3Flash, "qwen3-tts-flash").size)
+    }
+
+    @Test fun `a pasted websocket address becomes the http synthesis address`() {
+        assertEquals(
+            "https://cn-beijing.maas.qianwenaiapi.com/api/v1/services/audio/tts/SpeechSynthesizer",
+            TtsClient.normalizeEndpoint(" wss://cn-beijing.maas.qianwenaiapi.com/api-ws/v1/inference "),
+        )
+        assertEquals("https://example.com/tts", TtsClient.normalizeEndpoint("https://example.com/tts"))
+        val request = TtsClient.buildRequest(
+            settings(TtsApi.QianwenAudio).copy(endpoint = "wss://cn-beijing.maas.qianwenaiapi.com/api-ws/v1/inference"), "你好",
+        )
+        assertEquals("/api/v1/services/audio/tts/SpeechSynthesizer", request.url.encodedPath)
+    }
+
+    @Test fun `every interface has voices without duplicates and a usable default`() {
+        TtsApi.entries.forEach { api ->
+            val voices = TtsVoices.of(api, api.defaultModel)
+            assertEquals(voices.size, voices.map { it.id }.toSet().size)
+            assertTrue("${api.name} default voice is listed", voices.any { it.id == api.defaultVoice })
+        }
+    }
+
     @Test fun `unfinished or insecure settings are rejected before any request`() {
         listOf(
             settings().copy(apiKey = ""),

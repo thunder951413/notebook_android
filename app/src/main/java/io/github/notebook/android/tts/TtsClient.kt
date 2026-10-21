@@ -34,7 +34,7 @@ class TtsClient(
     suspend fun synthesize(settings: TtsSettings, text: String, directory: File): TtsAudio = withContext(Dispatchers.IO) {
         val link = requestAudio(settings, text)
         directory.mkdirs()
-        val file = File.createTempFile("tts-", if (settings.api == TtsApi.QwenAudio) ".mp3" else ".wav", directory)
+        val file = File.createTempFile("tts-", if (settings.api.isAudioStyle) ".mp3" else ".wav", directory)
         try {
             download(link.url, file)
             TtsAudio(file, link.characters ?: text.length)
@@ -85,7 +85,7 @@ class TtsClient(
         private val LAN_HTTP = Regex("^http://(127\\.0\\.0\\.1|localhost|10\\.0\\.2\\.2|192\\.168\\.\\d+\\.\\d+)(:\\d+)?(/|$)")
 
         fun buildRequest(settings: TtsSettings, text: String): Request {
-            val endpoint = settings.endpoint.trim()
+            val endpoint = normalizeEndpoint(settings.endpoint)
             require(settings.apiKey.isNotBlank()) { "请先填写朗读服务的 API Key" }
             require(endpoint.isNotEmpty() && !endpoint.contains('<')) { "请先填写完整的接口地址（业务空间 ID）" }
             require(endpoint.startsWith("https://") || LAN_HTTP.containsMatchIn(endpoint)) { "朗读接口地址必须使用 HTTPS（局域网地址除外）" }
@@ -95,7 +95,7 @@ class TtsClient(
                 addProperty("voice", settings.voice.trim())
                 when (settings.api) {
                     TtsApi.Qwen3Flash -> addProperty("language_type", settings.language.ifBlank { "Auto" })
-                    TtsApi.QwenAudio -> {
+                    TtsApi.QwenAudio, TtsApi.QianwenAudio -> {
                         addProperty("format", "mp3")
                         addProperty("sample_rate", 24000)
                         if (settings.instruction.isNotBlank()) addProperty("instruction", settings.instruction.trim())
@@ -109,6 +109,18 @@ class TtsClient(
             return Request.Builder().url(url)
                 .header("Authorization", "Bearer ${settings.apiKey.trim()}")
                 .post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType())).build()
+        }
+
+        private val SOCKET_ENDPOINT = Regex("^wss://([^/]+)/api-ws/v1/inference/?$")
+
+        /**
+         * The platform documents a WebSocket address (`wss://HOST/api-ws/v1/inference`); the
+         * same host serves the plain HTTP synthesis path this client uses.
+         */
+        fun normalizeEndpoint(raw: String): String {
+            val endpoint = raw.trim()
+            val socket = SOCKET_ENDPOINT.find(endpoint) ?: return endpoint
+            return "https://${socket.groupValues[1]}/api/v1/services/audio/tts/SpeechSynthesizer"
         }
 
         fun parseAudioUrl(json: JsonObject): String =

@@ -82,12 +82,14 @@ internal fun TtsSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
         SectionLabel("接口")
         Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TtsApi.entries.forEach { option ->
                         FilterChip(
                             selected = api == option,
                             onClick = {
                                 if (api != option) {
+                                    // Keep a price the user typed; swap it only while it is still the old default.
+                                    if (priceText.toFloatOrNull() == api.defaultUnitPrice) priceText = trimNumber(option.defaultUnitPrice)
                                     api = option
                                     endpoint = option.defaultEndpoint
                                     model = option.defaultModel
@@ -112,6 +114,21 @@ internal fun TtsSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
                     },
                     supportingText = { Text("只保存在本机的加密存储中，不会同步。") },
                 )
+                if (api.models.size > 1) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        api.models.forEach { option ->
+                            FilterChip(
+                                selected = model == option,
+                                onClick = {
+                                    model = option
+                                    // A voice only works with its own model.
+                                    if (TtsVoices.of(api, option).none { it.id == voice }) voice = TtsVoices.of(api, option).first().id
+                                },
+                                label = { Text(option.removePrefix("qwen-audio-").removeSuffix("-tts-flash").let { if (it == option) option.removePrefix("qwen-audio-") else "$it flash" }) },
+                            )
+                        }
+                    }
+                }
                 OutlinedTextField(model, { model = it }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("模型") })
             }
         }
@@ -119,7 +136,7 @@ internal fun TtsSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
         SectionLabel("音色")
         Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                val known = TtsVoices.of(api).firstOrNull { it.id == voice }
+                val known = TtsVoices.of(api, model).firstOrNull { it.id == voice }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(known?.name ?: voice.ifBlank { "未选择" }, fontSize = 18.sp)
@@ -135,7 +152,7 @@ internal fun TtsSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
                     voice, { voice = it }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("音色 ID") },
                     supportingText = { Text("可直接填写自己的复刻或设计音色 ID。") },
                 )
-                if (api == TtsApi.Qwen3Flash) {
+                if (!api.isAudioStyle) {
                     Text("语种", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         TTS_LANGUAGES.forEach { (code, label) ->
@@ -159,8 +176,8 @@ internal fun TtsSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
         SectionLabel("播放")
         Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface) {
             Column(Modifier.padding(16.dp)) {
-                Text("语速 ${String.format(Locale.ROOT, "%.1f", speed)}×")
-                Slider(speed, { speed = (it * 10).roundToInt() / 10f }, valueRange = 0.5f..2f, steps = 14)
+                Text("语速 ${trimNumber(speed)}×")
+                Slider(speed, { speed = (it * 20).roundToInt() / 20f }, valueRange = 0.5f..TtsSettings.MAX_SPEED, steps = 49)
             }
         }
 
@@ -245,7 +262,7 @@ internal fun TtsSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
     if (picking) {
         ModalBottomSheet(onDismissRequest = { picking = false }) {
             Text("选择音色", Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.titleLarge)
-            LazyVoiceList(TtsVoices.of(api), voice) {
+            LazyVoiceList(TtsVoices.of(api, model), voice) {
                 voice = it.id
                 picking = false
             }
