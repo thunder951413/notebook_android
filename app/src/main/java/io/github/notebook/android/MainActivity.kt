@@ -102,6 +102,7 @@ import io.github.notebook.android.diagnostics.DiagnosticLogger
 import io.github.notebook.android.tts.TtsPhase
 import io.github.notebook.android.tts.TtsPlayer
 import io.github.notebook.android.tts.TtsReaderBar
+import io.github.notebook.android.tts.TtsMiniPlayer
 import io.github.notebook.android.tts.SpokenSpan
 import io.github.notebook.android.tts.sourceOffsetAt
 import io.github.notebook.android.tts.TtsText
@@ -111,6 +112,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var repository:SyncRepository
     private val notificationTarget=mutableStateOf<String?>(null)
     private val incomingShare=mutableStateOf<IncomingShare?>(null)
+    private val ttsOpenTarget=mutableStateOf<String?>(null)
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         Reminders.createChannel(this)
@@ -118,7 +120,10 @@ class MainActivity : ComponentActivity() {
         repository = (application as NotebookApp).repository
         notificationTarget.value=noteIdFromIntent(intent)
         if(state==null)incomingShare.value=incomingShareFromIntent(intent)
-        setContent { NotebookTheme { NotebookScreen(repository,notificationTarget.value,{notificationTarget.value=null},incomingShare.value){incomingShare.value=null} } }
+        setContent { NotebookTheme { Box(Modifier.fillMaxSize()){
+            NotebookScreen(repository,notificationTarget.value,{notificationTarget.value=null},incomingShare.value,{incomingShare.value=null},ttsOpenTarget.value){ttsOpenTarget.value=null}
+            TtsMiniPlayer(onOpenNote={ttsOpenTarget.value=it},onSpeedChosen={repository.saveTtsSettings(repository.ttsSettings().copy(speed=it))})
+        } } }
     }
     override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);notificationTarget.value=noteIdFromIntent(intent);incomingShareFromIntent(intent)?.let{incomingShare.value=it}}
     override fun onStart(){super.onStart();repository.requestForegroundSync()}
@@ -179,7 +184,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun NotebookScreen(repo:SyncRepository,notificationNoteId:String?=null,onNotificationConsumed:()->Unit={},incoming:IncomingShare?=null,onIncomingHandled:()->Unit={}) {
+@Composable private fun NotebookScreen(repo:SyncRepository,notificationNoteId:String?=null,onNotificationConsumed:()->Unit={},incoming:IncomingShare?=null,onIncomingHandled:()->Unit={},ttsOpenNoteId:String?=null,onTtsOpenHandled:()->Unit={}) {
     val all by repo.notes.collectAsState(initial=emptyList())
     val folders by repo.folders.collectAsState(initial=emptyList())
     val tags by repo.tags.collectAsState(initial=emptyList())
@@ -295,6 +300,12 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             if(result!=null&&result.ids.isNotEmpty()){delay(1_500);repo.rememberSearch(query)}
         }
     }
+    // "打开笔记" in the floating read-aloud player: leave whatever screen is up and show the note being read.
+    LaunchedEffect(ttsOpenNoteId){ttsOpenNoteId?.let{id->
+        showAi=false;showSettings=false;manage=null
+        if(editing?.id!=id)openNote(id)
+        onTtsOpenHandled()
+    }}
     LaunchedEffect(notificationNoteId,all){notificationNoteId?.let{id->
         all.firstOrNull{it.id==id}?.let{target->
             destination=if(target.itemType=="todo")Destination.Today else Destination.All
@@ -983,7 +994,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         }
         if(showBody&&note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider(Modifier.widthIn(max=readerStyle.maxWidthDp.dp))};items(steps,key={"read-step-${it.id}"}){step->Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
         if(showBody)items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
-    };ReaderScrollIndicator(state);TtsReaderBar(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).padding(horizontal=12.dp,vertical=10.dp),{repo.saveTtsSettings(repo.ttsSettings().copy(speed=it))});if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
+    };ReaderScrollIndicator(state);TtsReaderBar(note.id,Modifier.align(androidx.compose.ui.Alignment.BottomCenter).padding(horizontal=12.dp,vertical=10.dp),{repo.saveTtsSettings(repo.ttsSettings().copy(speed=it))});if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
     if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){if(document.headings.isEmpty())Text("添加标题后，这里会出现目录",Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant);Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);val reading=blocks.getOrNull(state.firstVisibleItemIndex-bodyStart)?.startUtf16;val active=if(reading==null)-1 else activeHeadingIndex(document.headings,reading);val listState=rememberLazyListState(maxOf(0,active-2));LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp),listState){itemsIndexed(document.headings,key={_,h->h.blockId}){index,heading->OutlineRow(heading.title,heading.level,index==active,2){val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}}};Spacer(Modifier.height(24.dp))}
     if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(visibleBacklinks.isEmpty())Text("还没有其他可查看的页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(visibleBacklinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when{link.id.contains(":title:")->"以标题链接到此页";link.targetKind=="block"->"引用了内容块";link.targetKind=="group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}

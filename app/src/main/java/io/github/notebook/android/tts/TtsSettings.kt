@@ -75,7 +75,7 @@ data class TtsSettings(
     companion object {
         const val DEFAULT_SPEED = 1.25f
         const val MAX_SPEED = 3f
-        val SPEEDS = listOf(0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f)
+        val SPEEDS = listOf(0.75f, 1f, 1.1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f)
     }
 }
 
