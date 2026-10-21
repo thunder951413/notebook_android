@@ -98,6 +98,10 @@ import io.github.notebook.android.update.AppUpdateViewModel
 import io.github.notebook.android.update.DownloadProgress
 import io.github.notebook.android.update.UpdatePhase
 import io.github.notebook.android.diagnostics.DiagnosticLogger
+import io.github.notebook.android.tts.TtsPlayer
+import io.github.notebook.android.tts.TtsReaderBar
+import io.github.notebook.android.tts.TtsText
+import io.github.notebook.android.tts.installSpeakMenu
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository:SyncRepository
@@ -106,6 +110,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         Reminders.createChannel(this)
+        io.github.notebook.android.ui.Appearance.load(this)
         repository = (application as NotebookApp).repository
         notificationTarget.value=noteIdFromIntent(intent)
         if(state==null)incomingShare.value=incomingShareFromIntent(intent)
@@ -608,6 +613,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 RoundTool(Icons.Default.IosShare,"分享与导出",{exportSheet=true})
                 Box{RoundTool(Icons.Default.MoreVert,"笔记更多",{moreMenu=true});DropdownMenu(moreMenu,{moreMenu=false}){
                     if(n.itemType!="todo"){
+                        DropdownMenuItem({Text("朗读全文")},{moreMenu=false;readerAction="speak"},leadingIcon={Icon(Icons.Default.RecordVoiceOver,null)})
                         DropdownMenuItem({Text("文档内查找")},{moreMenu=false;readerAction="find"})
                         DropdownMenuItem({Text("反向链接")},{moreMenu=false;readerAction="backlinks"},leadingIcon={Icon(Icons.Default.Link,null)})
                         DropdownMenuItem({Text("阅读设置")},{moreMenu=false;readerAction="settings"},leadingIcon={Icon(Icons.Default.TextFields,null)})
@@ -860,7 +866,39 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     val document=ready.document;val blocks=if(showBody)document.blocks else emptyList();val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)3 else 2;val state=remember(note.id){val anchor=ReaderDocumentCache.takeStart(note.id);androidx.compose.foundation.lazy.LazyListState(anchor?.let{a->bodyStart+document.blocks.indexOfLast{it.startUtf16<=a}.coerceAtLeast(0)}?:0)};val scope=rememberCoroutineScope();val views=remember(note.id,note.body){mutableMapOf<Int,TextView>()}
     val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingBacklinks by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
     val searchMatches=remember(note.body,searchQuery){if(searchQuery.isBlank())emptyList()else buildList{var start=0;while(size<10_000){val found=note.body.indexOf(searchQuery,start,ignoreCase=true);if(found<0)break;add(found);start=found+searchQuery.length.coerceAtLeast(1)}}}
-    LaunchedEffect(readerAction){when(readerAction){"outline"->showingOutline=true;"find"->showingSearch=true;"backlinks"->showingBacklinks=true;"settings"->showingSettings=true};if(readerAction!=null)onActionConsumed()}
+    val speechContext=LocalContext.current
+    var pendingSpeech by remember{mutableStateOf<(()->Unit)?>(null)}
+    val notifyPermission=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){pendingSpeech?.invoke();pendingSpeech=null}
+    // Reading aloud keeps going with the screen off; the notification carries its controls.
+    fun withNotifications(action:()->Unit){
+        val asked=speechContext.getSharedPreferences("editor_preferences",0)
+        if(android.os.Build.VERSION.SDK_INT>=33&&speechContext.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=android.content.pm.PackageManager.PERMISSION_GRANTED&&!asked.getBoolean("ttsNotificationAsked",false)){
+            asked.edit().putBoolean("ttsNotificationAsked",true).apply();pendingSpeech=action;notifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }else action()
+    }
+    /** [fromBlock] with a view reads from the selection to the end (or just the selection); no view reads the whole note. */
+    fun speak(fromBlock:Int,view:TextView?,selectionOnly:Boolean){
+        val settings=repo.ttsSettings()
+        if(!settings.configured){android.widget.Toast.makeText(speechContext,"请先在 设置 → 语音朗读 里填写接口和 API Key",android.widget.Toast.LENGTH_LONG).show();return}
+        val rendered=view?.text?.toString().orEmpty()
+        val selStart=(view?.selectionStart?:0).coerceIn(0,rendered.length)
+        val selEnd=(view?.selectionEnd?:rendered.length).coerceIn(selStart,rendered.length)
+        val firstText=if(view==null)"" else if(selectionOnly&&selEnd>selStart)rendered.substring(selStart,selEnd)else rendered.substring(selStart)
+        val rest=if(selectionOnly&&view!=null)emptyList()else document.blocks.drop(if(view==null)fromBlock else fromBlock+1).filter{it.kind!=MarkdownBlockKind.Blank}.map{it.text}
+        withNotifications{scope.launch{
+            val segments=withContext(Dispatchers.Default){
+                val text=buildString{
+                    if(view==null&&note.title.isNotBlank())append(note.title).append("。\n")
+                    append(firstText).append('\n')
+                    rest.forEach{append(TtsText.plainText(NotebookAssetSyntax.withoutImages(it))).append('\n')}
+                }
+                TtsText.split(text,max=settings.api.chunkLimit)
+            }
+            if(segments.isEmpty())android.widget.Toast.makeText(speechContext,"没有可朗读的文字",android.widget.Toast.LENGTH_SHORT).show()
+            else{TtsPlayer.dismissError();TtsPlayer.start(speechContext,note.title.ifBlank{"无标题"},segments,settings)}
+        }}
+    }
+    LaunchedEffect(readerAction){when(readerAction){"speak"->speak(0,null,false);"outline"->showingOutline=true;"find"->showingSearch=true;"backlinks"->showingBacklinks=true;"settings"->showingSettings=true};if(readerAction!=null)onActionConsumed()}
     fun navigateSearch(delta:Int){if(searchMatches.isEmpty())return;searchIndex=(searchIndex+delta).mod(searchMatches.size);val offset=searchMatches[searchIndex];val blockIndex=blocks.indexOfLast{it.startUtf16<=offset}.coerceAtLeast(0);launchScroll(scope,state,bodyStart+blockIndex)}
     var restored by remember(note.id){mutableStateOf(false)};val latestRestored by rememberUpdatedState(restored)
     fun capturedPosition():Pair<Int,Double>{
@@ -898,7 +936,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
                     }else if(block.kind==MarkdownBlockKind.List&&block.text.lines().all{it.isBlank()||Regex("^[ \t]*[-+*] \\[[ xX]] .*").matches(it)}){
                         var lineOffset=block.startUtf16
                         block.text.lines().filter(String::isNotBlank).forEach{line->val at=lineOffset;lineOffset+=line.length+1;val match=Regex("^[ \t]*[-+*] \\[([ xX])] (.*)").find(line)!!;val checked=match.groupValues[1].equals("x",true);Row(Modifier.fillMaxWidth(),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Checkbox(checked,{next->val marker=at+line.indexOf('[')+1;onUpdateBody(note.body.replaceRange(marker,marker+1,if(next)"x" else " "))},enabled=note.deletedAt==null);Text(match.groupValues[2],textDecoration=if(checked)androidx.compose.ui.text.style.TextDecoration.LineThrough else null,color=if(checked)MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface)}}
-                    }else if(displayMarkdown.isNotBlank())MarkdownView(markdown=displayMarkdown,modifier=Modifier.fillMaxWidth(),style=readerStyle,highlightQuery=searchQuery,onNotebookLink=::openReference,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)},renderer=markwon,prerendered=ready.spans[displayMarkdown])
+                    }else if(displayMarkdown.isNotBlank())MarkdownView(markdown=displayMarkdown,modifier=Modifier.fillMaxWidth(),style=readerStyle,highlightQuery=searchQuery,onNotebookLink=::openReference,onViewReady={views[index]=it},onViewReleased={if(views[index]===it)views.remove(index)},renderer=markwon,prerendered=ready.spans[displayMarkdown],onSpeak={view,selectionOnly->speak(index,view,selectionOnly)})
                     val blockReferences=references.filter{it.start in block.startUtf16 until block.endUtf16}
                     if(blockReferences.isNotEmpty())FlowRow(Modifier.padding(top=6.dp),horizontalArrangement=Arrangement.spacedBy(6.dp)){
                         blockReferences.forEach{reference->
@@ -912,7 +950,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
         }
         if(showBody&&note.itemType=="todo"&&steps.isNotEmpty()){item(key="todo-divider"){HorizontalDivider(Modifier.widthIn(max=readerStyle.maxWidthDp.dp))};items(steps,key={"read-step-${it.id}"}){step->Row(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(if(step.checked)Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,null);Text(step.text,Modifier.padding(8.dp))}}}
         if(showBody)items(attachments.filter{it.id !in referencedAssetIds},key={"read-asset-${it.id}"}){Box(Modifier.fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp)){AttachmentView(it)}}
-    };ReaderScrollIndicator(state);if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
+    };ReaderScrollIndicator(state);TtsReaderBar(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).padding(horizontal=12.dp,vertical=10.dp),{repo.saveTtsSettings(repo.ttsSettings().copy(speed=it))});if(showingSearch)Surface(Modifier.align(androidx.compose.ui.Alignment.TopCenter).fillMaxWidth().widthIn(max=readerStyle.maxWidthDp.dp).padding(vertical=4.dp),shape=MaterialTheme.shapes.large,tonalElevation=4.dp){Row(Modifier.padding(horizontal=10.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){OutlinedTextField(searchQuery,{searchQuery=it;searchIndex=0},Modifier.weight(1f),singleLine=true,label={Text("搜索当前文档")});Text(if(searchMatches.isEmpty())"0/0" else "${searchIndex+1}/${searchMatches.size}",Modifier.padding(horizontal=8.dp),style=MaterialTheme.typography.labelMedium);IconButton({navigateSearch(-1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowUp,"上一个")};IconButton({navigateSearch(1)},enabled=searchMatches.isNotEmpty()){Icon(Icons.Default.KeyboardArrowDown,"下一个")};IconButton({showingSearch=false;searchQuery="";searchIndex=0}){Icon(Icons.Default.Close,"关闭搜索")}}}}
     if(showingOutline)ModalBottomSheet(onDismissRequest={showingOutline=false}){if(document.headings.isEmpty())Text("添加标题后，这里会出现目录",Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant);Text("目录",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(document.headings,key={it.blockId}){heading->ListItem(headlineContent={Text(heading.title,maxLines=2)},modifier=Modifier.clickable{val blockIndex=blocks.indexOfFirst{it.id==heading.blockId};if(blockIndex>=0)launchScroll(scope,state,bodyStart+blockIndex);showingOutline=false}.padding(start=((heading.level-1)*14).dp))}};Spacer(Modifier.height(24.dp))}
     if(showingBacklinks)ModalBottomSheet(onDismissRequest={showingBacklinks=false}){Text("链接到此页",Modifier.padding(horizontal=20.dp,vertical=8.dp),style=MaterialTheme.typography.titleLarge);if(visibleBacklinks.isEmpty())Text("还没有其他可查看的页面引用这里",Modifier.padding(20.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)else LazyColumn(Modifier.fillMaxWidth().heightIn(max=520.dp)){items(visibleBacklinks,key={it.id}){link->val source=allNotes.firstOrNull{it.id==link.sourceNoteId};ListItem(headlineContent={Text(source?.title?.ifBlank{"无标题"}?:"已删除页面")},supportingContent={Text(when{link.id.contains(":title:")->"以标题链接到此页";link.targetKind=="block"->"引用了内容块";link.targetKind=="group"->"引用了连续内容";else->"引用了此页面"})},leadingContent={Icon(if(link.embed)Icons.Default.DynamicFeed else Icons.Default.Link,null)},modifier=Modifier.clickable{showingBacklinks=false;openReference("notebook://page/${link.sourceNoteId}")})}};Spacer(Modifier.height(24.dp))}
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
@@ -982,7 +1020,7 @@ internal fun configureMarkdownTextView(view:TextView){
     view.importantForAccessibility=android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
 }
 
-@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,style:ReaderStyle=ReaderStyle(),highlightQuery:String="",onNotebookLink:(String)->Unit={},onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={},renderer:Markwon?=null,prerendered:android.text.Spanned?=null){val context=LocalContext.current;val color=MaterialTheme.colorScheme.onBackground.toArgb();val highlight=MaterialTheme.colorScheme.tertiaryContainer.toArgb();val latestNotebookLink by rememberUpdatedState(onNotebookLink);val markwon=renderer?:remember(context){createMarkdownRenderer(context){latestNotebookLink(it)}};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;configureMarkdownTextView(this)}},update={view->view.setTextColor(color);view.setTextSize(TypedValue.COMPLEX_UNIT_SP,style.fontSizeSp);view.setLineSpacing(0f,style.lineHeight);val renderKey=Triple(markdown,style.fontSizeSp,highlightQuery);if(view.tag!=renderKey){if(prerendered!=null&&highlightQuery.isBlank())markwon.setParsedMarkdown(view,prerendered)else markwon.setMarkdown(view,markdown);if(highlightQuery.isNotBlank()){val highlighted=SpannableString(view.text);var start=0;while(start<highlighted.length){val found=highlighted.toString().indexOf(highlightQuery,start,ignoreCase=true);if(found<0)break;highlighted.setSpan(BackgroundColorSpan(highlight),found,found+highlightQuery.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);start=found+highlightQuery.length.coerceAtLeast(1)};view.text=highlighted};view.tag=renderKey};onViewReady(view)},modifier=modifier)}
+@Composable private fun MarkdownView(markdown:String,modifier:Modifier=Modifier,style:ReaderStyle=ReaderStyle(),highlightQuery:String="",onNotebookLink:(String)->Unit={},onViewReady:(TextView)->Unit={},onViewReleased:(TextView)->Unit={},renderer:Markwon?=null,prerendered:android.text.Spanned?=null,onSpeak:((TextView,Boolean)->Unit)?=null){val context=LocalContext.current;val latestSpeak by rememberUpdatedState(onSpeak);val color=MaterialTheme.colorScheme.onBackground.toArgb();val highlight=MaterialTheme.colorScheme.tertiaryContainer.toArgb();val latestNotebookLink by rememberUpdatedState(onNotebookLink);val markwon=renderer?:remember(context){createMarkdownRenderer(context){latestNotebookLink(it)}};val holder=remember{arrayOfNulls<TextView>(1)};DisposableEffect(Unit){onDispose{holder[0]?.let(onViewReleased)}};AndroidView(factory={TextView(it).apply{holder[0]=this;configureMarkdownTextView(this);if(onSpeak!=null)installSpeakMenu{view,selectionOnly->latestSpeak?.invoke(view,selectionOnly)}}},update={view->view.setTextColor(color);view.setTextSize(TypedValue.COMPLEX_UNIT_SP,style.fontSizeSp);view.setLineSpacing(0f,style.lineHeight);val renderKey=Triple(markdown,style.fontSizeSp,highlightQuery);if(view.tag!=renderKey){if(prerendered!=null&&highlightQuery.isBlank())markwon.setParsedMarkdown(view,prerendered)else markwon.setMarkdown(view,markdown);if(highlightQuery.isNotBlank()){val highlighted=SpannableString(view.text);var start=0;while(start<highlighted.length){val found=highlighted.toString().indexOf(highlightQuery,start,ignoreCase=true);if(found<0)break;highlighted.setSpan(BackgroundColorSpan(highlight),found,found+highlightQuery.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);start=found+highlightQuery.length.coerceAtLeast(1)};view.text=highlighted};view.tag=renderKey};onViewReady(view)},modifier=modifier)}
 
 /** Known image proportions, from metadata or a bounds-only decode (cached). */
 private val imageRatioCache=java.util.concurrent.ConcurrentHashMap<String,Float>()

@@ -1,11 +1,16 @@
 package io.github.notebook.android.ui
 
+import android.app.Activity
+import android.graphics.drawable.ColorDrawable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 
 object NotebookColors {
@@ -19,7 +24,7 @@ object NotebookColors {
     val EditorDark = Color.Black
 }
 
-private val Light =
+private fun lightScheme(bg: BackgroundPreset) =
     lightColorScheme(
         primary = NotebookColors.AccentTextLight,
         onPrimary = Color.White,
@@ -27,20 +32,20 @@ private val Light =
         onPrimaryContainer = Color(0xFF452100),
         secondary = Color(0xFF191919),
         onSecondary = Color.White,
-        secondaryContainer = Color(0xFFE6E7E8),
+        secondaryContainer = bg.container,
         onSecondaryContainer = Color(0xFF191919),
         tertiary = NotebookColors.Accent,
         tertiaryContainer = Color(0xFFFFDDBE),
-        background = NotebookColors.EditorLight,
-        surface = Color.White,
-        surfaceVariant = NotebookColors.SidebarLight,
+        background = bg.page,
+        surface = bg.card,
+        surfaceVariant = bg.side,
         onBackground = Color(0xFF191919),
         onSurface = Color(0xFF191919),
         onSurfaceVariant = Color(0xFF757575),
         outline = Color(0xFF989A9D),
-        outlineVariant = Color(0xFFE4E5E6),
+        outlineVariant = bg.divider,
     )
-private val Dark =
+private fun darkScheme(bg: BackgroundPreset) =
     darkColorScheme(
         primary = NotebookColors.Accent,
         onPrimary = Color.Black,
@@ -48,23 +53,31 @@ private val Dark =
         onPrimaryContainer = Color(0xFFFFDDBE),
         secondary = Color(0xFFEAEAEA),
         onSecondary = Color(0xFF191919),
-        secondaryContainer = Color(0xFF37383A),
+        secondaryContainer = bg.container,
         tertiary = NotebookColors.Accent,
         tertiaryContainer = Color(0xFF754414),
-        background = NotebookColors.EditorDark,
-        surface = NotebookColors.ListDark,
-        surfaceVariant = NotebookColors.SidebarDark,
+        background = bg.page,
+        surface = bg.card,
+        surfaceVariant = bg.side,
         onBackground = Color(0xFFF2F2F2),
         onSurface = Color(0xFFF2F2F2),
         onSurfaceVariant = Color(0xFFA4A5A7),
         outline = Color(0xFF7C7E81),
-        outlineVariant = Color(0xFF393A3C),
+        outlineVariant = bg.divider,
     )
 
 @Composable
-fun NotebookTheme(content: @Composable () -> Unit) =
+fun NotebookTheme(content: @Composable () -> Unit) {
+    val systemDark = isSystemInDarkTheme()
+    // Follows the system: the light and dark backgrounds are chosen separately.
+    val colors = if (systemDark) darkScheme(Appearance.dark) else lightScheme(Appearance.light)
+    // The window behind the first frame and the keyboard resize must match too.
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect { (view.context as? Activity)?.window?.setBackgroundDrawable(ColorDrawable(colors.background.toArgb())) }
+    }
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) Dark else Light,
+        colorScheme = colors,
         typography = Typography(),
         shapes =
             Shapes(
@@ -82,3 +95,4 @@ fun NotebookTheme(content: @Composable () -> Unit) =
             content = content,
         )
     }
+}
