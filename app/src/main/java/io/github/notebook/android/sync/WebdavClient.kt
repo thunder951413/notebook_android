@@ -151,11 +151,31 @@ class WebdavClient(
         request("DELETE", path).use { if (it.code != 404 && !it.isSuccessful) throw fail(it, "删除 $path 失败") }
     }
 
+    private fun remoteObjectExists(hash: String, expectedSize: Long): Boolean {
+        val path = objectPath(hash)
+        request("HEAD", path).use { response ->
+            when {
+                response.code == 404 -> return false
+                response.code == 405 -> {
+                    val existing = getBytes(path) ?: return false
+                    return expectedSize > 0L &&
+                        existing.size.toLong() == expectedSize &&
+                        WebdavJournalProtocol.sha256(existing).equals(hash, ignoreCase = true)
+                }
+                response.isSuccessful -> {
+                    if (expectedSize <= 0L) return false
+                    val remoteLength = response.header("Content-Length")?.trim()?.toLongOrNull()
+                    return if (remoteLength != null) remoteLength > 0L && remoteLength == expectedSize else true
+                }
+                else -> throw fail(response, "检查对象 $hash 失败")
+            }
+        }
+    }
+
     fun putObject(hash: String, bytes: ByteArray) {
         WebdavJournalProtocol.requireHash(hash)
         if (hash in knownObjects) return
-        val existing = getBytes(objectPath(hash))
-        if (existing != null && WebdavJournalProtocol.sha256(existing).equals(hash, ignoreCase = true)) {
+        if (remoteObjectExists(hash, bytes.size.toLong())) {
             knownObjects.add(hash)
             return
         }
@@ -168,8 +188,7 @@ class WebdavClient(
     fun putObject(hash: String, file: File) {
         WebdavJournalProtocol.requireHash(hash)
         if (hash in knownObjects) return
-        val existing = getBytes(objectPath(hash))
-        if (existing != null && existing.inputStream().use(WebdavJournalProtocol::sha256).equals(hash, ignoreCase = true)) {
+        if (remoteObjectExists(hash, file.length())) {
             knownObjects.add(hash)
             return
         }
@@ -182,6 +201,20 @@ class WebdavClient(
     /** GET as UTF-8 text, or null when the resource does not exist. */
     fun getText(path: String, maxBytes: Int = WebdavJournalProtocol.MAX_LOG_BYTES): String? =
         getBytes(path, maxBytes)?.toString(StandardCharsets.UTF_8)
+
+    /** GET as UTF-8 text together with any strong HTTP ETag reported by the server. */
+    internal fun getTextWithEtag(path: String, maxBytes: Int = WebdavJournalProtocol.MAX_LOG_BYTES): WebdavTextResponse? {
+        request("GET", path).use { response ->
+            if (response.code == 404) return null
+            if (!response.isSuccessful) throw fail(response, "下载 $path 失败")
+            val length = response.body?.contentLength() ?: -1
+            if (length > maxBytes) throw IOException("远端文件超过上限，已停止同步")
+            val bytes = response.body?.bytes() ?: throw IOException("下载 $path 失败：响应为空")
+            if (bytes.size > maxBytes) throw IOException("远端文件超过上限，已停止同步")
+            val etag = response.header("ETag")?.trim()?.takeIf(::isStrongWebdavEtag)
+            return WebdavTextResponse(bytes.toString(StandardCharsets.UTF_8), etag)
+        }
+    }
 
     fun getBytes(path: String, maxBytes: Int = WebdavJournalProtocol.MAX_OBJECT_BYTES): ByteArray? {
         request("GET", path).use { response ->
@@ -250,14 +283,32 @@ class WebdavClient(
         listNames("$root/journal").filter { it.endsWith(".jsonl") }.map { it.removeSuffix(".jsonl") }
             .filter { WebdavJournalProtocol.validDeviceId(it) }
 
-    /** Journal device IDs plus the file sizes the server reports for them (one PROPFIND). */
+    /** Journal device IDs plus file sizes, orphan `.head.json` peers, and strong ETags (one PROPFIND). */
     internal fun listJournal(): WebdavJournalListing {
         request("PROPFIND", "$root/journal", propfindBody, depth = "1").use { response ->
             if (response.code == 404) return WebdavJournalListing(emptyList(), emptyMap())
             if (!response.isSuccessful) throw fail(response, "读取远端目录 $root/journal 失败")
-            val items = parseWebdavListing(response.readPropfindBody("读取远端目录 $root/journal 失败"))
-                .mapNotNull { item -> webdavHrefBasename(item.href)?.takeIf { it.endsWith(".jsonl") }?.removeSuffix(".jsonl")?.takeIf(WebdavJournalProtocol::validDeviceId)?.let { it to item.size } }
-            return WebdavJournalListing(items.map { it.first }, items.mapNotNull { (name, size) -> size?.takeIf { it > 0 }?.let { name to it } }.toMap())
+            val rawItems = parseWebdavListing(response.readPropfindBody("读取远端目录 $root/journal 失败"))
+            val journalItems = rawItems.mapNotNull { item ->
+                webdavHrefBasename(item.href)
+                    ?.takeIf { it.endsWith(".jsonl") }
+                    ?.removeSuffix(".jsonl")
+                    ?.takeIf(WebdavJournalProtocol::validDeviceId)
+                    ?.let { it to item.size }
+            }
+            val headItems = rawItems.mapNotNull { item ->
+                webdavHrefBasename(item.href)
+                    ?.takeIf { it.endsWith(".head.json") }
+                    ?.removeSuffix(".head.json")
+                    ?.takeIf(WebdavJournalProtocol::validDeviceId)
+                    ?.let { it to item.etag }
+            }
+            val deviceIds = journalItems.map { it.first }.distinct()
+            val journalIdSet = deviceIds.toHashSet()
+            val sizes = journalItems.mapNotNull { (name, size) -> size?.takeIf { it > 0 }?.let { name to it } }.toMap()
+            val headOnlyDeviceIds = headItems.map { it.first }.distinct().filter { it !in journalIdSet }
+            val headEtags = headItems.mapNotNull { (name, etag) -> etag?.takeIf(::isStrongWebdavEtag)?.let { name to it } }.toMap()
+            return WebdavJournalListing(deviceIds, sizes, headOnlyDeviceIds, headEtags)
         }
     }
 
@@ -291,10 +342,23 @@ private const val MAX_PROPFIND_DEPTH = 128
 private val FORBIDDEN_XML_DECLARATION = Regex("<!\\s*(?:DOCTYPE|ENTITY)\\b", RegexOption.IGNORE_CASE)
 
 /** Android's pull parser has no external resolver. Declarations are rejected before parsing. */
-internal data class WebdavJournalListing(val deviceIds: List<String>, val sizes: Map<String, Long>)
+internal data class WebdavJournalListing(
+    val deviceIds: List<String>,
+    val sizes: Map<String, Long>,
+    val headOnlyDeviceIds: List<String> = emptyList(),
+    val headEtags: Map<String, String> = emptyMap(),
+)
 
-/** One child of a PROPFIND listing: its href and `getcontentlength` when the server reports it. */
-internal data class WebdavListingItem(val href: String, val size: Long?)
+internal data class WebdavTextResponse(val text: String, val etag: String?)
+
+/** True when [etag] is a non-empty strong HTTP entity tag (excludes `W/` weak tags). */
+internal fun isStrongWebdavEtag(etag: String?): Boolean {
+    val trimmed = etag?.trim().orEmpty()
+    return trimmed.isNotEmpty() && !trimmed.startsWith("W/", ignoreCase = true)
+}
+
+/** One child of a PROPFIND listing: its href, `getcontentlength` and `getetag` when reported. */
+internal data class WebdavListingItem(val href: String, val size: Long?, val etag: String? = null)
 
 internal fun parseWebdavHrefs(text: String): List<String> = parseWebdavListing(text).map { it.href }
 
@@ -314,8 +378,11 @@ internal fun parseWebdavListing(text: String): List<WebdavListingItem> {
         val items = mutableListOf<WebdavListingItem>()
         var itemIndex = -1
         var pendingSize: Long? = null
+        var pendingEtag: String? = null
         var sizeDepth = -1
         var sizeText = StringBuilder()
+        var etagDepth = -1
+        var etagText = StringBuilder()
         var hrefDepth = -1
         var href = StringBuilder()
         var openElements = 0
@@ -333,7 +400,7 @@ internal fun parseWebdavListing(text: String): List<WebdavListingItem> {
                         }
                         rootSeen = true
                     }
-                    if (parser.name == "response") { itemIndex = -1; pendingSize = null }
+                    if (parser.name == "response") { itemIndex = -1; pendingSize = null; pendingEtag = null }
                     if (parser.name == "href" && (parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
                         hrefDepth = parser.depth
                         href = StringBuilder()
@@ -341,6 +408,10 @@ internal fun parseWebdavListing(text: String): List<WebdavListingItem> {
                     if (parser.name == "getcontentlength" && (parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
                         sizeDepth = parser.depth
                         sizeText = StringBuilder()
+                    }
+                    if (parser.name == "getetag" && (parser.namespace.isNullOrEmpty() || parser.namespace == "DAV:")) {
+                        etagDepth = parser.depth
+                        etagText = StringBuilder()
                     }
                 }
                 XmlPullParser.TEXT -> {
@@ -351,12 +422,13 @@ internal fun parseWebdavListing(text: String): List<WebdavListingItem> {
                         href.append(parser.text)
                     }
                     if (sizeDepth >= 0 && sizeText.length < 24) sizeText.append(parser.text)
+                    if (etagDepth >= 0 && etagText.length < 512) etagText.append(parser.text)
                 }
                 XmlPullParser.END_TAG -> {
                     if (hrefDepth == parser.depth && parser.name == "href") {
                         href.toString().trim().takeIf(String::isNotBlank)?.let { value ->
                             hrefs.add(value)
-                            items.add(WebdavListingItem(value, pendingSize))
+                            items.add(WebdavListingItem(value, pendingSize, pendingEtag))
                             itemIndex = items.lastIndex
                         }
                         if (hrefs.size > MAX_PROPFIND_HREFS) throw IOException("WebDAV 返回的 href 数量超过上限")
@@ -366,6 +438,11 @@ internal fun parseWebdavListing(text: String): List<WebdavListingItem> {
                         val size = sizeText.toString().trim().toLongOrNull()?.takeIf { it >= 0 }
                         if (itemIndex >= 0) items[itemIndex] = items[itemIndex].copy(size = size) else pendingSize = size
                         sizeDepth = -1
+                    }
+                    if (etagDepth == parser.depth && parser.name == "getetag") {
+                        val etag = etagText.toString().trim().takeIf(String::isNotEmpty)
+                        if (itemIndex >= 0) items[itemIndex] = items[itemIndex].copy(etag = etag) else pendingEtag = etag
+                        etagDepth = -1
                     }
                     openElements--
                 }

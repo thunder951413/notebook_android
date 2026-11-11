@@ -37,7 +37,7 @@ class ParallelDownloadTest {
         }}
         server.start()
         try{
-            val progress=mutableListOf<DownloadProgress>();val file=AppUpdater.download(context,GithubRelease("test-${System.nanoTime()}","test","",server.url("/asset").toString(),server.url("/checksum").toString())){progress+=it}
+            val progress=mutableListOf<DownloadProgress>();val file=AppUpdater.download(context,GithubRelease("1.0.${System.nanoTime() and 0xffff}","test","",server.url("/asset").toString(),server.url("/checksum").toString())){progress+=it}
             assertArrayEquals(payload,file.readBytes());assertEquals(5,requests.size);assertEquals("bytes=0-0",requests.first());assertEquals(4,requests.drop(1).distinct().size);assertEquals(payload.size.toLong(),progress.last().downloadedBytes)
         }finally{server.shutdown()}
     }
@@ -48,7 +48,7 @@ class ParallelDownloadTest {
         server.dispatcher=object:Dispatcher(){override fun dispatch(request:RecordedRequest):MockResponse=if(request.path=="/checksum")MockResponse().setBody("$checksum  notebook-android.apk\n")else{assetHeaders+=request.getHeader("Range");MockResponse().setBody(Buffer().write(payload))}}
         server.start()
         try{
-            val file=AppUpdater.download(context,GithubRelease("fallback-${System.nanoTime()}","test","",server.url("/asset").toString(),server.url("/checksum").toString()))
+            val file=AppUpdater.download(context,GithubRelease("2.0.${System.nanoTime() and 0xffff}","test","",server.url("/asset").toString(),server.url("/checksum").toString()))
             assertArrayEquals(payload,file.readBytes());assertEquals(listOf("bytes=0-0",null),assetHeaders)
         }finally{server.shutdown()}
     }

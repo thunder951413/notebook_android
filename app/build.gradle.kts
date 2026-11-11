@@ -16,7 +16,13 @@ android {
         buildConfigField("String","GITHUB_REPOSITORY","\"${providers.gradleProperty("githubRepository").orNull ?: "thunder951413/notebook_android"}\"")
     }
     val releaseStoreFile=System.getenv("RELEASE_STORE_FILE")
-    if(releaseStoreFile!=null){signingConfigs.create("release"){storeFile=file(releaseStoreFile);storePassword=System.getenv("RELEASE_STORE_PASSWORD");keyAlias=System.getenv("RELEASE_KEY_ALIAS");keyPassword=System.getenv("RELEASE_KEY_PASSWORD")};buildTypes.getByName("release"){signingConfig=signingConfigs.getByName("release")}}
+    if(releaseStoreFile!=null){signingConfigs.create("release"){storeFile=file(releaseStoreFile);storePassword=System.getenv("RELEASE_STORE_PASSWORD");keyAlias=System.getenv("RELEASE_KEY_ALIAS");keyPassword=System.getenv("RELEASE_KEY_PASSWORD")}}
+    buildTypes.getByName("release"){
+        isMinifyEnabled = true
+        isShrinkResources = true
+        proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        if(releaseStoreFile!=null){signingConfig=signingConfigs.getByName("release")}
+    }
     // Keep local/ADB validation alongside a signed production installation.
     buildTypes.getByName("debug"){applicationIdSuffix=".nexttest";versionNameSuffix="-debug"}
     // Release-like performance on the preview package (keeps its data, debug key):

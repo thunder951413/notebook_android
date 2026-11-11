@@ -75,8 +75,8 @@ internal object WebdavJournalProtocol {
     const val MAX_ENTRIES = 100_000
     const val MAX_OBJECT_BYTES = 100 * 1024 * 1024
     const val MAX_HEAD_BYTES = 64 * 1024
-    const val MAX_REVISION_ENTRIES = MAX_ENTRIES
-    const val MAX_REVISION_BYTES = MAX_LOG_BYTES
+    const val MAX_REVISION_ENTRIES = 256
+    const val MAX_REVISION_BYTES = 2 * 1024 * 1024
     const val OBJECT_MARKER = "${'$'}object"
     const val PAYLOAD_OBJECT_MARKER = "${'$'}payloadObject"
     private val DEVICE_ID_PATTERN = Regex("^[0-9a-f-]{36}$", RegexOption.IGNORE_CASE)
@@ -206,6 +206,28 @@ internal object WebdavProtocolRules {
         return uri
     }
 
+    val SYNC_DEPENDENCY_RANK: Map<String, Int> = mapOf(
+        "notebook" to 0,
+        "section" to 1,
+        "tag" to 2,
+        "page" to 3,
+        "document" to 4,
+        "asset" to 4,
+        "task_step" to 4,
+        "page_tag" to 4,
+        "page_link" to 4,
+        "revision" to 4,
+        "reading_position" to 4,
+    )
+
+    fun outboxDependencyOrderKey(entityType: String, operation: String): Int {
+        val rank = SYNC_DEPENDENCY_RANK[entityType] ?: 5
+        return if (operation == "delete") 11 - rank else rank
+    }
+
+    fun sortOutboxForPush(items: List<io.github.notebook.android.data.ApiSyncOutboxEntity>): List<io.github.notebook.android.data.ApiSyncOutboxEntity> =
+        items.sortedWith(compareBy({ outboxDependencyOrderKey(it.entityType, it.operation) }, { it.createdAt }, { it.id }))
+
     fun compact(entries: List<WebdavJournalEntry>): CompactedJournal {
         // State is an LWW snapshot (including tombstones); revisions are
         // bounded history, not an ever-growing event stream.
@@ -219,7 +241,7 @@ internal object WebdavProtocolRules {
         for (revision in revisions) {
             val size = gson.toJson(revision).toByteArray(Charsets.UTF_8).size + 1
             if (retainedRevisions.size >= WebdavJournalProtocol.MAX_REVISION_ENTRIES) break
-            if (retainedRevisions.isNotEmpty() && revisionBytes + size > WebdavJournalProtocol.MAX_REVISION_BYTES) break
+            if (revisionBytes + size > WebdavJournalProtocol.MAX_REVISION_BYTES) break
             retainedRevisions.add(revision)
             revisionBytes += size
         }
@@ -336,6 +358,8 @@ class WebdavSyncClient(
     /** Entities that conflicted during the latest pull stay queued for the user. */
     private val conflictKeys = mutableSetOf<String>()
     private var privacyCipher=WebdavPrivacyCipher("")
+    private var activeSettings: WebdavSettings? = null
+    private val headCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, WebdavJournalHead>>()
     /** Conflicts settled automatically in the most recent [sync]. */
     @Volatile var lastResolved: List<ResolvedWebdavConflict> = emptyList()
         private set
@@ -346,8 +370,40 @@ class WebdavSyncClient(
     /** Devices whose journal could not be trusted in the latest [sync]. */
     @Volatile internal var lastBlocked: List<WebdavBlockedDevice> = emptyList()
         private set
+    /** Outgoing outbox items skipped in the latest [sync] due to isolated local/attachment issues. */
+    @Volatile internal var lastPushSkipped: List<PushSkippedItem> = emptyList()
+        private set
 
     fun fingerprint(settings: WebdavSettings) = "${settings.baseUrl.trim()}|${settings.username.trim()}|${settings.remotePath.trim()}"
+
+    private fun headCacheKey(settings: WebdavSettings, deviceId: String) = "${fingerprint(settings)}|$deviceId"
+
+    private fun clearHeadCache(settings: WebdavSettings) {
+        val prefix = "${fingerprint(settings)}|"
+        headCache.keys.removeIf { it.startsWith(prefix) }
+    }
+
+    private fun readJournalHead(settings: WebdavSettings, client: WebdavClient, deviceId: String, listedStrongEtag: String?): WebdavJournalHead? {
+        val key = headCacheKey(settings, deviceId)
+        if (listedStrongEtag != null) {
+            val cached = headCache[key]
+            if (cached != null && cached.first == listedStrongEtag) return cached.second
+        }
+        val fetched = client.getTextWithEtag(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
+        if (fetched == null) {
+            headCache.remove(key)
+            return null
+        }
+        val parsed = try {
+            WebdavJournalProtocol.parseHead(fetched.text, deviceId)
+        } catch (error: Exception) {
+            headCache.remove(key)
+            throw error
+        }
+        val strongEtag = fetched.etag ?: listedStrongEtag
+        if (strongEtag != null) headCache[key] = strongEtag to parsed else headCache.remove(key)
+        return parsed
+    }
 
     private fun client(settings: WebdavSettings) =
         WebdavClient(settings.baseUrl, settings.username, settings.appPassword, settings.remotePath, allowInsecureHttp = allowInsecureHttp)
@@ -374,11 +430,13 @@ class WebdavSyncClient(
     suspend fun sync(settings: WebdavSettings, onProgress: (String) -> Unit = {}) {
         validate(settings)
         withContext(Dispatchers.IO) {
+            activeSettings = settings
             conflictKeys.clear()
             resolved.clear()
             lastResolved = emptyList()
             lastRepublished = 0
             lastBlocked = emptyList()
+            lastPushSkipped = emptyList()
             privacyCipher=WebdavPrivacyCipher(settings.syncPassword)
             if(settings.syncPassword.isNotEmpty()) queuePrivateSnapshot(settings)
             val budget = RemoteTransferLimits.Budget()
@@ -427,6 +485,7 @@ class WebdavSyncClient(
 
     /** Repair: forget read positions so the next sync re-reads every journal (idempotent). */
     suspend fun resetReadPositions(settings: WebdavSettings) = withContext(Dispatchers.IO) {
+        clearHeadCache(settings)
         prefs.edit().remove(knownSeqsKey(settings)).commit()
         dao.deleteApiCursorsWithPrefix(seqRowPrefix(settings))
     }
@@ -458,6 +517,8 @@ class WebdavSyncClient(
         // while a journal without a marker would be read as a legacy one.
         client.delete(journalPath)
         client.delete(headPath)
+        headCache.remove(headCacheKey(settings, ownId))
+        prefs.edit().remove(syncedPrivateKey(settings)).commit()
         // The floor outlives the removed files: sequence numbers must never
         // move backwards, so it joins this device's own read position.
         val seqs = knownSeqs(settings)
@@ -502,6 +563,8 @@ class WebdavSyncClient(
         client.ensureDirectory("${settings.remotePath.trim()}/journal")
         val listing = client.listJournal()
         val deviceIds = WebdavProtocolRules.pullOrder(listing.deviceIds, { it }, { 0L })
+        val headOnlySet = listing.headOnlyDeviceIds.toHashSet()
+        val candidateIds = WebdavProtocolRules.pullOrder((listing.deviceIds + listing.headOnlyDeviceIds).distinct(), { it }, { 0L })
         val seqs = knownSeqs(settings)
         val journals=mutableListOf<JournalReplay>()
         val bootstrap=seqs.isEmpty() && dao.allNotes().isEmpty()
@@ -518,30 +581,46 @@ class WebdavSyncClient(
         // authentication errors (IOException) still fail the pull: they say
         // nothing about that device and hiding them would make every device
         // look healthy.
-        for (deviceId in deviceIds) {
+        for (deviceId in candidateIds) {
             var known = seqs[deviceId] ?: 0L
             var head: WebdavJournalHead? = null
             try {
-                head = client.getText(client.journalHeadPath(deviceId), WebdavJournalProtocol.MAX_HEAD_BYTES)
-                    ?.let { WebdavJournalProtocol.parseHead(it, deviceId) }
+                head = readJournalHead(settings, client, deviceId, listing.headEtags[deviceId])
             } catch (error: Exception) {
                 if (error is IOException || error is kotlin.coroutines.cancellation.CancellationException) throw error
                 blocked.add(WebdavBlockedDevice(deviceId, WebdavBlockCode.HEAD_CORRUPT, error.message.orEmpty(), known))
                 continue
             }
+            val missingFromListing = deviceId in headOnlySet
             // A marker behind our cursor means the journal was deleted and
             // recreated; skipping it would hide every new record. A marker at
             // or below the cursor means there is nothing new to download,
-            // unless the listed size says the journal is shorter than committed.
+            // unless the listed size says the journal is shorter than committed
+            // or `.head.json` appeared in PROPFIND without `.jsonl`.
             val plan = WebdavProtocolRules.planJournalReadSized(head, known, listing.sizes[deviceId])
             if (plan.reset) {
                 DiagnosticLogger.log(DiagnosticLevel.WARN,DiagnosticEvent.SYNC_REPOSITORY_RESET,resourceId=deviceId,counts=mapOf("known" to known,"remote" to (head?.lastSeq ?: 0L)))
                 known = 0L
                 seqs[deviceId] = 0L
             }
-            if (!plan.fetch) continue
+            if (!plan.fetch && !missingFromListing) continue
             // No head is a legacy v4 journal; retain its full-read compatibility.
             val text = client.getText(client.journalPath(deviceId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES)
+            if (missingFromListing && text == null) {
+                if (head != null) {
+                    blocked.add(
+                        WebdavBlockedDevice(
+                            deviceId,
+                            WebdavBlockCode.JOURNAL_MISSING,
+                            "远端日志 $deviceId.jsonl 不存在，但提交标记指向序号 ${head.lastSeq}",
+                            known,
+                            head.lastSeq,
+                            null,
+                        ),
+                    )
+                }
+                continue
+            }
             if (text != null) {
                 val journalBytes=utf8Size(text).toLong()
                 budget.consume(journalBytes,journalBytes)
@@ -580,6 +659,9 @@ class WebdavSyncClient(
                     // is set aside with its position instead of failing the
                     // sync; everything else in the journal still applies.
                     val failure = classifyMaterializeFailure(error) ?: throw error
+                    if (failure.reason == QuarantineReason.NEEDS_KEY || failure.reason == QuarantineReason.BAD_KEY) {
+                        retractLocalCleartextIfPublic(entry.type, entry.id, entry.ts)
+                    }
                     setAside.add(quarantinedRecord(deviceId, entry, failure))
                     quarantinedSeqs.add(entry.seq)
                     entry
@@ -757,6 +839,7 @@ class WebdavSyncClient(
     /** Try set-aside records again (all of them, or only those whose cause may be gone); returns how many remain. */
     suspend fun retryQuarantine(settings: WebdavSettings, automatic: Boolean = false): Int = withContext(Dispatchers.IO) {
         validate(settings)
+        activeSettings = settings
         privacyCipher=WebdavPrivacyCipher(settings.syncPassword)
         val store = quarantine(settings)
         if (store.count() == 0) return@withContext 0
@@ -810,7 +893,7 @@ class WebdavSyncClient(
             throw IllegalArgumentException("云端 $type 记录（序号 ${entry.seq}）：${error.message}", error)
         }
         val writtenAt=runCatching{java.time.Instant.parse(entry.ts).toEpochMilli()}.getOrNull()
-        if(operation=="upsert"&&(type=="page"||type=="document"))api.reviveRemotelyDeletedNote(id,writtenAt)
+        if(operation=="upsert"&&(type=="page"||type=="document"))api.reviveRemotelyDeletedNote(id,writtenAt,entry.encrypted)
         if(api.consumeChangeForDeletedPage(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID,type,id,payload,version+1))return true
         // Compare the actual document, rather than an external-object marker,
         // when a retained cursor causes an already applied record to replay.
@@ -848,6 +931,14 @@ class WebdavSyncClient(
         // a conflict (or as an old ancestor) silently kept deleted notes. Only
         // an edit this device has not sent yet keeps the note alive.
         val isDelete=operation=="delete"
+        if (isDelete && payload.boolean("privacyRetraction")) {
+            val privateLocal = (affectedPage != null && affectedPage in encryptedNoteIds()) ||
+                (type == "section" && dao.getFolder(id)?.type == "encryptedFolder")
+            if (privateLocal) {
+                dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, type, id), maxOf(localVersion, version + 1)))
+                return true
+            }
+        }
         if(!isDelete && pending==null && !locallyDirty && version+1<localVersion)return true
         // With an edit queued, a record older than the accepted baseline is an
         // ancestor this device has already moved past.
@@ -875,7 +966,13 @@ class WebdavSyncClient(
             require(hash != null) { "附件 $id 缺少对象哈希，已停止同步" }
             downloadAsset(client, id, payload, WebdavJournalProtocol.requireHash(hash), budget,entry.encrypted)
         }
-        if(entry.encrypted && type=="page") rememberPrivatePage(id,payload.optionalString("sectionId"))
+        if(entry.encrypted && type=="page") {
+            rememberPrivatePage(id,payload.optionalString("sectionId"))
+            activeSettings?.let { recordSyncedPrivateEntity(it, "page", id) }
+        }
+        if(entry.encrypted && type=="section") {
+            activeSettings?.let { recordSyncedPrivateEntity(it, "section", id) }
+        }
         if(type=="notebook" && operation=="upsert") {
             val values=JsonParser.parseString(prefs.getString("webdavNotebookPayloads","{}")).asJsonObject
             values.add(id,payload);prefs.edit().putString("webdavNotebookPayloads",gson.toJson(values)).apply()
@@ -1116,41 +1213,292 @@ class WebdavSyncClient(
         }
     }
 
+    private fun syncedPrivateKey(settings: WebdavSettings) = "webdav-synced-private:${fingerprint(settings)}"
+
+    private fun loadSyncedPrivateIds(settings: WebdavSettings): MutableSet<String> =
+        runCatching { gson.fromJson(prefs.getString(syncedPrivateKey(settings), "[]"), Array<String>::class.java)?.toMutableSet() }
+            .getOrNull() ?: mutableSetOf()
+
+    private fun saveSyncedPrivateIds(settings: WebdavSettings, ids: Set<String>) {
+        prefs.edit().putString(syncedPrivateKey(settings), gson.toJson(ids.toTypedArray())).commit()
+    }
+
+    private fun recordSyncedPrivateEntity(settings: WebdavSettings, type: String, id: String) {
+        val current = loadSyncedPrivateIds(settings)
+        if (current.add("$type:$id")) saveSyncedPrivateIds(settings, current)
+    }
+
+    /** Retract unencrypted local copies when a peer publishes an encrypted replacement we cannot decrypt yet. */
+    private suspend fun retractLocalCleartextIfPublic(type: String, id: String, ts: String) {
+        val privateNotes = encryptedNoteIds()
+        val privateFolders = dao.allFolders().filter { it.type == "encryptedFolder" }.map { it.id }.toSet()
+        val at = runCatching { Instant.parse(ts).toEpochMilli() }.getOrNull() ?: System.currentTimeMillis()
+        when (type) {
+            "page" -> if (id !in privateNotes && dao.getNoteHeader(id) != null) api.applyDelete("page", id, JsonObject(), at)
+            "document" -> if (id !in privateNotes) dao.deleteApiDocument(id)
+            "asset" -> {
+                val asset = dao.getAsset(id)
+                if (asset != null && asset.noteId !in privateNotes) api.deleteAssetAndFile(id)
+            }
+            "task_step" -> {
+                val step = dao.getStep(id)
+                if (step != null && step.noteId !in privateNotes) dao.deleteStep(id)
+            }
+            "reading_position" -> {
+                val noteId = id.substringBefore(':')
+                if (noteId.isNotBlank() && noteId !in privateNotes) dao.deleteReadingPosition(noteId)
+            }
+            "section" -> if (id !in privateFolders && dao.getFolder(id) != null) dao.deleteFolder(id)
+        }
+    }
+
+    private suspend fun preparePrivacyRetractions(
+        settings: WebdavSettings,
+        client: WebdavClient,
+        workspace: String,
+        encryptedNotes: Set<String>,
+        encryptedFolders: Set<String>,
+        retractTs: String,
+    ): Pair<List<JsonObject>, Map<String, Long>> {
+        val syncedPrivate = loadSyncedPrivateIds(settings)
+        // Drop markers for anything no longer private locally so re-locking retracts again.
+        val activeMarkers = syncedPrivate.filterTo(mutableSetOf()) { marker ->
+            when {
+                marker.startsWith("page:") -> marker.removePrefix("page:") in encryptedNotes
+                marker.startsWith("section:") -> marker.removePrefix("section:") in encryptedFolders
+                else -> false
+            }
+        }
+        if (activeMarkers.size != syncedPrivate.size) saveSyncedPrivateIds(settings, activeMarkers)
+
+        val newlyPrivateNotes = encryptedNotes.filter { noteId ->
+            "page:$noteId" !in activeMarkers && (
+                dao.apiVersion(api.versionKey(workspace, "page", noteId)) != null ||
+                    (dao.getNoteHeader(noteId)?.lastSyncedVersion ?: 0L) > 0L
+                )
+        }
+        val newlyPrivateFolders = encryptedFolders.filter { folderId ->
+            "section:$folderId" !in activeMarkers &&
+                dao.apiVersion(api.versionKey(workspace, "section", folderId)) != null
+        }
+        if (newlyPrivateNotes.isEmpty() && newlyPrivateFolders.isEmpty()) return emptyList<JsonObject>() to emptyMap()
+
+        if (settings.syncPassword.isNotEmpty()) {
+            val payloads = JsonParser.parseString(prefs.getString("webdavNotebookPayloads", "{}")).asJsonObject
+            var notebookChanged = false
+            val targetFolderIds = (newlyPrivateFolders + newlyPrivateNotes.mapNotNull { privacy.snapshot().mappings[it] ?: dao.getNoteHeader(it)?.folderId })
+                .filter { it in encryptedFolders }
+                .toSet()
+            for (folderId in targetFolderIds) {
+                val folder = dao.getFolder(folderId) ?: continue
+                val parent = payloads[folder.notebookId]?.takeIf { it.isJsonObject }?.asJsonObject
+                val privateParent = parent?.get("locked")?.asBoolean == true
+                val notebookId = if (privateParent) folder.notebookId else "private-${folder.id}"
+                if (!privateParent) {
+                    val notebook = JsonObject().apply {
+                        addProperty("id", notebookId)
+                        addProperty("workspaceId", workspace)
+                        addProperty("name", folder.name)
+                        addProperty("sortOrder", folder.sortOrder)
+                        addProperty("createdAt", Instant.ofEpochMilli(folder.updatedAt).toString())
+                        addProperty("updatedAt", Instant.ofEpochMilli(folder.updatedAt).toString())
+                        addProperty("locked", true)
+                    }
+                    payloads.add(notebookId, notebook)
+                    notebookChanged = true
+                    api.enqueue(workspace, "notebook", notebookId, "upsert", notebook)
+                }
+                val placed = if (folder.notebookId == notebookId) folder else folder.copy(notebookId = notebookId).also { dao.putFolder(it) }
+                api.queueFolder(workspace, placed)
+            }
+            if (notebookChanged) prefs.edit().putString("webdavNotebookPayloads", gson.toJson(payloads)).apply()
+            for (noteId in newlyPrivateNotes) {
+                dao.get(noteId)?.let { note ->
+                    api.queueNote(workspace, note)
+                    dao.assets(noteId).forEach { api.queueAsset(workspace, it) }
+                    dao.readingPosition(noteId)?.let { api.queueReadingPosition(workspace, it) }
+                }
+            }
+        }
+
+        data class RetractionSpec(val type: String, val id: String, val payload: JsonObject)
+        val specs = LinkedHashMap<String, RetractionSpec>()
+        fun addSpec(type: String, id: String, payload: JsonObject) {
+            specs.putIfAbsent("$type:$id", RetractionSpec(type, id, payload))
+        }
+        val allVersions = dao.apiVersionsWithPrefix("$workspace:")
+        for (noteId in newlyPrivateNotes) {
+            dao.assets(noteId).forEach { asset ->
+                if (dao.apiVersion(api.versionKey(workspace, "asset", asset.id)) != null) {
+                    addSpec("asset", asset.id, JsonObject().apply { addProperty("pageId", noteId); addProperty("privacyRetraction", true) })
+                }
+            }
+            dao.steps(noteId).forEach { step ->
+                if (dao.apiVersion(api.versionKey(workspace, "task_step", step.id)) != null) {
+                    addSpec("task_step", step.id, JsonObject().apply { addProperty("pageId", noteId); addProperty("privacyRetraction", true) })
+                }
+            }
+            dao.pageLinks(noteId).forEach { link ->
+                if (dao.apiVersion(api.versionKey(workspace, "page_link", link.id)) != null) {
+                    addSpec("page_link", link.id, JsonObject().apply { addProperty("sourcePageId", noteId); addProperty("privacyRetraction", true) })
+                }
+            }
+            dao.remoteRevisionHeaders(noteId).forEach { rev ->
+                if (dao.apiVersion(api.versionKey(workspace, "revision", rev.id)) != null) {
+                    addSpec("revision", rev.id, JsonObject().apply { addProperty("pageId", noteId); addProperty("privacyRetraction", true) })
+                }
+            }
+            val tagPrefix = "$workspace:page_tag:$noteId:"
+            allVersions.filter { it.id.startsWith(tagPrefix) }.forEach { verRow ->
+                val compositeId = verRow.id.removePrefix("$workspace:page_tag:")
+                val tagId = compositeId.substringAfter(':', "")
+                if (tagId.isNotEmpty()) {
+                    addSpec("page_tag", compositeId, JsonObject().apply {
+                        addProperty("pageId", noteId)
+                        addProperty("tagId", tagId)
+                        addProperty("privacyRetraction", true)
+                    })
+                }
+            }
+            if (dao.apiVersion(api.versionKey(workspace, "reading_position", noteId)) != null) {
+                addSpec("reading_position", noteId, JsonObject().apply { addProperty("pageId", noteId); addProperty("privacyRetraction", true) })
+            }
+            if (dao.apiVersion(api.versionKey(workspace, "document", noteId)) != null) {
+                addSpec("document", noteId, JsonObject().apply { addProperty("pageId", noteId); addProperty("privacyRetraction", true) })
+            }
+            addSpec("page", noteId, JsonObject().apply { addProperty("privacyRetraction", true) })
+        }
+        for (folderId in newlyPrivateFolders) {
+            addSpec("section", folderId, JsonObject().apply { addProperty("privacyRetraction", true) })
+        }
+        val ownJournalEntries = runCatching {
+            val ownId = WebdavJournalProtocol.requireDeviceId(webdavDeviceId(prefs))
+            client.getText(client.journalPath(ownId), maxBytes = WebdavJournalProtocol.MAX_LOG_BYTES)
+                ?.let(WebdavJournalProtocol::parseJournal)
+        }.getOrNull().orEmpty()
+        for (entry in ownJournalEntries) {
+            if (entry.op != "upsert" || WebdavPrivacyCipher.isEncrypted(entry.payload)) continue
+            val ownerPage = api.pageIdFor(entry.type, entry.id, entry.payload)
+            if (ownerPage != null && ownerPage in newlyPrivateNotes) {
+                val payload = JsonObject().apply {
+                    when (entry.type) {
+                        "page" -> Unit
+                        "page_link" -> addProperty("sourcePageId", ownerPage)
+                        "page_tag" -> {
+                            addProperty("pageId", ownerPage)
+                            val tagId = entry.payload.optionalString("tagId") ?: entry.id.substringAfter(':', "")
+                            if (tagId.isNotEmpty()) addProperty("tagId", tagId)
+                        }
+                        else -> addProperty("pageId", ownerPage)
+                    }
+                    addProperty("privacyRetraction", true)
+                }
+                addSpec(entry.type, entry.id, payload)
+            }
+        }
+
+        val orderedSpecs = specs.values.sortedBy { WebdavProtocolRules.outboxDependencyOrderKey(it.type, "delete") }
+        val nextVersions = mutableMapOf<String, Long>()
+        val entries = orderedSpecs.map { spec ->
+            val currentVer = dao.apiVersion(api.versionKey(workspace, spec.type, spec.id))?.version ?: 0L
+            nextVersions["${spec.type}:${spec.id}"] = currentVer + 1
+            JsonObject().apply {
+                addProperty("ts", retractTs)
+                addProperty("op", "delete")
+                addProperty("type", spec.type)
+                addProperty("id", spec.id)
+                addProperty("ver", currentVer)
+                add("payload", spec.payload)
+            }
+        }
+        return entries to nextVersions
+    }
+
     private suspend fun push(settings: WebdavSettings, client: WebdavClient, budget: RemoteTransferLimits.Budget, onProgress: (String) -> Unit) {
         val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
-        val outgoing = dao.apiOutbox(workspace, 200).filter { "${it.entityType}:${it.entityId}" !in conflictKeys }
-        if (outgoing.isEmpty()) return
-        val deviceId = WebdavJournalProtocol.requireDeviceId(webdavDeviceId(prefs))
         val encryptedNotes = encryptedNoteIds()
         val encryptedFolders = dao.allFolders().filter { it.type == "encryptedFolder" }.map { it.id }.toSet()
+        val baseNowMs = System.currentTimeMillis()
+        val (retractionEntries, retractedNextVersions) = preparePrivacyRetractions(
+            settings = settings,
+            client = client,
+            workspace = workspace,
+            encryptedNotes = encryptedNotes,
+            encryptedFolders = encryptedFolders,
+            retractTs = Instant.ofEpochMilli(baseNowMs - 1).toString(),
+        )
+        val outgoing = WebdavProtocolRules.sortOutboxForPush(
+            dao.apiOutbox(workspace, 200).filter { "${it.entityType}:${it.entityId}" !in conflictKeys },
+        )
+        if (outgoing.isEmpty() && retractionEntries.isEmpty()) return
+        val deviceId = WebdavJournalProtocol.requireDeviceId(webdavDeviceId(prefs))
         val notebookPayloads=JsonParser.parseString(prefs.getString("webdavNotebookPayloads","{}")).asJsonObject
         val entries = mutableListOf<JsonObject>()
         // Only acknowledge rows that were actually serialized into the journal.
-        // Malformed records stay queued for repair. Private records are removed
-        // from the network outbox because they are intentionally local-only.
-        val published = mutableListOf<io.github.notebook.android.data.ApiSyncOutboxEntity>()
+        // Broken per-item records stay queued for repair without blocking the batch.
+        // Private records without a privacy key are removed from the network outbox.
+        val published = mutableListOf<Pair<io.github.notebook.android.data.ApiSyncOutboxEntity, Long>>()
         val localOnly = mutableListOf<io.github.notebook.android.data.ApiSyncOutboxEntity>()
+        val skipped = mutableListOf<PushSkippedItem>()
+        val syncedPrivateMarkers = mutableSetOf<String>()
         for ((index, item) in outgoing.withIndex()) {
             onProgress("正在上传更改 ${index + 1}/${outgoing.size}…")
-            var payload = runCatching { JsonParser.parseString(item.payloadJson).asJsonObject }.getOrNull() ?: continue
+            var payload = runCatching { JsonParser.parseString(item.payloadJson).asJsonObject }.getOrNull()
+            if (payload == null) {
+                skipped.add(PushSkippedItem(item.entityType, item.entityId, "待上传记录 JSON 损坏"))
+                DiagnosticLogger.log(DiagnosticLevel.WARN, DiagnosticEvent.SYNC_FAILURE, operationId = "push-item-isolated", resourceId = item.entityId)
+                continue
+            }
             // Assets, steps, page-tag relations and reading positions use ids
             // different from their owning note, so resolve pageId from payload.
             val affectedPage = api.pageIdFor(item.entityType, item.entityId, payload)
-            val privateItem=affectedPage in encryptedNotes || (item.entityType == "section" && item.entityId in encryptedFolders) ||
-                (item.entityType=="notebook" && notebookPayloads[item.entityId]?.asJsonObject?.get("locked")?.asBoolean==true)
+            val isPublicRetraction = item.operation == "delete" && payload.boolean("privacyRetraction")
+            val privateItem = !isPublicRetraction && (
+                affectedPage in encryptedNotes ||
+                    (item.entityType == "section" && item.entityId in encryptedFolders) ||
+                    (item.entityType == "notebook" && notebookPayloads[item.entityId]?.asJsonObject?.get("locked")?.asBoolean == true)
+                )
             if (privateItem && settings.syncPassword.isEmpty()) {
                 localOnly.add(item)
                 continue
             }
-            if(privateItem && item.entityType=="page")payload.addProperty("locked",true)
-            val entry = JsonObject()
-            entry.addProperty("ts", Instant.now().toString())
-            entry.addProperty("op", item.operation)
-            entry.addProperty("type", item.entityType)
-            entry.addProperty("id", item.entityId)
-            entry.addProperty("ver", item.expectedVersion)
-            when (item.entityType) {
-                "document" -> if (item.operation == "upsert" && !privateItem) {
+            val expectedVer = maxOf(item.expectedVersion, retractedNextVersions["${item.entityType}:${item.entityId}"] ?: 0L)
+            try {
+                if (privateItem && item.entityType == "page") payload.addProperty("locked", true)
+                val entry = JsonObject()
+                entry.addProperty("ts", Instant.ofEpochMilli(maxOf(System.currentTimeMillis(), baseNowMs)).toString())
+                entry.addProperty("op", item.operation)
+                entry.addProperty("type", item.entityType)
+                entry.addProperty("id", item.entityId)
+                entry.addProperty("ver", expectedVer)
+                when (item.entityType) {
+                    "document" -> if (item.operation == "upsert" && !privateItem) {
+                        val bytes = gson.toJson(payload).toByteArray(Charsets.UTF_8)
+                        if (bytes.size > WebdavJournalProtocol.EXTERNALIZE_BYTES) {
+                            val hash = WebdavJournalProtocol.sha256(bytes)
+                            client.putObject(hash, bytes)
+                            payload = JsonObject().apply { addProperty(WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER, hash) }
+                            entry.addProperty("hash", hash)
+                        }
+                    }
+                    "asset" -> if (item.operation == "upsert") {
+                        val asset = dao.getAsset(item.entityId) ?: throw MissingAttachmentException(item.entityId)
+                        val file = resolveAssetFile(client, asset, budget, onProgress)
+                        RemoteTransferLimits.requireUploadSize(file.length())
+                        val contentHash = file.inputStream().use(WebdavJournalProtocol::sha256)
+                        val hash = if (privateItem) {
+                            val bytes = gson.toJson(privacyCipher.encrypt("asset-bytes:${item.entityId}", file.readBytes())).toByteArray(Charsets.UTF_8)
+                            RemoteTransferLimits.requireUploadSize(bytes.size.toLong())
+                            WebdavJournalProtocol.sha256(bytes).also { client.putObject(it, bytes) }
+                        } else contentHash.also { client.putObject(it, file) }
+                        payload.addProperty("objectHash", hash)
+                        payload.addProperty("checksum", contentHash)
+                        payload.addProperty("byteSize", file.length())
+                        entry.addProperty("hash", hash)
+                    }
+                }
+                if (privateItem) {
+                    payload = privacyCipher.encryptPayload(item.entityType, item.entityId, payload, item.operation, expectedVer)
                     val bytes = gson.toJson(payload).toByteArray(Charsets.UTF_8)
                     if (bytes.size > WebdavJournalProtocol.EXTERNALIZE_BYTES) {
                         val hash = WebdavJournalProtocol.sha256(bytes)
@@ -1158,51 +1506,47 @@ class WebdavSyncClient(
                         payload = JsonObject().apply { addProperty(WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER, hash) }
                         entry.addProperty("hash", hash)
                     }
+                    if (item.entityType == "page" || item.entityType == "section") {
+                        syncedPrivateMarkers.add("${item.entityType}:${item.entityId}")
+                    }
                 }
-                "asset" -> if (item.operation == "upsert") {
-                    val asset = dao.getAsset(item.entityId) ?: error("附件 ${item.entityId} 的元数据不存在")
-                    val file = resolveAssetFile(client, asset, budget, onProgress)
-                    RemoteTransferLimits.requireUploadSize(file.length())
-                    val contentHash=file.inputStream().use(WebdavJournalProtocol::sha256)
-                    val hash=if(privateItem) {
-                        val bytes=gson.toJson(privacyCipher.encrypt("asset-bytes:${item.entityId}",file.readBytes())).toByteArray(Charsets.UTF_8)
-                        RemoteTransferLimits.requireUploadSize(bytes.size.toLong())
-                        WebdavJournalProtocol.sha256(bytes).also{client.putObject(it,bytes)}
-                    }else contentHash.also{client.putObject(it,file)}
-                    payload.addProperty("objectHash", hash)
-                    payload.addProperty("checksum", contentHash)
-                    payload.addProperty("byteSize", file.length())
-                    entry.addProperty("hash", hash)
-                }
+                entry.add("payload", payload)
+                entries.add(entry)
+                published.add(item to expectedVer)
+            } catch (error: Exception) {
+                val reason = classifyOutgoingPushFailure(error) ?: throw error
+                skipped.add(PushSkippedItem(item.entityType, item.entityId, reason))
+                DiagnosticLogger.log(DiagnosticLevel.WARN, DiagnosticEvent.SYNC_FAILURE, operationId = "push-item-isolated", resourceId = item.entityId, error = error)
             }
-            if(privateItem) {
-                payload=privacyCipher.encryptPayload(item.entityType,item.entityId,payload,item.operation,item.expectedVersion)
-                val bytes=gson.toJson(payload).toByteArray(Charsets.UTF_8)
-                if(bytes.size>WebdavJournalProtocol.EXTERNALIZE_BYTES) {
-                    val hash=WebdavJournalProtocol.sha256(bytes);client.putObject(hash,bytes)
-                    payload=JsonObject().apply{addProperty(WebdavJournalProtocol.PAYLOAD_OBJECT_MARKER,hash)}
-                    entry.addProperty("hash",hash)
-                }
-            }
-            entry.add("payload", payload)
-            entries.add(entry)
-            published.add(item)
         }
+        lastPushSkipped = skipped
         for (item in localOnly) {
             dao.deleteApiOutboxById(item.id)
             if (item.entityType == "page") dao.get(item.entityId)?.let { dao.put(it.copy(dirty = false)) }
             if (item.entityType == "asset") dao.getAsset(item.entityId)?.let { dao.putAssets(listOf(it.copy(dirty = false))) }
         }
-        if (entries.isEmpty()) return
+        val allEntries = retractionEntries + entries
+        if (allEntries.isEmpty()) return
         onProgress("正在提交同步记录…")
-        val pushed = appendJournal(client, deviceId, entries, knownSeqs(settings)[deviceId] ?: 0L)
-        for (item in published) {
+        val pushed = appendJournal(client, deviceId, allEntries, knownSeqs(settings)[deviceId] ?: 0L)
+        headCache.remove(headCacheKey(settings, deviceId))
+        for ((key, nextVer) in retractedNextVersions) {
+            val type = key.substringBefore(':')
+            val id = key.substringAfter(':')
+            dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(workspace, type, id), nextVer))
+            if (type == "page" || type == "section") syncedPrivateMarkers.add("$type:$id")
+        }
+        for ((item, expectedVer) in published) {
             dao.deleteApiOutboxById(item.id)
-            val version = item.expectedVersion + 1
+            val version = expectedVer + 1
             dao.putApiVersion(ApiSyncVersionEntity(api.versionKey(workspace, item.entityType, item.entityId), version))
             if (item.entityType == "page") dao.get(item.entityId)?.let { dao.put(it.copy(dirty = false, lastSyncedVersion = version)) }
             if (item.entityType == "asset") dao.getAsset(item.entityId)?.let { dao.putAssets(listOf(it.copy(dirty = false))) }
             if (item.entityType == "reading_position") markReadingPositionSynced(item.payloadJson)
+        }
+        if (syncedPrivateMarkers.isNotEmpty()) {
+            val updated = loadSyncedPrivateIds(settings).apply { addAll(syncedPrivateMarkers) }
+            saveSyncedPrivateIds(settings, updated)
         }
         val seqs = knownSeqs(settings)
         seqs[deviceId] = max(seqs[deviceId] ?: 0L, pushed.first + pushed.second - 1)

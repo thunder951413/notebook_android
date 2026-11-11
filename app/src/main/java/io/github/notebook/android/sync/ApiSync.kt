@@ -283,7 +283,7 @@ class ApiSyncClient(
     }
 
     private suspend fun push(s:ApiSyncSettings) {
-        val outgoing=dao.apiOutbox(s.workspaceId,200)
+        val outgoing=WebdavProtocolRules.sortOutboxForPush(dao.apiOutbox(s.workspaceId,200))
         if(outgoing.isEmpty())return
         outgoing.filter{it.entityType=="asset"}.forEach{item->
             val url=assetUrl(s,item.entityId)
@@ -435,7 +435,7 @@ class ApiSyncClient(
         wrapper["apiConflicts"].asJsonObject.add(type,payload.deepCopy());dao.put(note.copy(conflict=true,conflictSnapshotJson=gson.toJson(wrapper)))
     }}
 
-    internal suspend fun applyDelete(type:String,id:String,p:JsonObject,at:Long=System.currentTimeMillis()){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);deleteNoteAndAssets(id,at)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->deleteAssetAndFile(id);"page_link"->dao.deletePageLink(id);"revision"->dao.deleteRemoteRevision(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->p.optionalString("pageId")?.let{dao.deleteReadingPosition(it)}}}
+    internal suspend fun applyDelete(type:String,id:String,p:JsonObject,at:Long=System.currentTimeMillis()){when(type){"notebook"->dao.deleteApiNotebook(id);"section"->dao.deleteFolder(id);"tag"->dao.deleteTag(id);"page"->{dao.deleteApiPage(id);deleteNoteAndAssets(id,at)};"document"->dao.deleteApiDocument(id);"task_step"->dao.deleteStep(id);"asset"->deleteAssetAndFile(id);"page_link"->dao.deletePageLink(id);"revision"->dao.deleteRemoteRevision(id);"page_tag"->applyPageTag(if(p.size()>0)p else JsonObject().apply{val parts=id.split(':',limit=2);addProperty("pageId",parts.firstOrNull().orEmpty());addProperty("tagId",parts.getOrNull(1).orEmpty())},false);"reading_position"->(p.optionalString("pageId")?:id.substringBefore(':').takeIf(String::isNotBlank))?.let{dao.deleteReadingPosition(it)}}}
     internal suspend fun deleteAssetAndFile(id:String){dao.getAsset(id)?.localPath?.let(::File)?.let{AttachmentStorageContract.deleteIfContained(context,it)};dao.deleteAsset(id)}
     /**
      * A tombstone left by a delete that came from another device is only a
@@ -443,9 +443,9 @@ class ApiSyncClient(
      * from its trash) supersedes it. Tombstones from deletions made on this phone
      * (any other device id) never expire.
      */
-    internal suspend fun reviveRemotelyDeletedNote(noteId:String,writtenAt:Long?){
+    internal suspend fun reviveRemotelyDeletedNote(noteId:String,writtenAt:Long?,allowEncryptedRevival:Boolean=false){
         val tombstone=dao.tombstone("note|$noteId")?:return
-        if(tombstone.deviceId==REMOTE_DELETE_DEVICE&&writtenAt!=null&&writtenAt>tombstone.deletedAt)dao.deleteTombstone(tombstone.itemKey)
+        if(tombstone.deviceId==REMOTE_DELETE_DEVICE&&((writtenAt!=null&&writtenAt>tombstone.deletedAt)||(allowEncryptedRevival&&(writtenAt==null||writtenAt>=tombstone.deletedAt))))dao.deleteTombstone(tombstone.itemKey)
     }
     internal suspend fun deleteNoteAndAssets(noteId:String,at:Long=System.currentTimeMillis()){
         val assets=dao.assets(noteId)

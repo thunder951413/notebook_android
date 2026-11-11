@@ -35,6 +35,9 @@ private class FakeWebdavServer(private val server: MockWebServer) {
     val journalPuts = mutableListOf<String>()
     val objectPuts = mutableListOf<String>()
     val gets = mutableListOf<String>()
+    val heads = mutableListOf<String>()
+    var headAllowed: Boolean = true
+    var emitEtags: Boolean = false
 
     init {
         server.dispatcher = object : Dispatcher() {
@@ -56,10 +59,20 @@ private class FakeWebdavServer(private val server: MockWebServer) {
                         return MockResponse().setResponseCode(201)
                     }
                     "DELETE" -> return MockResponse().setResponseCode(if (files.remove(path) != null) 204 else 404)
+                    "HEAD" -> {
+                        heads.add(path)
+                        if (!headAllowed) return MockResponse().setResponseCode(405)
+                        val data = files[path] ?: return MockResponse().setResponseCode(404)
+                        return MockResponse()
+                            .setResponseCode(200)
+                            .setHeader("Content-Length", data.size.toString())
+                    }
                     "GET" -> {
                         gets.add(path)
                         val data = files[path] ?: return MockResponse().setResponseCode(404)
-                        return MockResponse().setResponseCode(200).setBody(okio.Buffer().apply { write(data) })
+                        val response = MockResponse().setResponseCode(200).setBody(okio.Buffer().apply { write(data) })
+                        if (emitEtags) response.setHeader("ETag", "\"${WebdavJournalProtocol.sha256(data).take(16)}\"")
+                        return response
                     }
                     "PROPFIND" -> {
                         val depth = request.headers["Depth"] ?: "1"
@@ -76,7 +89,10 @@ private class FakeWebdavServer(private val server: MockWebServer) {
                         }
                         val responses = children.joinToString("\n") { href ->
                             val isDir = dirs.contains(href.trimEnd('/'))
-                            "  <d:response><d:href>$href</d:href><d:propstat><d:prop>${if (isDir) "<d:resourcetype><d:collection/></d:resourcetype>" else "<d:resourcetype/>"}<d:displayname>${href.substringAfterLast('/')}</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+                            val fileBytes = if (isDir) null else files[href]
+                            val sizeProp = if (fileBytes != null) "<d:getcontentlength>${fileBytes.size}</d:getcontentlength>" else ""
+                            val etagProp = if (emitEtags && fileBytes != null) "<d:getetag>\"${WebdavJournalProtocol.sha256(fileBytes).take(16)}\"</d:getetag>" else ""
+                            "  <d:response><d:href>$href</d:href><d:propstat><d:prop>${if (isDir) "<d:resourcetype><d:collection/></d:resourcetype>" else "<d:resourcetype/>"}<d:displayname>${href.substringAfterLast('/')}</d:displayname>$sizeProp$etagProp</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
                         }
                         val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:multistatus xmlns:d=\"DAV:\">\n$responses\n</d:multistatus>"
                         return MockResponse().setResponseCode(207).setHeader("Content-Type", "application/xml").setBody(body)
@@ -784,37 +800,43 @@ class WebdavSyncTest {
     }
 
     @Test
-    fun `missing cloud and local attachment keeps edits queued until bytes are restored`() = runBlocking {
+    fun `missing cloud and local attachment isolates broken asset while publishing healthy note until bytes are restored`() = runBlocking {
         val bytes = "recover later".toByteArray()
         val asset = missingAsset(bytes)
 
-        val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+        client.sync(settings())
 
-        assertTrue(failure is MissingAttachmentException)
-        assertTrue(failure!!.message.orEmpty().contains(asset.filename))
-        assertTrue(database.dao().get(noteId)!!.dirty)
+        assertEquals(1, client.lastPushSkipped.size)
+        assertEquals(asset.id, client.lastPushSkipped.single().entityId)
+        assertTrue(client.lastPushSkipped.single().message.contains(asset.filename))
+        assertFalse(database.dao().get(noteId)!!.dirty)
         assertTrue(database.dao().getAsset(asset.id)!!.dirty)
         assertNotNull(database.dao().apiOutboxItem("asset", asset.id))
-        assertTrue(webdav.journalPuts.isEmpty())
+        assertFalse(webdav.journalText(deviceId).orEmpty().contains(asset.id))
         webdav.putObject(asset.contentHash, bytes)
 
         client.sync(settings())
 
+        assertTrue(client.lastPushSkipped.isEmpty())
         assertFalse(database.dao().get(noteId)!!.dirty)
         assertFalse(database.dao().getAsset(asset.id)!!.dirty)
+        assertNull(database.dao().apiOutboxItem("asset", asset.id))
+        assertTrue(webdav.journalText(deviceId)!!.contains(asset.id))
     }
 
     @Test
-    fun `corrupt recovery object is rejected without publishing or clearing dirty state`() = runBlocking {
+    fun `corrupt recovery object is rejected without publishing broken asset or clearing its dirty state`() = runBlocking {
         val asset = missingAsset("expected bytes".toByteArray())
         webdav.putObject(asset.contentHash, "corrupt".toByteArray())
 
-        val failure = runCatching { client.sync(settings()) }.exceptionOrNull()
+        client.sync(settings())
 
-        assertTrue(failure?.message.orEmpty().contains("SHA-256"))
+        assertEquals(1, client.lastPushSkipped.size)
+        assertEquals(asset.id, client.lastPushSkipped.single().entityId)
+        assertTrue(client.lastPushSkipped.single().message.contains("SHA-256"))
         assertTrue(database.dao().getAsset(asset.id)!!.dirty)
         assertNotNull(database.dao().apiOutboxItem("asset", asset.id))
-        assertTrue(webdav.journalPuts.isEmpty())
+        assertFalse(webdav.journalText(deviceId).orEmpty().contains(asset.id))
         val context = ApplicationProvider.getApplicationContext<Context>()
         assertFalse(AttachmentStorageContract.file(context, asset.relativePath).exists())
     }
@@ -1141,5 +1163,328 @@ class WebdavSyncTest {
         val head = JsonParser.parseString(webdav.files["notebook_backup/journal/$deviceId.head.json"]!!.toString(StandardCharsets.UTF_8)).asJsonObject
         assertEquals(3, head["stateEntries"].asInt)
         assertEquals(2, head["historyEntries"].asInt)
+    }
+
+    @Test
+    fun `compaction enforces 256 revision entry cap and 2 MiB revision byte cap`() {
+        assertEquals(256, WebdavJournalProtocol.MAX_REVISION_ENTRIES)
+        assertEquals(2 * 1024 * 1024, WebdavJournalProtocol.MAX_REVISION_BYTES)
+
+        val entriesByCount = buildList {
+            add(WebdavJournalEntry(1L, "2026-08-04T00:00:00Z", "upsert", "page", noteId, 0L, null, JsonObject()))
+            for (index in 1..300) {
+                add(
+                    WebdavJournalEntry(
+                        seq = (index + 1).toLong(),
+                        ts = "2026-08-04T00:00:00Z",
+                        op = "upsert",
+                        type = "revision",
+                        id = "rev-$index",
+                        ver = 0L,
+                        hash = null,
+                        payload = JsonObject().apply { addProperty("pageId", noteId); addProperty("n", index) },
+                    ),
+                )
+            }
+        }
+        val compactedCount = WebdavProtocolRules.compact(entriesByCount)
+        assertEquals(1, compactedCount.stateEntries)
+        assertEquals(256, compactedCount.historyEntries)
+        val retainedIds = compactedCount.entries.filter { it.type == "revision" }.map { it.id }
+        assertEquals((45..300).map { "rev-$it" }, retainedIds)
+
+        val largeChunk = "r".repeat(20_000)
+        val entriesByBytes = (1..150).map { index ->
+            WebdavJournalEntry(
+                seq = index.toLong(),
+                ts = "2026-08-04T00:00:00Z",
+                op = "upsert",
+                type = "revision",
+                id = "big-rev-$index",
+                ver = 0L,
+                hash = null,
+                payload = JsonObject().apply { addProperty("body", largeChunk) },
+            )
+        }
+        val compactedBytes = WebdavProtocolRules.compact(entriesByBytes)
+        assertTrue(compactedBytes.historyEntries in 1 until 150)
+        val serializedBytes = compactedBytes.entries.sumOf {
+            com.google.gson.Gson().toJson(it).toByteArray(StandardCharsets.UTF_8).size + 1
+        }
+        assertTrue(serializedBytes <= WebdavJournalProtocol.MAX_REVISION_BYTES)
+    }
+
+    @Test
+    fun `push isolates missing attachment on one note while uploading healthy notes and attachments`() = runBlocking {
+        val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val brokenBytes = "missing-local-bytes".toByteArray()
+        val brokenAsset = missingAsset(brokenBytes)
+        api.queueNote(workspace, database.dao().get(noteId)!!)
+        api.queueAsset(workspace, brokenAsset)
+
+        val healthyNoteId = "20000000-0000-4000-8000-000000000099"
+        val healthyNote = NoteEntity(
+            id = healthyNoteId,
+            title = "健康笔记",
+            body = "正常同步正文",
+            previewText = "正常同步正文",
+            createdAt = System.currentTimeMillis(),
+            updatedAt = System.currentTimeMillis(),
+            folderId = null,
+            folderName = "未分类",
+            version = 0,
+            dirty = true,
+        )
+        val goodBytes = "healthy-attachment-bytes".toByteArray()
+        val goodAssetId = "70000000-0000-4000-8000-000000000099"
+        val goodFile = AttachmentStorageContract.file(context, "$healthyNoteId/$goodAssetId-ok.png").apply {
+            parentFile?.mkdirs()
+            writeBytes(goodBytes)
+        }
+        val goodHash = WebdavJournalProtocol.sha256(goodBytes)
+        val goodAsset = AssetEntity(
+            id = goodAssetId,
+            noteId = healthyNoteId,
+            kind = "image",
+            filename = "ok.png",
+            mimeType = "image/png",
+            relativePath = "$healthyNoteId/$goodAssetId-ok.png",
+            localPath = goodFile.absolutePath,
+            contentHash = goodHash,
+            size = goodBytes.size.toLong(),
+            dirty = true,
+        )
+        database.dao().put(healthyNote)
+        database.dao().putAssets(listOf(goodAsset))
+        api.queueNote(workspace, healthyNote)
+        api.queueAsset(workspace, goodAsset)
+
+        client.sync(settings())
+
+        assertFalse(database.dao().get(healthyNoteId)!!.dirty)
+        assertFalse(database.dao().getAsset(goodAssetId)!!.dirty)
+        assertNull(database.dao().apiOutboxItem("asset", goodAssetId))
+        assertArrayEquals(goodBytes, webdav.files.getValue("notebook_backup/objects/${goodHash.take(2)}/$goodHash"))
+
+        assertTrue(database.dao().getAsset(brokenAsset.id)!!.dirty)
+        assertNotNull(database.dao().apiOutboxItem("asset", brokenAsset.id))
+        assertEquals(listOf(brokenAsset.id), client.lastPushSkipped.map { it.entityId })
+    }
+
+    @Test
+    fun `outbox push orders upserts parent first and deletes child first with createdAt tiebreak`() = runBlocking {
+        val workspace = WebdavJournalProtocol.DEFAULT_WORKSPACE_ID
+        fun row(id: String, type: String, op: String, createdAt: Long) = ApiSyncOutboxEntity(
+            id = id,
+            workspaceId = workspace,
+            entityType = type,
+            entityId = id,
+            expectedVersion = 0L,
+            operation = op,
+            payloadJson = "{}",
+            createdAt = createdAt,
+        )
+        val scrambled = listOf(
+            row("del-notebook", "notebook", "delete", 1L),
+            row("del-page", "page", "delete", 2L),
+            row("del-asset", "asset", "delete", 3L),
+            row("del-step", "task_step", "delete", 1L),
+            row("up-revision", "revision", "upsert", 1L),
+            row("up-asset", "asset", "upsert", 2L),
+            row("up-doc", "document", "upsert", 1L),
+            row("up-page", "page", "upsert", 10L),
+            row("up-tag", "tag", "upsert", 20L),
+            row("up-section", "section", "upsert", 30L),
+            row("up-notebook", "notebook", "upsert", 40L),
+        )
+        scrambled.forEach { database.dao().putApiOutbox(it) }
+
+        val expectedIds = listOf(
+            "up-notebook",
+            "up-section",
+            "up-tag",
+            "up-page",
+            "up-doc",
+            "up-revision",
+            "up-asset",
+            "del-step",
+            "del-asset",
+            "del-page",
+            "del-notebook",
+        )
+        assertEquals(expectedIds, WebdavProtocolRules.sortOutboxForPush(scrambled).map { it.id })
+        assertEquals(expectedIds, database.dao().apiOutbox(workspace, 50).map { it.id })
+    }
+
+    @Test
+    fun `putObject uses HEAD instead of GET and falls back to GET on 405`() = runBlocking {
+        val body = "bandwidth-check-" + "y".repeat(3000)
+        database.dao().put(note(body = body))
+        client.sync(settings())
+        val objectPath = webdav.files.keys.single { it.contains("/objects/") }
+        val putsAfterSeed = webdav.objectPuts.size
+        webdav.gets.clear()
+        webdav.heads.clear()
+
+        val edited = database.dao().get(noteId)!!.copy(body = body, dirty = true)
+        database.dao().put(edited)
+        api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, edited)
+        client.sync(settings())
+
+        assertTrue(webdav.heads.contains(objectPath))
+        assertFalse(webdav.gets.contains(objectPath))
+        assertEquals(putsAfterSeed, webdav.objectPuts.size)
+
+        webdav.headAllowed = false
+        webdav.gets.clear()
+        val editedAgain = database.dao().get(noteId)!!.copy(body = body, dirty = true)
+        database.dao().put(editedAgain)
+        api.queueNote(WebdavJournalProtocol.DEFAULT_WORKSPACE_ID, editedAgain)
+        client.sync(settings())
+
+        assertTrue(webdav.gets.contains(objectPath))
+        assertEquals(putsAfterSeed, webdav.objectPuts.size)
+    }
+
+    @Test
+    fun `warm pull caches peer head json when PROPFIND strong ETag matches`() = runBlocking {
+        webdav.emitEtags = true
+        val peer = "30000000-0000-4000-8000-000000000044"
+        val line1 = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"tag","id":"tag-1","ver":0,"payload":{"id":"tag-1","name":"first","color":"blue","updatedAt":"2026-08-04T00:00:00Z"}}"""
+        webdav.putJournal(peer, listOf(line1))
+        val journal1Bytes = webdav.files.getValue("notebook_backup/journal/$peer.jsonl")
+        webdav.putHead(peer, journal1Bytes.size, WebdavJournalProtocol.sha256(journal1Bytes), 1L)
+
+        client.sync(settings())
+        assertNotNull(database.dao().getTag("tag-1"))
+
+        webdav.gets.clear()
+        client.sync(settings())
+        assertFalse(webdav.gets.any { it.endsWith("$peer.head.json") })
+        assertFalse(webdav.gets.any { it.endsWith("$peer.jsonl") })
+
+        val line2 = """{"seq":2,"ts":"2026-08-04T00:00:05Z","op":"upsert","type":"tag","id":"tag-2","ver":0,"payload":{"id":"tag-2","name":"second","color":"green","updatedAt":"2026-08-04T00:00:05Z"}}"""
+        webdav.putJournal(peer, listOf(line1, line2))
+        val journal2Bytes = webdav.files.getValue("notebook_backup/journal/$peer.jsonl")
+        webdav.putHead(peer, journal2Bytes.size, WebdavJournalProtocol.sha256(journal2Bytes), 2L)
+
+        client.sync(settings())
+        assertNotNull(database.dao().getTag("tag-2"))
+    }
+
+    @Test
+    fun `peer with head json and missing jsonl is reported as blocked JOURNAL_MISSING`() = runBlocking {
+        val damagedPeer = "30000000-0000-4000-8000-000000000055"
+        val healthyPeer = "30000000-0000-4000-8000-000000000056"
+        webdav.putHead(damagedPeer, 128, "a".repeat(64), 4L)
+        val tagLine = """{"seq":1,"ts":"2026-08-04T00:00:00Z","op":"upsert","type":"tag","id":"tag-healthy","ver":0,"payload":{"id":"tag-healthy","name":"ok","color":"orange","updatedAt":"2026-08-04T00:00:00Z"}}"""
+        webdav.putJournal(healthyPeer, listOf(tagLine))
+        val healthyBytes = webdav.files.getValue("notebook_backup/journal/$healthyPeer.jsonl")
+        webdav.putHead(healthyPeer, healthyBytes.size, WebdavJournalProtocol.sha256(healthyBytes), 1L)
+
+        client.sync(settings())
+
+        assertNotNull(database.dao().getTag("tag-healthy"))
+        val blocked = client.lastBlocked.single { it.deviceId == damagedPeer }
+        assertEquals(WebdavBlockCode.JOURNAL_MISSING, blocked.code)
+        assertEquals(4L, blocked.headLastSeq)
+    }
+
+    @Test
+    fun `moving synced public note to private retracts remote cleartext for peers`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val secretMarker = "CLEARTEXT-BEFORE-LOCK"
+        val stepId = "60000000-0000-4000-8000-000000000077"
+        database.dao().put(note(title = "$secretMarker-title", body = "$secretMarker-body"))
+        database.dao().putStep(TodoStepEntity(stepId, noteId, "$secretMarker-step"))
+        client.sync(settings())
+        assertTrue(webdav.journalText(deviceId)!!.contains(secretMarker))
+
+        val peerDb = Room.inMemoryDatabaseBuilder(context, NotebookDatabase::class.java).allowMainThreadQueries().build()
+        val unkeyedPeerDb = Room.inMemoryDatabaseBuilder(context, NotebookDatabase::class.java).allowMainThreadQueries().build()
+        try {
+            val peerPrefs = context.getSharedPreferences("webdav-peer-${UUID.randomUUID()}", Context.MODE_PRIVATE).apply {
+                edit().putString("device", "00000000-0000-4000-8000-000000000002").apply()
+            }
+            val peerApi = ApiSyncClient(context, peerDb.dao(), allowInsecureHttp = true)
+            val peerClient = WebdavSyncClient(context, peerDb.dao(), peerPrefs, peerApi, allowInsecureHttp = true)
+            peerClient.sync(settings())
+            assertNotNull(peerDb.dao().get(noteId))
+            assertNotNull(peerDb.dao().getStep(stepId))
+
+            val unkeyedPrefs = context.getSharedPreferences("webdav-peer-${UUID.randomUUID()}", Context.MODE_PRIVATE).apply {
+                edit().putString("device", "00000000-0000-4000-8000-000000000003").apply()
+            }
+            val unkeyedApi = ApiSyncClient(context, unkeyedPeerDb.dao(), allowInsecureHttp = true)
+            val unkeyedClient = WebdavSyncClient(context, unkeyedPeerDb.dao(), unkeyedPrefs, unkeyedApi, allowInsecureHttp = true)
+            unkeyedClient.sync(settings())
+            assertNotNull(unkeyedPeerDb.dao().get(noteId))
+
+            // Move the synced public note into a private folder and sync WITH a privacy password:
+            // Device A replaces cleartext with encrypted records; unkeyed peer retracts cleartext; keyed peer keeps decrypted private note.
+            val privateFolderId = "50000000-0000-4000-8000-000000000077"
+            database.dao().putFolder(FolderEntity(privateFolderId, "私密库", 0, "encryptedFolder"))
+            val moved = database.dao().get(noteId)!!.copy(folderId = privateFolderId, folderName = "私密库", dirty = true)
+            database.dao().put(moved)
+            prefs.edit()
+                .putString("encryptedNoteIds", "[\"$noteId\"]")
+                .putString("encryptedMappings", "{\"$noteId\":\"$privateFolderId\"}")
+                .apply()
+
+            val keyedSettings = settings().copy(syncPassword = "correct-horse-battery-staple")
+            client.sync(keyedSettings)
+
+            assertFalse(webdav.journalText(deviceId)!!.contains(secretMarker))
+
+            unkeyedClient.sync(settings())
+            assertNull(unkeyedPeerDb.dao().get(noteId))
+            assertNull(unkeyedPeerDb.dao().getStep(stepId))
+
+            peerClient.sync(keyedSettings)
+            assertEquals("$secretMarker-title", peerDb.dao().get(noteId)!!.title)
+            assertTrue(PrivateNoteIndex(peerPrefs).snapshot().isPrivate(noteId))
+        } finally {
+            peerDb.close()
+            unkeyedPeerDb.close()
+        }
+    }
+
+    @Test
+    fun `moving synced public note to local only private folder publishes public privacyRetraction deletes`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val secretMarker = "LOCAL-ONLY-RETRACT"
+        database.dao().put(note(title = "$secretMarker-title", body = "$secretMarker-body"))
+        client.sync(settings())
+
+        val peerDb = Room.inMemoryDatabaseBuilder(context, NotebookDatabase::class.java).allowMainThreadQueries().build()
+        try {
+            val peerPrefs = context.getSharedPreferences("webdav-peer-${UUID.randomUUID()}", Context.MODE_PRIVATE).apply {
+                edit().putString("device", "00000000-0000-4000-8000-000000000004").apply()
+            }
+            val peerApi = ApiSyncClient(context, peerDb.dao(), allowInsecureHttp = true)
+            val peerClient = WebdavSyncClient(context, peerDb.dao(), peerPrefs, peerApi, allowInsecureHttp = true)
+            peerClient.sync(settings())
+            assertNotNull(peerDb.dao().get(noteId))
+
+            val privateFolderId = "50000000-0000-4000-8000-000000000088"
+            database.dao().putFolder(FolderEntity(privateFolderId, "仅本机私密", 0, "encryptedFolder"))
+            database.dao().put(database.dao().get(noteId)!!.copy(folderId = privateFolderId, folderName = "仅本机私密", dirty = true))
+            prefs.edit()
+                .putString("encryptedNoteIds", "[\"$noteId\"]")
+                .putString("encryptedMappings", "{\"$noteId\":\"$privateFolderId\"}")
+                .apply()
+
+            client.sync(settings())
+
+            val journal = webdav.journalText(deviceId)!!
+            assertFalse(journal.contains(secretMarker))
+            assertTrue(journal.contains("\"privacyRetraction\":true"))
+
+            peerClient.sync(settings())
+            assertNull(peerDb.dao().get(noteId))
+        } finally {
+            peerDb.close()
+        }
     }
 }

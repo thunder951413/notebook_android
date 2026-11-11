@@ -288,6 +288,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
                 val copies=webdavSync.lastResolved.count{it.copyNoteId!=null}
                 if(copies>0)add("$copies 篇笔记在多台设备上同时被修改：已保留本机版本，另一版本另存为“冲突副本”")
                 if(webdavSync.lastRepublished>0)add("云端缺少本机记录，已自动重新上传全部内容")
+                if(webdavSync.lastPushSkipped.isNotEmpty())add("${webdavSync.lastPushSkipped.size} 个项目的本地附件缺失或损坏，已跳过并保留待传")
                 val issues=webdavSync.issues(webdavSettings())
                 if(issues.quarantined.isNotEmpty())add("${issues.quarantined.size} 条云端记录暂时无法应用，详见同步状态")
                 if(issues.blocked.isNotEmpty())add("${issues.blocked.size} 台设备的云端日志异常，详见同步状态")
@@ -508,7 +509,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         val structuralDraft=if(current!=null&&current.treeUpdatedAt>draft.treeUpdatedAt)draft.copy(folderId=current.folderId,folderName=current.folderName,parentPageId=current.parentPageId,sortOrder=current.sortOrder,treeUpdatedAt=current.treeUpdatedAt)else draft
         if(current!=null&&sameEditableContent(current,structuralDraft)){dao.deleteDraft(draft.id);return@withLock current}
         val base=current?:draft;val saved=base.copy(title=draft.title,body=draft.body,previewText=previewText(draft.body),folderId=structuralDraft.folderId,folderName=structuralDraft.folderName,icon=draft.icon,parentPageId=structuralDraft.parentPageId,sortOrder=structuralDraft.sortOrder,treeUpdatedAt=structuralDraft.treeUpdatedAt,reminderAt=draft.reminderAt,recurrence=draft.recurrence,tagIds=draft.tagIds,deletedAt=draft.deletedAt,itemType=draft.itemType,dueAt=draft.dueAt,completedAt=draft.completedAt,important=draft.important,viewMode=draft.viewMode,updatedAt=System.currentTimeMillis(),version=(current?.version?:draft.version)+1,dirty=true)
-        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);if(current==null||current.title!=saved.title)reindexTitleLinksAsync();dao.deleteDraft(draft.id);if(syncBackend()!=SyncBackend.SSH){val workspace=syncWorkspaceId();apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
+        if(current==null)dao.put(saved)else dao.updateEditable(saved.editableUpdate());indexReferences(saved);if(current==null||current.title!=saved.title)reindexTitleLinksAsync();dao.deleteDraft(draft.id);if(syncBackend()==SyncBackend.WEBDAV||(syncBackend()==SyncBackend.API&&!isEncrypted(saved))){val workspace=syncWorkspaceId();apiSync.queueNote(workspace,saved);val oldTags=current?.tagIds?.split(',')?.filter(String::isNotBlank)?.toSet().orEmpty();val newTags=saved.tagIds.split(',').filter(String::isNotBlank).toSet();(oldTags-newTags).forEach{apiSync.queueDelete(workspace,"page_tag","${saved.id}:$it")}};if(saved.deletedAt!=null||saved.completedAt!=null||saved.reminderAt==null)Reminders.cancel(appContext,saved.id)else Reminders.schedule(appContext,saved.id,saved.title,saved.reminderAt,saved.recurrence);requestSyncIfConfigured();saved
     }
     private fun sameEditableContent(a:NoteEntity,b:NoteEntity)=a.title==b.title&&a.body==b.body&&a.folderId==b.folderId&&a.folderName==b.folderName&&a.icon==b.icon&&a.parentPageId==b.parentPageId&&a.sortOrder==b.sortOrder&&a.treeUpdatedAt==b.treeUpdatedAt&&a.reminderAt==b.reminderAt&&a.recurrence==b.recurrence&&a.tagIds==b.tagIds&&a.deletedAt==b.deletedAt&&a.itemType==b.itemType&&a.dueAt==b.dueAt&&a.completedAt==b.completedAt&&a.important==b.important&&a.viewMode==b.viewMode
     private suspend fun subtree(id:String):List<NoteEntity>{
@@ -616,11 +617,43 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     /** Moving a page carries its descendants, retaining the document tree inside one library. */
     suspend fun moveToLibrary(id:String,folder:FolderEntity?){
         val root=loadEditable(id)?:error("笔记不存在")
-        require(folder==null||folder.type==if(isEncrypted(root))"encryptedFolder" else if(root.itemType=="todo")"todoList" else "noteFolder") { "目标笔记库类型不匹配" }
         val isPrivate=isEncrypted(root)
+        val movingToPrivate=!isPrivate&&root.itemType=="note"&&folder?.type=="encryptedFolder"
+        require(movingToPrivate||folder==null||folder.type==if(isPrivate)"encryptedFolder" else if(root.itemType=="todo")"todoList" else "noteFolder") { "目标笔记库类型不匹配" }
         require(!isPrivate || folder?.type=="encryptedFolder") { "私密笔记必须留在私密笔记库中" }
         flushAll()
-        subtree(id).forEach{note->if(isPrivate)moveEncrypted(note.id,folder!!.id);save(note.copy(folderId=folder?.id,folderName=folder?.name?:"未分类",parentPageId=if(note.id==id)null else note.parentPageId,treeUpdatedAt=System.currentTimeMillis()))}
+        val targets=subtree(id)
+        targets.forEach{note->
+            if(isPrivate||movingToPrivate)moveEncrypted(note.id,folder!!.id)
+            save(note.copy(folderId=folder?.id,folderName=folder?.name?:"未分类",parentPageId=if(note.id==id)null else note.parentPageId,treeUpdatedAt=System.currentTimeMillis()))
+        }
+        if(movingToPrivate&&syncBackend()==SyncBackend.WEBDAV){
+            val workspace=syncWorkspaceId()
+            targets.forEach{note->
+                dao.assets(note.id).forEach{apiSync.queueAsset(workspace,it)}
+                dao.steps(note.id).forEach{apiSync.queueStep(workspace,it)}
+                dao.readingPosition(note.id)?.let{apiSync.queueReadingPosition(workspace,it)}
+            }
+        } else if(movingToPrivate&&syncBackend()==SyncBackend.API){
+            val workspace=syncWorkspaceId()
+            targets.forEach{note->retractNoteFromApi(workspace,note)}
+        }
+    }
+    private suspend fun retractNoteFromApi(workspace:String,note:NoteEntity){
+        val keys=buildList<Pair<String,String>>{
+            dao.assets(note.id).forEach{add("asset" to it.id)}
+            dao.steps(note.id).forEach{add("task_step" to it.id)}
+            dao.pageLinks(note.id).forEach{add("page_link" to it.id)}
+            dao.remoteRevisionHeaders(note.id).forEach{add("revision" to it.id)}
+            note.tagIds.split(',').filter(String::isNotBlank).forEach{add("page_tag" to "${note.id}:$it")}
+            add("reading_position" to note.id);add("document" to note.id);add("page" to note.id)
+        }
+        keys.forEach{(type,key)->
+            dao.deleteApiOutbox(type,key)
+            val retraction=apiSync.noteDeletionOperation(workspace,type,key,note.id)
+            val payload=runCatching{JsonParser.parseString(retraction.payloadJson).asJsonObject}.getOrDefault(JsonObject()).apply{addProperty("privacyRetraction",true)}
+            dao.putApiOutbox(retraction.copy(payloadJson=gson.toJson(payload)))
+        }
     }
     suspend fun dissolveLibrary(id:String,deleteNotes:Boolean){
         val folder=dao.getFolder(id)?:return
@@ -1259,7 +1292,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     }
     private fun cancelDelayedSyncRequest(){synchronized(syncRequestLock){syncRequestJob?.cancel();syncRequestJob=null}}
     private suspend fun scheduleNextOutboxBatch(workspace:String,outboxBefore:Int){
-        if(outboxBefore>=200&&dao.apiOutboxCount(workspace)>0)SyncWorker.enqueueNow(appContext)
+        val remaining=dao.apiOutboxCount(workspace)
+        if(outboxBefore>=200&&remaining>0&&remaining<outboxBefore)SyncWorker.enqueueNow(appContext)
     }
     /** Re-resolves title links in every note after a title appeared or changed. */
     private fun reindexTitleLinksAsync(){appScope.launch{runCatching{dao.noteIdsWithLinks().forEach{id->loadEditable(id)?.let{indexReferences(it)}}}}}

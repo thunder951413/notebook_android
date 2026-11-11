@@ -41,6 +41,29 @@ internal class UnknownRecordTypeException(type: String) : IllegalArgumentExcepti
 
 internal data class MaterializeFailure(val reason: String, val message: String)
 
+/** An outgoing outbox record skipped during push because its local payload or attachment is missing/corrupt. */
+internal data class PushSkippedItem(val entityType: String, val entityId: String, val message: String)
+
+/**
+ * Classifies a per-item push failure that should leave the offending outbox item
+ * queued without aborting healthy items in the same batch. Transport, auth and
+ * cancellation failures return null so they still fail the push.
+ */
+internal fun classifyOutgoingPushFailure(error: Throwable): String? {
+    val message = error.message.orEmpty()
+    return when {
+        error is CancellationException -> null
+        error is MissingAttachmentException -> message.ifBlank { "本地附件缺失" }
+        error is WebdavObjectNotFoundException -> message.ifBlank { "云端附件对象缺失" }
+        error is java.io.FileNotFoundException -> message.ifBlank { "本地附件文件不存在" }
+        error is IOException -> null
+        error is JsonParseException -> message.ifBlank { "待上传记录 JSON 损坏" }
+        error is IllegalArgumentException && !message.contains("本次远端读取超过") ->
+            message.ifBlank { "待上传记录校验失败" }
+        else -> null
+    }
+}
+
 /**
  * Sorts a failure while reading or applying one remote record. Only trouble
  * with the record's own data is set aside; network, storage and cancellation

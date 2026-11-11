@@ -27,28 +27,77 @@ data class DownloadProgress(val downloadedBytes:Long,val totalBytes:Long){val fr
 
 object AppUpdater {
     suspend fun latestRelease():GithubRelease?=withContext(Dispatchers.IO){
-        val releases=JsonParser.parseString(getText("https://api.github.com/repos/${BuildConfig.GITHUB_REPOSITORY}/releases?per_page=100")).asJsonArray.map{it.asJsonObject}.filter{it["draft"]?.asBoolean!=true&&it["prerelease"]?.asBoolean!=true&&it["tag_name"]?.asString.orEmpty().startsWith("android-v")}
-        val root=releases.maxWithOrNull(Comparator{a,b->compareVersions(releaseVersion(a["tag_name"]?.asString.orEmpty()),releaseVersion(b["tag_name"]?.asString.orEmpty()))})?:return@withContext null
-        val tag=root["tag_name"]?.asString.orEmpty();val version=tag.removePrefix("android-v").removePrefix("v")
-        val assets=mutableListOf<com.google.gson.JsonObject>();root["assets"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{assets+=it.asJsonObject}
-        val apk=assets.firstOrNull{it["name"].asString=="notebook-android.apk"}?:assets.firstOrNull{it["name"].asString.endsWith(".apk")}
-        if(apk==null||compareVersions(version,BuildConfig.VERSION_NAME)<=0)return@withContext null
-        val checksum=assets.firstOrNull{it["name"].asString.endsWith(".sha256")}
-        GithubRelease(version,root["name"]?.asString?.ifBlank{tag}?:tag,root["body"]?.asString.orEmpty(),preferredAssetUrl(apk["url"]?.asString,apk["browser_download_url"].asString),checksum?.let{preferredAssetUrl(it["url"]?.asString,it["browser_download_url"].asString)})
+        selectLatestRelease(
+            getText("https://api.github.com/repos/${BuildConfig.GITHUB_REPOSITORY}/releases?per_page=100"),
+            BuildConfig.VERSION_NAME,
+        )
+    }
+
+    internal fun selectLatestRelease(releasesJson:String,currentVersion:String):GithubRelease?{
+        val releases=JsonParser.parseString(releasesJson).asJsonArray
+            .map{it.asJsonObject}
+            .filter{
+                val tag=it["tag_name"]?.takeUnless{el->el.isJsonNull}?.asString.orEmpty()
+                it["draft"]?.takeUnless{el->el.isJsonNull}?.asBoolean!=true&&
+                    it["prerelease"]?.takeUnless{el->el.isJsonNull}?.asBoolean!=true&&
+                    tag.startsWith("android-v")&&
+                    isValidReleaseVersion(tag.removePrefix("android-v"))
+            }
+        val root=releases.maxWithOrNull(Comparator{a,b->compareVersions(a["tag_name"].asString.removePrefix("android-v"),b["tag_name"].asString.removePrefix("android-v"))})?:return null
+        val tag=root["tag_name"].asString
+        val version=tag.removePrefix("android-v")
+        if(!isValidReleaseVersion(version)||compareVersions(version,currentVersion)<=0)return null
+        val assets=mutableListOf<com.google.gson.JsonObject>()
+        root["assets"]?.takeIf{it.isJsonArray}?.asJsonArray?.forEach{assets+=it.asJsonObject}
+        val apk=assets.firstOrNull{it["name"]?.asString=="notebook-android.apk"}?:assets.firstOrNull{it["name"]?.asString.orEmpty().endsWith(".apk")}?:return null
+        val apkName=apk["name"]?.asString.orEmpty()
+        val apkBrowserUrl=apk["browser_download_url"]?.takeUnless{it.isJsonNull}?.asString?.trim().orEmpty()
+        if(apkBrowserUrl.isEmpty())return null
+        val checksum=assets.firstOrNull{it["name"]?.asString=="$apkName.sha256"}
+            ?:assets.firstOrNull{it["name"]?.asString.orEmpty().endsWith(".sha256")}
+            ?:return null
+        val checksumBrowserUrl=checksum["browser_download_url"]?.takeUnless{it.isJsonNull}?.asString?.trim().orEmpty()
+        val resolvedChecksumUrl=preferredAssetUrl(checksum["url"]?.takeUnless{it.isJsonNull}?.asString,checksumBrowserUrl).trim()
+        if(resolvedChecksumUrl.isEmpty())return null
+        val resolvedApkUrl=preferredAssetUrl(apk["url"]?.takeUnless{it.isJsonNull}?.asString,apkBrowserUrl).trim()
+        if(resolvedApkUrl.isEmpty())return null
+        val title=root["name"]?.takeUnless{it.isJsonNull}?.asString?.ifBlank{tag}?:tag
+        val notes=root["body"]?.takeUnless{it.isJsonNull}?.asString.orEmpty()
+        return GithubRelease(version,title,notes,resolvedApkUrl,resolvedChecksumUrl)
     }
 
     suspend fun cachedDownload(context:Context,release:GithubRelease):File?=withContext(Dispatchers.IO){
+        if(!isValidReleaseVersion(release.version)||release.checksumUrl.isNullOrBlank())return@withContext null
         val target=targetFile(context,release);val marker=markerFile(target)
-        target.takeIf{it.isFile&&marker.isFile&&marker.readText().trim().equals(sha256(it),ignoreCase=true)}
+        target.takeIf{it.isFile&&marker.isFile&&parseSha256Checksum(marker.readText())==sha256(it)}
     }
 
     suspend fun download(context:Context,release:GithubRelease,onProgress:suspend (DownloadProgress)->Unit={}):File=withContext(Dispatchers.IO){
-        cachedDownload(context,release)?.let{onProgress(DownloadProgress(it.length(),it.length()));return@withContext it}
-        val target=targetFile(context,release);target.parentFile?.mkdirs();target.delete();markerFile(target).delete()
+        require(isValidReleaseVersion(release.version)){"无效的更新版本号：${release.version}"}
+        val target=targetFile(context,release)
         val partial=File(target.parentFile,"${target.name}.part")
+        val checksumUrl=release.checksumUrl?.trim()?.takeIf(String::isNotEmpty)
+        if(checksumUrl==null){
+            partial.delete();target.delete();markerFile(target).delete()
+            throw IllegalArgumentException("安装包缺少 SHA-256 校验文件，已拒绝下载")
+        }
+        cachedDownload(context,release)?.let{onProgress(DownloadProgress(it.length(),it.length()));return@withContext it}
+        target.parentFile?.mkdirs();target.delete();markerFile(target).delete()
         downloadTo(release.apkUrl,partial,onProgress)
         val actual=sha256(partial)
-        release.checksumUrl?.let{url->val expected=getText(url).trim().substringBefore(' ').lowercase();if(expected!=actual){partial.delete();throw IllegalArgumentException("安装包校验失败，请重新下载")}}
+        val rawChecksum=try{
+            getText(checksumUrl)
+        }catch(error:CancellationException){
+            throw error
+        }catch(error:Throwable){
+            partial.delete();target.delete();markerFile(target).delete()
+            throw IllegalArgumentException("无法下载安装包 SHA-256 校验文件",error)
+        }
+        val expected=parseSha256Checksum(rawChecksum)
+        if(expected==null||expected!=actual){
+            partial.delete();target.delete();markerFile(target).delete()
+            throw IllegalArgumentException("安装包校验失败，请重新下载")
+        }
         if(!partial.renameTo(target)){partial.copyTo(target,overwrite=true);partial.delete()}
         markerFile(target).writeText(actual)
         target
@@ -127,8 +176,18 @@ object AppUpdater {
     }
 }
 
+private val STRICT_RELEASE_VERSION=Regex("^[0-9]+\\.[0-9]+\\.[0-9]+$")
+private val SHA256_DIGEST_PATTERN=Regex("^[0-9a-f]{64}$")
+
+internal fun isValidReleaseVersion(version:String):Boolean=STRICT_RELEASE_VERSION.matches(version)
+
+internal fun parseSha256Checksum(raw:String?):String?{
+    val token=raw?.trim()?.lineSequence()?.firstOrNull()?.trim()?.split(Regex("\\s+"))?.firstOrNull()?.lowercase()?:return null
+    return token.takeIf{SHA256_DIGEST_PATTERN.matches(it)}
+}
+
 internal fun releaseVersion(tag:String)=tag.removePrefix("android-v").removePrefix("v")
-internal fun newestVersion(versions:List<String>)=versions.maxWithOrNull(Comparator(AppUpdater::compareVersions))
+internal fun newestVersion(versions:List<String>)=versions.filter(::isValidReleaseVersion).maxWithOrNull(Comparator(AppUpdater::compareVersions))
 
 internal fun preferredAssetUrl(apiUrl:String?,browserUrl:String):String{
     val trustedApi=apiUrl?.takeIf(::isTrustedAssetApiUrl)

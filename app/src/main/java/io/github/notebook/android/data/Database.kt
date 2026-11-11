@@ -291,7 +291,52 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("SELECT * FROM api_notebooks WHERE id=:id") suspend fun apiNotebook(id:String):ApiNotebookEntity?
     @Upsert suspend fun putApiNotebook(notebook:ApiNotebookEntity)
     @Query("DELETE FROM api_notebooks WHERE id=:id") suspend fun deleteApiNotebook(id:String)
-    @Query("SELECT id,workspaceId,entityType,entityId,expectedVersion,operation,'' AS payloadJson,createdAt FROM api_sync_outbox WHERE workspaceId=:workspaceId ORDER BY createdAt LIMIT :limit") suspend fun apiOutboxHeaders(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity>
+    @Query(
+        """
+        SELECT id,workspaceId,entityType,entityId,expectedVersion,operation,'' AS payloadJson,createdAt
+        FROM api_sync_outbox
+        WHERE workspaceId=:workspaceId
+        ORDER BY
+            CASE
+                WHEN operation='delete' THEN 11 - (
+                    CASE entityType
+                        WHEN 'notebook' THEN 0
+                        WHEN 'section' THEN 1
+                        WHEN 'tag' THEN 2
+                        WHEN 'page' THEN 3
+                        WHEN 'document' THEN 4
+                        WHEN 'asset' THEN 4
+                        WHEN 'task_step' THEN 4
+                        WHEN 'page_tag' THEN 4
+                        WHEN 'page_link' THEN 4
+                        WHEN 'revision' THEN 4
+                        WHEN 'reading_position' THEN 4
+                        ELSE 5
+                    END
+                )
+                ELSE (
+                    CASE entityType
+                        WHEN 'notebook' THEN 0
+                        WHEN 'section' THEN 1
+                        WHEN 'tag' THEN 2
+                        WHEN 'page' THEN 3
+                        WHEN 'document' THEN 4
+                        WHEN 'asset' THEN 4
+                        WHEN 'task_step' THEN 4
+                        WHEN 'page_tag' THEN 4
+                        WHEN 'page_link' THEN 4
+                        WHEN 'revision' THEN 4
+                        WHEN 'reading_position' THEN 4
+                        ELSE 5
+                    END
+                )
+            END ASC,
+            createdAt ASC,
+            id ASC
+        LIMIT :limit
+        """
+    )
+    suspend fun apiOutboxHeaders(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity>
     @Query("SELECT length(payloadJson) FROM api_sync_outbox WHERE id=:id") suspend fun apiOutboxLength(id:String):Int?
     @Query("SELECT substr(payloadJson,:start,:length) FROM api_sync_outbox WHERE id=:id") suspend fun apiOutboxChunk(id:String,start:Int,length:Int):String?
     @Transaction suspend fun apiOutbox(workspaceId:String,limit:Int=200):List<ApiSyncOutboxEntity> = apiOutboxHeaders(workspaceId,limit).map{outbox->outbox.copy(payloadJson=readStoredText(apiOutboxLength(outbox.id)){start,length->apiOutboxChunk(outbox.id,start,length)}.orEmpty())}
@@ -311,7 +356,9 @@ data class RemoteRevisionEntity(@PrimaryKey val id:String,val noteId:String,val 
     @Query("DELETE FROM remote_revisions WHERE id=:id") suspend fun deleteRemoteRevision(id:String)
     @Query("DELETE FROM remote_revisions WHERE noteId=:noteId") suspend fun deleteRemoteRevisionsForNote(noteId:String)
     @Query("SELECT * FROM api_sync_versions WHERE id=:id") suspend fun apiVersion(id:String):ApiSyncVersionEntity?
+    @Query("SELECT * FROM api_sync_versions WHERE id LIKE :prefix || '%'") suspend fun apiVersionsWithPrefix(prefix:String):List<ApiSyncVersionEntity>
     @Upsert suspend fun putApiVersion(version:ApiSyncVersionEntity)
+    @Query("DELETE FROM api_sync_versions WHERE id=:id") suspend fun deleteApiVersion(id:String)
     @Query("SELECT cursor FROM api_sync_cursors WHERE workspaceId=:workspaceId") suspend fun apiCursor(workspaceId:String):Long?
     @Upsert suspend fun putApiCursor(cursor:ApiSyncCursorEntity)
     @Query("SELECT * FROM api_sync_cursors WHERE workspaceId LIKE :prefix || '%'") suspend fun apiCursorsWithPrefix(prefix:String):List<ApiSyncCursorEntity>
