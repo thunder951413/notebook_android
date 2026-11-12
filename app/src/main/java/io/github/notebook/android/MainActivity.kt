@@ -29,6 +29,7 @@ import androidx.compose.animation.core.animate
 import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
@@ -176,7 +177,17 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun NotebookScreen(repo:SyncRepository,notificationNoteId:String?=null,onNotificationConsumed:()->Unit={},incoming:IncomingShare?=null,onIncomingHandled:()->Unit={},ttsOpenNoteId:String?=null,onTtsOpenHandled:()->Unit={}) {
-    val all by repo.notes.collectAsState(initial=emptyList())
+    val loadedNotes: List<NoteSummary>? by repo.notes.collectAsState(initial = null)
+    val all = loadedNotes
+    if (all == null) {
+        Box(
+            Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center,
+        ) {
+            CircularProgressIndicator()
+        }
+        return
+    }
     val folders by repo.folders.collectAsState(initial=emptyList())
     val tags by repo.tags.collectAsState(initial=emptyList())
     val saveError by repo.saveError.collectAsState()
@@ -184,7 +195,12 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     val focusManager=androidx.compose.ui.platform.LocalFocusManager.current
     val keyboardController=androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val drawer=rememberDrawerState(DrawerValue.Closed)
-    var destination by rememberSaveable{mutableStateOf(Destination.All)}
+    var destination by rememberSaveable {
+        mutableStateOf(
+            if (all.any { it.isOpenTodo() && !repo.isEncrypted(it) }) Destination.Todos
+            else Destination.All
+        )
+    }
     var folderId by rememberSaveable{mutableStateOf<String?>(null)}
     var tagId by rememberSaveable{mutableStateOf<String?>(null)};var manage by remember{mutableStateOf<String?>(null)}
     var query by rememberSaveable{mutableStateOf("")};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by rememberSaveable{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
@@ -380,7 +396,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             folderId!=null -> !encrypted&&n.deletedAt==null&&n.folderId==folderId&&(if(selectedFolderType=="todoList")n.itemType=="todo"&&n.completedAt==null else n.itemType=="note")
             destination==Destination.Today -> !encrypted&&n.itemType=="todo"&&n.deletedAt==null&&n.completedAt==null&&(n.dueAt?:Long.MAX_VALUE)<=endOfToday
             destination==Destination.Important -> !encrypted&&n.itemType=="todo"&&n.deletedAt==null&&n.completedAt==null&&n.important
-            destination==Destination.Todos -> !encrypted&&n.itemType=="todo"&&n.deletedAt==null&&n.completedAt==null
+            destination==Destination.Todos -> !encrypted&&n.isOpenTodo()
             destination==Destination.Completed -> !encrypted&&n.itemType=="todo"&&n.deletedAt==null&&n.completedAt!=null
             destination==Destination.All -> !encrypted&&(n.itemType=="note"||query.isNotBlank())&&n.deletedAt==null
             destination==Destination.Unfiled -> !encrypted&&n.itemType=="note"&&n.deletedAt==null&&n.folderId==null
