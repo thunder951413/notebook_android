@@ -80,8 +80,86 @@ class MainActivityTest {
         rule.onAllNodes(hasText("查看全部文件夹",substring=true),useUnmergedTree=true).onFirst().performClick()
         rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("滚动文件夹 29"))
         rule.onNodeWithText("滚动文件夹 29").assertIsDisplayed()
-        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("设置与同步"))
-        rule.onNodeWithText("设置与同步").assertIsDisplayed()
+        rule.onNodeWithTag("drawer-scroll").performScrollToNode(hasText("设置"))
+        rule.onNodeWithText("设置").assertIsDisplayed()
+    }
+
+    @Test fun settingsOpensSyncOverviewBeforeConfigurationAndMaintenance() {
+        rule.onNodeWithContentDescription("更多").performClick()
+        rule.onNodeWithTag("open-settings").performClick()
+        rule.onNodeWithText("扫码配置").assertIsDisplayed()
+        rule.onNodeWithText("同步设置").performClick()
+
+        rule.onNodeWithText("扫码配置").assertIsDisplayed()
+        rule.onNodeWithText("服务器地址").assertDoesNotExist()
+        rule.onNodeWithText("提醒权限").assertDoesNotExist()
+        rule.onNodeWithText("连接配置").performClick()
+        rule.onNodeWithText("服务器地址").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("检测连接").performScrollTo().performClick()
+        rule.waitUntil(10_000) {
+            rule.onAllNodesWithText("连接失败：", substring = true).fetchSemanticsNodes().isNotEmpty()
+        }
+        rule.onNodeWithText("连接失败：", substring = true).assertIsDisplayed()
+        rule.onNodeWithContentDescription("返回").performClick()
+
+        rule.onNodeWithText("同步状态与修复").performClick()
+        rule.onNodeWithText("导出同步诊断").assertIsDisplayed()
+        rule.onNodeWithContentDescription("返回").performClick()
+
+        rule.onNodeWithText("旧仓库迁移").performClick()
+        rule.onNodeWithText("SSH/SFTP").assertIsDisplayed()
+        rule.activityRule.scenario.recreate()
+        rule.onNodeWithText("SSH/SFTP").assertIsDisplayed()
+        rule.onNodeWithContentDescription("返回").performClick()
+        rule.onNodeWithContentDescription("返回").performClick()
+        rule.onNodeWithTag("settings-home-scroll").assertIsDisplayed()
+    }
+
+    @Test fun configuredSyncShowsManualActionAndConfirmsRepair() {
+        val repo = (rule.activity.application as NotebookApp).repository
+        repo.saveWebdavSettings(WebdavSettings("http://127.0.0.1:1/dav/", "test", "test", "notebook_test"))
+        try {
+            rule.onNodeWithContentDescription("更多").performClick()
+            rule.onNodeWithTag("open-settings").performClick()
+            rule.onNodeWithText("坚果云 WebDAV").assertIsDisplayed()
+            rule.onNodeWithText("立即同步").assertIsEnabled().performClick()
+            rule.waitUntil(10_000) {
+                rule.onAllNodesWithText("同步失败：", substring = true).fetchSemanticsNodes().isNotEmpty()
+            }
+            rule.onNodeWithText("立即同步").assertIsEnabled()
+            rule.onNodeWithText("同步设置").performClick()
+            rule.onNodeWithText("同步状态与修复").performClick()
+            rule.onNodeWithText("重新上传本机").performClick()
+            rule.onNodeWithText("重新上传本机全部内容？").assertIsDisplayed()
+            rule.onNodeWithText("取消").performClick()
+            rule.onNodeWithText("重新读取云端").assertIsDisplayed()
+        } finally {
+            repo.saveWebdavSettings(WebdavSettings())
+        }
+    }
+
+    @Test fun settingsGroupsPreferencesAndReturnsFromManagement() {
+        rule.onNodeWithContentDescription("更多").performClick()
+        rule.onNodeWithTag("open-settings").performClick()
+        for (group in listOf("同步与数据", "使用偏好", "内容与提醒", "AI 与朗读", "关于与诊断")) {
+            rule.onNodeWithText(group).performScrollTo().assertIsDisplayed()
+        }
+
+        rule.onNodeWithText("标签管理").performScrollTo().performClick()
+        rule.onNodeWithText("管理标签").assertIsDisplayed()
+        rule.onNodeWithContentDescription("返回").performClick()
+        rule.onNodeWithText("标签管理").assertIsDisplayed()
+
+        rule.onNodeWithText("提醒权限").performScrollTo().performClick()
+        rule.onNodeWithText("精确提醒").assertIsDisplayed()
+        rule.onNodeWithContentDescription("返回").performClick()
+
+        rule.onNodeWithText("AI 服务").performScrollTo().performClick()
+        rule.onNodeWithText("模型").assertIsDisplayed()
+        rule.onNodeWithContentDescription("返回").performClick()
+
+        rule.onNodeWithText("关于 Notebook").performScrollTo().performClick()
+        rule.onNodeWithText("导出并分享诊断日志").assertIsDisplayed()
     }
 
     @Test fun folderBelowSelectedFolderRemainsClickable(){

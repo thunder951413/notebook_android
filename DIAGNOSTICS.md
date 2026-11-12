@@ -20,4 +20,4 @@ For a debuggable build without the `.nexttest` suffix, replace the package name 
 
 ## Retrieve a release build
 
-Open **设置与同步 → 诊断日志 → 导出并分享诊断日志**. Android opens the system share sheet for a small ZIP snapshot using the existing private `FileProvider`. The export is initiated by the user; there is no exported receiver or unauthenticated diagnostic endpoint.
+Open **设置 → 关于 Notebook → 导出并分享诊断日志**. Android opens the system share sheet for a small ZIP snapshot using the existing private `FileProvider`. The export is initiated by the user; there is no exported receiver or unauthenticated diagnostic endpoint.

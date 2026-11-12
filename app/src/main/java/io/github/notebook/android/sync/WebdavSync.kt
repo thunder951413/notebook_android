@@ -16,6 +16,7 @@ import io.github.notebook.android.data.TodoStepEntity
 import io.github.notebook.android.diagnostics.DiagnosticEvent
 import io.github.notebook.android.diagnostics.DiagnosticLevel
 import io.github.notebook.android.diagnostics.DiagnosticLogger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -418,11 +419,14 @@ class WebdavSyncClient(
     suspend fun test(settings: WebdavSettings): WebdavTestResult = withContext(Dispatchers.IO) {
         val startedAt = System.currentTimeMillis()
         try {
+            validate(settings)
             val client = client(settings)
-            client.ensureDirectory(settings.remotePath.trim())
-            val exists = client.exists("${settings.remotePath.trim()}/journal")
+            val exists = client.exists(safeRemotePath(settings.remotePath))
+            if (!exists && !client.exists("")) throw IOException("WebDAV 服务器目录不可访问，请检查服务器地址")
             WebdavTestResult(true, exists, System.currentTimeMillis() - startedAt, "")
-        } catch (error: Throwable) {
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
             WebdavTestResult(false, false, System.currentTimeMillis() - startedAt, error.message ?: "无法连接 WebDAV 服务器")
         }
     }

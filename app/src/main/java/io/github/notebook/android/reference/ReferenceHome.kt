@@ -673,11 +673,12 @@ internal fun ReferenceHome(
                                             leadingIcon = { Icon(Icons.Default.AutoAwesome, null) },
                                         )
                                         DropdownMenuItem(
-                                            { Text("设置与同步") },
+                                            { Text("设置") },
                                             {
                                                 menu = false
                                                 onSettings()
                                             },
+                                            modifier = Modifier.testTag("open-settings"),
                                             leadingIcon = { Icon(Icons.Default.Settings, null) },
                                         )
                                     }

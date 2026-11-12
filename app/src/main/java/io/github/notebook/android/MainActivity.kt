@@ -38,7 +38,6 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -62,22 +61,13 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import io.github.notebook.android.reminder.Reminders
-import io.github.notebook.android.sync.SshSettings
-import io.github.notebook.android.sync.ApiSyncSettings
-import io.github.notebook.android.sync.SyncBackend
 import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.sync.NoteSaveState
 import io.github.notebook.android.sync.NoteRevisionSummary
-import io.github.notebook.android.sync.ParsedQrConfig
-import io.github.notebook.android.sync.parseNotebookQrConfig
-import io.github.notebook.android.sync.parseSyncQrConfig
-import io.github.notebook.android.sync.parseWebdavQrConfig
 import io.github.notebook.android.sync.HostKeyChangedException
 import io.github.notebook.android.sync.HostKeyConfirmationRequiredException
 import io.github.notebook.android.sync.describeSyncError
 import io.github.notebook.android.ui.NotebookTheme
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -100,7 +90,6 @@ import io.noties.markwon.ext.tables.TablePlugin
 import io.github.notebook.android.update.AppUpdateViewModel
 import io.github.notebook.android.update.DownloadProgress
 import io.github.notebook.android.update.UpdatePhase
-import io.github.notebook.android.diagnostics.DiagnosticLogger
 import io.github.notebook.android.tts.TtsPhase
 import io.github.notebook.android.tts.TtsPlayer
 import io.github.notebook.android.tts.TtsReaderBar
@@ -217,7 +206,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         if(documentStack.isEmpty()){editing=null;activeDocumentId=null;startInEditMode=false}
         else {val previous=documentStack.removeAt(documentStack.lastIndex);scope.launch{val note=repo.loadNote(previous.first);editing=note?.takeIf{!repo.isEncrypted(it)||encryptedUnlocked};startInEditMode=previous.second}}
     }
-    var showSettings by remember{mutableStateOf(false)};var syncNowRequest by remember{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
+    var showSettings by rememberSaveable{mutableStateOf(false)};var syncNowRequest by rememberSaveable{mutableStateOf(false)}; var status by remember{mutableStateOf<String?>(null)}
     var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)}
     var showAllFolders by remember{mutableStateOf(false)};var showAllTags by remember{mutableStateOf(false)}
     var pendingEncryptedFolder by remember{mutableStateOf<String?>(null)};var pendingPrivateNoteId by remember{mutableStateOf<String?>(null)};var pendingPrivateStartInEditMode by remember{mutableStateOf(false)};var deviceCredentialInProgress by remember{mutableStateOf(false)}
@@ -304,7 +293,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     }
     // "打开笔记" in the floating read-aloud player: leave whatever screen is up and show the note being read.
     LaunchedEffect(ttsOpenNoteId){ttsOpenNoteId?.let{id->
-        showAi=false;showSettings=false;manage=null
+        showAi=false;showSettings=false;syncNowRequest=false;manage=null
         if(editing?.id!=id)openNote(id)
         onTtsOpenHandled()
     }}
@@ -367,7 +356,15 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         }
     }}
     if(showAi){io.github.notebook.android.ai.AiAssistantScreen(repo,aiNoteId,{markdown,modifier->MarkdownView(markdown,modifier)},onOpenNote={id->showAi=false;openNote(id)},onBack={showAi=false});return}
-    if(showSettings){ReferenceSettings(repo,{showSettings=false;syncNowRequest=false},{scanOnStart,back->ServerSettings(repo,back,syncNowRequest,scanOnStart)},{manage=it;showSettings=false},startInSync=syncNowRequest);return}
+    if (showSettings) {
+        SettingsFlow(
+            repo = repo,
+            startWithSync = syncNowRequest,
+            onBack = { showSettings = false; syncNowRequest = false },
+            manage = { kind, back -> ManagementScreen(kind, repo, folders, tags, back) },
+        )
+        return
+    }
     manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
 
     fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;scope.launch{drawer.close()}}
@@ -415,7 +412,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("标签",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("管理",Modifier.clickable{manage="tag"},style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)}
             tags.take(if(showAllTags)tags.size else 6).forEach{tag->DrawerRow(tag.name,Icons.Default.Label,tagId==tag.id){select(Destination.All,tag=tag.id)}}
             if(tags.size>6)Text(if(showAllTags)"收起标签" else "查看全部标签（${tags.size}）",Modifier.fillMaxWidth().clickable{showAllTags=!showAllTags}.padding(start=28.dp,top=6.dp,bottom=8.dp),style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("AI 助手",Icons.Default.AutoAwesome,false){aiNoteId=null;showAi=true;scope.launch{drawer.close()}};DrawerRow("设置与同步",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("AI 助手",Icons.Default.AutoAwesome,false){aiNoteId=null;showAi=true;scope.launch{drawer.close()}};DrawerRow("设置",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
     val mainContent:@Composable ()->Unit={
         homeHolder.SaveableStateProvider("home"){ReferenceHome(
@@ -1002,9 +999,40 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     if(showingSettings)ReaderSettingsDialog(readerStyle,{showingSettings=false}){updateReaderStyle(it);showingSettings=false}
 }
 
-@Composable private fun ReaderSettingsDialog(current:ReaderStyle,onDismiss:()->Unit,onConfirm:(ReaderStyle)->Unit){
-    var fontSize by remember(current){mutableFloatStateOf(current.fontSizeSp)};var lineHeight by remember(current){mutableFloatStateOf(current.lineHeight)};var width by remember(current){mutableFloatStateOf(current.maxWidthDp)}
-    AlertDialog(onDismissRequest=onDismiss,title={Text("阅读设置")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("字号 ${fontSize.roundToInt()} sp");Slider(fontSize,{fontSize=it},valueRange=13f..30f,steps=16);Text("行高 ${String.format(Locale.ROOT,"%.2f",lineHeight)}");Slider(lineHeight,{lineHeight=it},valueRange=1.05f..1.8f);Text("正文最大宽度 ${width.roundToInt()} dp");Slider(width,{width=it},valueRange=480f..1200f,steps=8)}},confirmButton={Button({onConfirm(ReaderStyle(fontSize,lineHeight,width))}){Text("保存")}},dismissButton={TextButton(onDismiss){Text("取消")}})
+@Composable
+private fun ReaderSettingsDialog(current: ReaderStyle, onDismiss: () -> Unit, onConfirm: (ReaderStyle) -> Unit) {
+    var draft by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("阅读设置") },
+        text = { ReaderStyleFields(draft) { draft = it } },
+        confirmButton = { Button({ onConfirm(draft) }) { Text("保存") } },
+        dismissButton = { TextButton(onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+internal fun ReadingSettingsScreen(onBack: () -> Unit) {
+    val (current, save) = rememberReaderStyle()
+    var draft by remember { mutableStateOf(current) }
+    SettingsScreen("阅读排版", onBack) {
+        SettingsSection("正文") {
+            Column(Modifier.padding(16.dp)) { ReaderStyleFields(draft) { draft = it } }
+        }
+        Button({ save(draft); onBack() }, Modifier.fillMaxWidth()) { Text("保存") }
+    }
+}
+
+@Composable
+private fun ReaderStyleFields(style: ReaderStyle, update: (ReaderStyle) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("字号 ${style.fontSizeSp.roundToInt()} sp")
+        Slider(style.fontSizeSp, { update(style.copy(fontSizeSp = it)) }, valueRange = 13f..30f, steps = 16)
+        Text("行高 ${String.format(Locale.ROOT, "%.2f", style.lineHeight)}")
+        Slider(style.lineHeight, { update(style.copy(lineHeight = it)) }, valueRange = 1.05f..1.8f)
+        Text("正文最大宽度 ${style.maxWidthDp.roundToInt()} dp")
+        Slider(style.maxWidthDp, { update(style.copy(maxWidthDp = it)) }, valueRange = 480f..1200f, steps = 8)
+    }
 }
 
 private fun launchScroll(scope:kotlinx.coroutines.CoroutineScope,state:androidx.compose.foundation.lazy.LazyListState,item:Int){scope.launch{state.scrollToItem(item)}}
@@ -1087,202 +1115,7 @@ internal fun imageAspectRatio(asset:AssetEntity,file:java.io.File):Float?{
 private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024->String.format(Locale.getDefault(),"%.1f KB",bytes/1024.0);else->String.format(Locale.getDefault(),"%.1f MB",bytes/(1024.0*1024.0))}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit,autoSync:Boolean=false,scanOnStart:Boolean=false){
-    BackHandler(onBack=onBack)
-    val context=LocalContext.current
-    var backend by remember{mutableStateOf(repo.syncBackend())}
-    var w by remember{mutableStateOf(repo.webdavSettings())}
-    var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
-    var showLegacySync by remember{mutableStateOf(backend==SyncBackend.SSH||backend==SyncBackend.API)}
-    var diagnosticMessage by remember{mutableStateOf<String?>(null)}
-    suspend fun syncNow(fromQrPrefix:String?=null){
-        if(syncing)return
-        syncing=true;message=if(fromQrPrefix!=null)"$fromQrPrefix，正在连接服务器并同步…" else "正在连接服务器并同步…";isError=false;changedKey=null;newKey=null
-        try{
-            repo.sync{message=if(fromQrPrefix!=null)"$fromQrPrefix · $it" else it}
-            val done=repo.syncCompletionMessage()
-            message=if(fromQrPrefix!=null)"$fromQrPrefix · $done" else done
-        }catch(error:kotlinx.coroutines.CancellationException){
-            message="同步已取消";throw error
-        }catch(error:Exception){
-            when(error){
-                is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"}
-                is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"}
-                else->message="${if(fromQrPrefix!=null)"$fromQrPrefix，但" else ""}连接或同步失败：${describeSyncError(error)}"
-            }
-            isError=true
-        }finally{syncing=false}
-    }
-    LaunchedEffect(autoSync){if(autoSync)syncNow()}
-    fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
-    val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->
-        var qrPrefix:String?=null
-        runCatching{
-            when(val parsed=parseNotebookQrConfig(payload)){
-                is ParsedQrConfig.Webdav->{
-                    val config=parsed.settings
-                    repo.saveWebdavSettings(config)
-                    repo.setSyncBackend(SyncBackend.WEBDAV)
-                    backend=SyncBackend.WEBDAV
-                    showLegacySync=false
-                    w=config
-                    qrPrefix="已从二维码导入坚果云配置"
-                }
-                is ParsedQrConfig.Ssh->{
-                    val config=parsed.settings
-                    s=config
-                    repo.saveSettings(config)
-                    backend=SyncBackend.SSH
-                    showLegacySync=true
-                    qrPrefix="已从二维码导入 SSH 配置"
-                }
-            }
-        }.onSuccess{scope.launch{syncNow(qrPrefix)}}.onFailure{message=it.message?:"无法读取配置二维码";isError=true}
-    }}
-    fun launchQrScanner(){
-        scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("请将取景框对准电脑端生成的同步配置二维码").setBeepEnabled(false).setOrientationLocked(false))
-    }
-    LaunchedEffect(scanOnStart){if(scanOnStart&&!autoSync)launchQrScanner()}
-    var privateKeyPassphrase by remember{mutableStateOf(s.privateKeyPassphrase)}
-    val keyPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{runCatching{repo.importPrivateKey(source,privateKeyPassphrase)}.onSuccess{s=repo.settings();message="私钥已导入"}.onFailure{message=it.message?:"无法导入私钥";isError=true}}}}
-    newKey?.let{key->AlertDialog(onDismissRequest={newKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("确认服务器身份")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("首次连接不会自动信任服务器。请将下面的 SHA-256 指纹与桌面端或服务器管理员提供的值核对，确认一致后再继续。");Text(key.actual,style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(key.actual);s=repo.settings();newKey=null;scope.launch{syncNow()}}){Text("指纹一致，信任并继续")}},dismissButton={TextButton({newKey=null}){Text("取消")}})}
-    changedKey?.let{change->AlertDialog(onDismissRequest={changedKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("服务器身份已变化")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("这可能是服务器重装、SSH 密钥更新，也可能存在安全风险。确认这是你的服务器后才能继续。");Text("原指纹\n${change.expected}",style=MaterialTheme.typography.bodySmall);Text("新指纹\n${change.actual}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(change.actual);s=repo.settings();changedKey=null;scope.launch{syncNow()}}){Text("信任并继续")}},dismissButton={TextButton({changedKey=null}){Text("取消")}})}
-    Scaffold(topBar={TopAppBar(title={Text("设置与同步")},navigationIcon={IconButton(onBack){Icon(Icons.Default.ArrowBack,"返回")}},actions={IconButton({launchQrScanner()},enabled=!syncing){Icon(Icons.Default.QrCodeScanner,"扫码配置同步")}})}){p->
-        Column(Modifier.padding(p).padding(20.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()),verticalArrangement=Arrangement.spacedBy(10.dp)){
-            ReminderPermissionCard()
-            Text("正式同步",fontWeight=FontWeight.SemiBold)
-            Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.primaryContainer),modifier=Modifier.fillMaxWidth()){
-                Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(6.dp)){
-                    Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(Icons.Default.CloudSync,"坚果云 WebDAV");Spacer(Modifier.width(8.dp));Text("坚果云 WebDAV",style=MaterialTheme.typography.titleMedium,fontWeight=FontWeight.SemiBold);Spacer(Modifier.weight(1f));if(backend==SyncBackend.WEBDAV)AssistChip(onClick={},label={Text("当前使用")})}
-                    Text("唯一推荐的正式同步方式。支持可靠的跨设备同步与冲突处理。",style=MaterialTheme.typography.bodySmall)
-                    if(backend!=SyncBackend.WEBDAV)OutlinedButton({backend=SyncBackend.WEBDAV;showLegacySync=false},Modifier.minimumInteractiveComponentSize()){Text("使用坚果云 WebDAV")}
-                }
-            }
-            message?.let{Card(colors=CardDefaults.cardColors(containerColor=if(isError)MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer),modifier=Modifier.fillMaxWidth()){Row(Modifier.padding(12.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)){if(syncing)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp);Icon(if(isError)Icons.Default.ErrorOutline else Icons.Default.CheckCircle,null);Text(it,Modifier.weight(1f),style=MaterialTheme.typography.bodySmall)}}}
-            HorizontalDivider()
-            if(backend==SyncBackend.WEBDAV){
-                Text("坚果云 WebDAV",fontWeight=FontWeight.SemiBold)
-                Button({launchQrScanner()},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描电脑端配置二维码")}
-                Text("在电脑端打开「设置 → 同步与连接 → 生成配置二维码」，扫码即可自动填入服务器地址、用户名、应用密码、远程目录与隐私同步密钥并立即同步。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                OutlinedTextField(w.baseUrl,{w=w.copy(baseUrl=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("服务器地址")},placeholder={Text("https://dav.jianguoyun.com/dav/")})
-                OutlinedTextField(w.username,{w=w.copy(username=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("用户名")})
-                OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
-                OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("远程目录")})
-                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("隐私同步密钥")},visualTransformation=PasswordVisualTransformation())
-                Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。配置与电脑相同的隐私同步密钥后，私密笔记、附件及历史以密文同步；密钥只保存在设备上。",style=MaterialTheme.typography.bodySmall)
-                Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.secondaryContainer),modifier=Modifier.fillMaxWidth()){
-                    Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(4.dp)){
-                        Text("私密文件夹说明",fontWeight=FontWeight.SemiBold)
-                        Text("私密文件夹通过设备锁保护访问。本地数据依赖 Android 系统存储加密；云端内容使用隐私同步密钥加密。请在已有设备上保留密钥，恢复到新设备时需要同一密钥。未设置密钥的私密内容仍只保存在本机。",style=MaterialTheme.typography.bodySmall)
-                    }
-                }
-                Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
-                    OutlinedButton({testWebdavNow()},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在检测…" else "检测连接")}
-                    Button({runCatching{repo.saveWebdavSettings(w)}.onSuccess{backend=SyncBackend.WEBDAV;scope.launch{syncNow()}}.onFailure{message=it.localizedMessage?:"同步配置保存失败，请重试";isError=true}},Modifier.weight(1f),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存并同步")}
-                }
-                SyncHealthCard(repo,syncing,message){kind->scope.launch{
-                    runCatching{when(kind){"reread"->repo.resetSyncReadPositions();"republish"->repo.republishAll();else->Unit}}
-                        .onSuccess{syncNow()}
-                        .onFailure{message="修复失败：${it.localizedMessage?:it.javaClass.simpleName}";isError=true}
-                }}
-            }
-            OutlinedCard(onClick={showLegacySync=!showLegacySync},modifier=Modifier.fillMaxWidth()){
-                Row(Modifier.padding(14.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Icon(Icons.Default.History,"旧同步方式与迁移");Spacer(Modifier.width(8.dp));Column(Modifier.weight(1f)){Text("旧同步方式与迁移",fontWeight=FontWeight.SemiBold);Text("仅用于迁移已有 SSH 或 API 仓库，不建议持续同步。",style=MaterialTheme.typography.bodySmall)};Icon(if(showLegacySync)Icons.Default.ExpandLess else Icons.Default.ExpandMore,if(showLegacySync)"收起旧同步方式" else "展开旧同步方式")}
-            }
-            OutlinedButton({scope.launch{runCatching{repo.exportSyncDiagnostics()}.onSuccess{message="同步诊断已保存（仅实体标识与校验值，不含正文、标题或密钥）"}.onFailure{message="诊断导出失败：${it.message}";isError=true}}},enabled=!syncing){Text("导出同步诊断")}
-            if(showLegacySync){
-                Text("SSH/SFTP 旧仓库迁移",fontWeight=FontWeight.SemiBold)
-                Text("旧配置会保留，方便完成迁移；请先同步并导入到坚果云 WebDAV，之后将正式同步切回 WebDAV。HTTP API 也仅作为旧部署迁移兼容，不作为新的客户端同步入口。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                if(backend!=SyncBackend.SSH)OutlinedButton({backend=SyncBackend.SSH},Modifier.minimumInteractiveComponentSize()){Text("打开 SSH 旧配置")}
-            }
-            if(showLegacySync&&backend==SyncBackend.SSH){
-                Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surfaceVariant),modifier=Modifier.fillMaxWidth()){
-                    Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(8.dp)){
-                Text("SSH/SFTP 同步（仅迁移）",fontWeight=FontWeight.SemiBold)
-                Button({launchQrScanner()},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描配置二维码")}
-                fun update(host:String=s.host,port:Int=s.port,user:String=s.username,password:String=s.password,path:String=s.path,privateKeyPath:String=s.privateKeyPath){s=SshSettings(host,port,user,password,path,s.fingerprint,privateKeyPath,privateKeyPassphrase)}
-                OutlinedTextField(s.host,{update(host=it)},label={Text("服务器地址")});OutlinedTextField(s.port.toString(),{update(port=it.toIntOrNull()?:22)},label={Text("端口")});OutlinedTextField(s.username,{update(user=it)},label={Text("用户名")});OutlinedTextField(s.password,{update(password=it)},label={Text("密码（可选）")},visualTransformation=PasswordVisualTransformation());OutlinedTextField(s.path,{update(path=it)},label={Text("远程目录")})
-                HorizontalDivider();Text("SSH 私钥",fontWeight=FontWeight.SemiBold)
-                if(s.privateKeyPath.isNotBlank())Text("已导入：${s.privateKeyPath}",style=MaterialTheme.typography.bodySmall)
-                OutlinedTextField(privateKeyPassphrase,{privateKeyPassphrase=it;update()},label={Text("私钥口令（可选）")},visualTransformation=PasswordVisualTransformation())
-                Button({keyPicker.launch(arrayOf("*/*"))},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.Key,null);Spacer(Modifier.width(8.dp));Text(if(s.privateKeyPath.isBlank())"导入私钥文件" else "重新导入私钥")}
-                if(s.privateKeyPath.isNotBlank())OutlinedButton({repo.clearPrivateKey();s=repo.settings()}){Text("清除私钥")}
-                if(s.fingerprint.isNotBlank())Text("已信任主机指纹：${s.fingerprint}",style=MaterialTheme.typography.bodySmall)
-                Text("仅用于读取和迁移旧 SSH JSON 仓库。迁移完成后请改用上方的坚果云 WebDAV；不要把 SSH 作为持续同步方案。",style=MaterialTheme.typography.bodySmall)
-                Button({repo.saveSettings(s);scope.launch{syncNow()}},Modifier.fillMaxWidth(),enabled=!syncing){Text(if(syncing)"正在同步…" else "保存旧配置并迁移")}
-                    }
-                }
-            }
-            HorizontalDivider()
-            Text("诊断日志",fontWeight=FontWeight.SemiBold)
-            Text("导出最近约 2 MiB 的结构化运行日志。日志不含笔记标题、正文、密码、令牌、原始网址或服务器响应。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-            OutlinedButton(onClick={scope.launch{
-                runCatching{
-                        val file=withContext(Dispatchers.IO){DiagnosticLogger.exportArchive(context)}
-                        val uri=FileProvider.getUriForFile(context,"${context.packageName}.files",file)
-                        val share=Intent(Intent.ACTION_SEND).setType("application/zip").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        context.startActivity(Intent.createChooser(share,"分享 Notebook 诊断日志"))
-                    }.onSuccess{diagnosticMessage=null}.onFailure{error->
-                        if(error is CancellationException)throw error
-                        diagnosticMessage="诊断日志导出失败"
-                    }
-            }},modifier=Modifier.fillMaxWidth()){Icon(Icons.Default.Share,null);Spacer(Modifier.width(8.dp));Text("导出并分享诊断日志")}
-            diagnosticMessage?.let{Text(it,color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)}
-        }
-    }
-}
-
-@Composable private fun SyncHealthCard(repo:SyncRepository,syncing:Boolean,refreshKey:Any?,onRepair:(String)->Unit){
-    var pending by remember{mutableStateOf<Int?>(null)};var copies by remember{mutableStateOf<Int?>(null)}
-    var confirm by remember{mutableStateOf<String?>(null)}
-    var issues by remember{mutableStateOf<io.github.notebook.android.sync.WebdavSyncIssues?>(null)}
-    var confirmDismiss by remember{mutableStateOf(false)}
-    var confirmRebuild by remember{mutableStateOf(false)}
-    val healthScope=rememberCoroutineScope()
-    LaunchedEffect(syncing,refreshKey){if(!syncing){pending=runCatching{repo.pendingUploadCount()}.getOrNull();copies=runCatching{repo.conflictCopyCount()}.getOrNull();issues=runCatching{repo.syncIssues()}.getOrNull()}}
-    val last=repo.lastSyncSuccessAt()
-    OutlinedCard(Modifier.fillMaxWidth()){Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(6.dp)){
-        Text("同步状态与修复",fontWeight=FontWeight.SemiBold)
-        Text("上次成功同步：${last?.let{android.text.format.DateUtils.getRelativeTimeSpanString(it,System.currentTimeMillis(),android.text.format.DateUtils.MINUTE_IN_MILLIS)}?:"尚未成功同步"}",style=MaterialTheme.typography.bodySmall)
-        Text("等待上传：${pending?.let{"$it 条变更"}?:"…"}    冲突副本：${copies?.let{if(it==0)"无" else "$it 篇"}?:"…"}",style=MaterialTheme.typography.bodySmall)
-        Text("多台设备同时修改同一篇笔记时，同步不会中断：保留本机版本，另一版本另存为标题含“冲突副本”的笔记，可对比后删除。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-        Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
-            OutlinedButton({confirm="reread"},Modifier.weight(1f),enabled=!syncing){Text("重新读取云端",maxLines=1)}
-            OutlinedButton({confirm="republish"},Modifier.weight(1f),enabled=!syncing){Text("重新上传本机",maxLines=1)}
-        }
-        Text("别的设备的修改没出现：重新读取云端。云端目录被清空或新设备缺笔记：重新上传本机。两者都不会删除内容，可以放心重复执行。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
-        issues?.takeUnless{it.isEmpty}?.let{found->
-            HorizontalDivider()
-            Text("需要处理的同步问题",fontWeight=FontWeight.SemiBold,color=MaterialTheme.colorScheme.error)
-            val ownBlocked=found.blocked.any{it.deviceId==repo.ownDeviceId()}
-            found.blocked.forEach{Text((if(it.deviceId==repo.ownDeviceId())"本机" else "设备 ${it.deviceId.take(8)}")+"：${when(it.code){io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_CORRUPT->"日志含有无法解析的记录";io.github.notebook.android.sync.WebdavBlockCode.HEAD_CORRUPT->"提交标记损坏";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TRUNCATED->"日志被截断，部分记录丢失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_MISSING->"日志文件缺失";io.github.notebook.android.sync.WebdavBlockCode.JOURNAL_TOO_LARGE->"日志超过 100 MB"}}。"+(if(it.deviceId==repo.ownDeviceId())"新的修改暂时无法上传，请选择“重建本机日志”。" else "其余设备的同步不受影响；请在那台设备上选择“重建本机日志”。"),style=MaterialTheme.typography.bodySmall)}
-            if(ownBlocked)Button({confirmRebuild=true},Modifier.fillMaxWidth(),enabled=!syncing){Text("重建本机日志")}
-            found.quarantined.groupBy{it.reason}.forEach{(reason,rows)->Text("${rows.size} 条：${when(reason){"needs-key"->"需要隐私同步密钥，填写后会自动读取";"bad-key"->"隐私同步密钥不匹配，请确认各设备使用同一密钥";"unknown-type"->"来自更新版本的记录，升级应用后会自动读取";"missing-object"->"云端文件缺失，请在产生该内容的设备上“重新上传本机”后重试";"object-corrupt"->"云端文件已损坏，请在产生该内容的设备上“重新上传本机”后重试";"workspace-mismatch"->"属于其他工作区，可以删除";else->"记录内容不正确，升级应用后会重试一次"}}",style=MaterialTheme.typography.bodySmall)}
-            if(found.quarantined.isNotEmpty())Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
-                OutlinedButton({healthScope.launch{runCatching{repo.retrySyncIssues()};issues=runCatching{repo.syncIssues()}.getOrNull()}},Modifier.weight(1f),enabled=!syncing){Text("重试异常记录",maxLines=1)}
-                OutlinedButton({confirmDismiss=true},Modifier.weight(1f),enabled=!syncing){Text("删除异常记录",maxLines=1)}
-            }
-        }
-    }}
-    if(confirmRebuild)AlertDialog(onDismissRequest={confirmRebuild=false},title={Text("重建本机日志？")},
-        text={Text("本机在云端的同步日志已损坏，所以无法上传新的修改。重建会保留一份损坏文件的副本（同目录下以 .corrupt 结尾），移除损坏的日志，再把本机全部内容重新上传；序号会接着原来的继续，其他设备已读取的内容不会重复或丢失。本机笔记不会改动。")},
-        confirmButton={Button({confirmRebuild=false;healthScope.launch{runCatching{repo.rebuildOwnJournal()}.onSuccess{onRepair("rebuilt")}.onFailure{issues=runCatching{repo.syncIssues()}.getOrNull()};issues=runCatching{repo.syncIssues()}.getOrNull()}}){Text("重建并重新上传")}},
-        dismissButton={TextButton({confirmRebuild=false}){Text("取消")}})
-    if(confirmDismiss)AlertDialog(onDismissRequest={confirmDismiss=false},title={Text("删除异常记录？")},
-        text={Text("这些云端记录将不再尝试读取，本机内容不受影响；其他设备上的原始记录不会被删除。此操作无法撤销。")},
-        confirmButton={Button({confirmDismiss=false;healthScope.launch{runCatching{repo.dismissSyncIssues()};issues=runCatching{repo.syncIssues()}.getOrNull()}}){Text("删除")}},
-        dismissButton={TextButton({confirmDismiss=false}){Text("取消")}})
-    confirm?.let{kind->AlertDialog(onDismissRequest={confirm=null},
-        title={Text(if(kind=="reread")"重新读取全部云端记录？" else "重新上传本机全部内容？")},
-        text={Text(if(kind=="reread")"忽略本机记住的读取位置，从头核对坚果云上所有设备的记录。已有内容不会被删除或重复，记录多时会多用一些流量。" else "把本机所有笔记、附件和设置重新排队上传，作为当前版本的后续版本。其他设备会自动合并，不会产生重复笔记。")},
-        confirmButton={Button({confirm=null;onRepair(kind)}){Text("开始并同步")}},
-        dismissButton={TextButton({confirm=null}){Text("取消")}})}
-}
-
-@Composable private fun ReminderPermissionCard(){val context=LocalContext.current;val owner=LocalLifecycleOwner.current;var refresh by remember{mutableIntStateOf(0)};val notificationLauncher=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()){refresh++};DisposableEffect(owner){val observer=LifecycleEventObserver{_,event->if(event==Lifecycle.Event.ON_RESUME)refresh++};owner.lifecycle.addObserver(observer);onDispose{owner.lifecycle.removeObserver(observer)}};val notifications=refresh.let{android.os.Build.VERSION.SDK_INT<33||context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==android.content.pm.PackageManager.PERMISSION_GRANTED};val alarm=context.getSystemService(android.content.Context.ALARM_SERVICE) as android.app.AlarmManager;val exact=android.os.Build.VERSION.SDK_INT<31||alarm.canScheduleExactAlarms();Card(Modifier.fillMaxWidth()){Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(8.dp)){Text("提醒权限",fontWeight=FontWeight.SemiBold);Text("通知：${if(notifications)"已允许" else "未允许"}    精确提醒：${if(exact)"已允许" else "将使用非精确提醒"}",style=MaterialTheme.typography.bodySmall);FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){if(!notifications)OutlinedButton({notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)}){Text("允许通知")};if(!exact&&android.os.Build.VERSION.SDK_INT>=31)OutlinedButton({val intent=Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,android.net.Uri.parse("package:${context.packageName}"));runCatching{context.startActivity(intent)}}){Text("允许精确提醒")}}}}}
+@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理待办文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新待办文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
 
 @Composable private fun UpdateAction(state:AppUpdateViewModel){
     if(state.release==null)return

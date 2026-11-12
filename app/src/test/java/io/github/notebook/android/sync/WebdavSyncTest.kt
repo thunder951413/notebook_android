@@ -158,6 +158,27 @@ class WebdavSyncTest {
         remotePath = "notebook_backup",
     )
 
+    @Test
+    fun connectionTestChecksMissingDirectoryWithoutCreatingIt() = runBlocking {
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.method != "PROPFIND") return MockResponse().setResponseCode(405)
+                if (request.path != "/dav/") return MockResponse().setResponseCode(404)
+                return MockResponse().setResponseCode(207).setBody(
+                    """<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/</d:href></d:response></d:multistatus>"""
+                )
+            }
+        }
+
+        val result = client.test(settings())
+
+        assertTrue(result.ok)
+        assertFalse(result.remotePathExists)
+        assertEquals(2, server.requestCount)
+        assertEquals("PROPFIND", server.takeRequest().method)
+        assertEquals("PROPFIND", server.takeRequest().method)
+    }
+
     private fun note(title: String = "本地笔记", body: String = "# 标题\n- [x] 完成") = NoteEntity(
         id = noteId, title = title, body = body, previewText = body.take(30),
         createdAt = System.currentTimeMillis(), updatedAt = System.currentTimeMillis(),

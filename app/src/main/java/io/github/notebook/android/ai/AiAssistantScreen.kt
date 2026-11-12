@@ -367,7 +367,7 @@ fun AiAssistantScreen(
         ScopePicker(aiScope, notes.filter { it.deletedAt == null && it.itemType != "todo" && !repo.isEncrypted(it) }, folders.filter { it.type != "encryptedFolder" && it.type != "todoList" }, tags, { aiScope = it }) { showPicker = false }
     }
     if (showSettings) AiSettingsDialog(settings, onDismiss = { showSettings = false }) { updated ->
-        runCatching { repo.saveAiSettings(updated) }.onSuccess { settings = updated; showSettings = false; notice = "AI 设置已保存" }.onFailure { notice = it.message }
+        runCatching { repo.saveAiSettings(updated) }.onSuccess { settings = repo.aiSettings(); showSettings = false; notice = "AI 设置已保存" }.onFailure { notice = it.message }
     }
     if (exportDialog) {
         val items = answers.filter { it.id in selected }.map { AiAssistant.ExportItem(it.question, it.text, it.sources) }
@@ -489,30 +489,70 @@ private fun ScopePicker(scope: AiScope, notes: List<NoteSummary>, folders: List<
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AiSettingsDialog(current: AiSettings, onDismiss: () -> Unit, onSave: (AiSettings) -> Unit) {
-    var provider by remember { mutableStateOf(current.provider) }
-    var baseUrl by remember { mutableStateOf(current.baseUrl) }
-    var model by remember { mutableStateOf(current.model) }
-    var key by remember { mutableStateOf(current.apiKey) }
+    var draft by remember { mutableStateOf(current) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("AI 设置") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                    AiProvider.entries.forEachIndexed { index, item ->
-                        SegmentedButton(selected = provider == item, onClick = { provider = item; if (item != AiProvider.Custom) { baseUrl = item.baseUrl; model = item.model } }, shape = SegmentedButtonDefaults.itemShape(index, AiProvider.entries.size)) { Text(if (item == AiProvider.Custom) "自定义" else item.label, maxLines = 1) }
-                    }
-                }
-                OutlinedTextField(baseUrl, { baseUrl = it }, label = { Text("接口地址") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(model, { model = it }, label = { Text("模型") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(key, { key = it }, label = { Text("API Key") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.fillMaxWidth())
-                Text("API Key 只加密保存在这台手机上，不会同步到其他设备。自定义可填任意 OpenAI 兼容接口，例如通义、Kimi 或局域网里的 Ollama（http://192.168.x.x:11434/v1）。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        },
-        confirmButton = { Button({ onSave(AiSettings(provider, baseUrl.trim(), model.trim(), key.trim())) }, enabled = baseUrl.isNotBlank() && model.isNotBlank()) { Text("保存") } },
+        text = { AiServiceFields(draft, { draft = it }, Modifier.verticalScroll(rememberScrollState())) },
+        confirmButton = { Button({ onSave(draft) }, enabled = draft.hasServiceDetails()) { Text("保存") } },
         dismissButton = { TextButton(onDismiss) { Text("取消") } },
     )
+}
+
+@Composable
+internal fun AiServiceSettingsScreen(repo: SyncRepository, onBack: () -> Unit) {
+    var draft by remember { mutableStateOf(repo.aiSettings()) }
+    var error by remember { mutableStateOf<String?>(null) }
+    io.github.notebook.android.SettingsScreen("AI 服务", onBack) {
+        AiServiceFields(draft, { draft = it })
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        Button(
+            onClick = {
+                runCatching { repo.saveAiSettings(draft) }.onSuccess { onBack() }
+                    .onFailure { error = it.localizedMessage ?: "AI 设置保存失败，请重试" }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = draft.hasServiceDetails(),
+        ) { Text("保存") }
+    }
+}
+
+private fun AiSettings.hasServiceDetails() = baseUrl.isNotBlank() && model.isNotBlank()
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AiServiceFields(draft: AiSettings, update: (AiSettings) -> Unit, modifier: Modifier = Modifier) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            AiProvider.entries.forEachIndexed { index, provider ->
+                SegmentedButton(
+                    selected = draft.provider == provider,
+                    onClick = {
+                        update(if (provider == AiProvider.Custom) draft.copy(provider = provider)
+                        else draft.copy(provider = provider, baseUrl = provider.baseUrl, model = provider.model))
+                    },
+                    shape = SegmentedButtonDefaults.itemShape(index, AiProvider.entries.size),
+                ) { Text(if (provider == AiProvider.Custom) "自定义" else provider.label, maxLines = 1) }
+            }
+        }
+        OutlinedTextField(
+            draft.baseUrl, { update(draft.copy(baseUrl = it)) }, Modifier.fillMaxWidth(),
+            label = { Text("接口地址") }, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+        )
+        OutlinedTextField(draft.model, { update(draft.copy(model = it)) }, Modifier.fillMaxWidth(), label = { Text("模型") }, singleLine = true)
+        OutlinedTextField(
+            draft.apiKey, { update(draft.copy(apiKey = it)) }, Modifier.fillMaxWidth(),
+            label = { Text("API Key") }, singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        )
+        Text(
+            "API Key 加密保存在这台手机上。自定义支持 OpenAI 兼容接口，例如通义、Kimi 或局域网里的 Ollama。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }

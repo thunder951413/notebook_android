@@ -255,6 +255,8 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun acknowledgeSaved(noteId:String){_noteSaveStates.update{states->if(states[noteId]==NoteSaveState.Saved)states-noteId else states}}
     fun clearSaveError(){_saveError.value=null}
     private val prefs=preferences?:encryptedPrefs(context)
+    private val _lastSyncSuccess = MutableStateFlow(lastSyncSuccessAt())
+    val lastSyncSuccess = _lastSyncSuccess.asStateFlow()
     private val privacy=PrivateNoteIndex(prefs,gson)
     private val apiSync=ApiSyncClient(appContext,dao)
     private val webdavSync=WebdavSyncClient(appContext,dao,prefs,apiSync,privacy=privacy)
@@ -281,7 +283,7 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     fun resetTtsUsage(){check(prefs.edit().putLong("ttsUsedChars",0L).commit()){"用量清零失败，请重试"}}
     fun webdavSettings()=WebdavSettings(prefs.getString("webdavBaseUrl","https://dav.jianguoyun.com/dav/")!!,prefs.getString("webdavUser","")!!,prefs.getString("webdavAppPassword","")!!,prefs.getString("webdavPath","notebook_backup")!!,prefs.getString("webdavSyncPassword","")!!)
     fun saveWebdavSettings(s:WebdavSettings){check(prefs.edit().putString("syncBackend",SyncBackend.WEBDAV.name).putString("webdavBaseUrl",s.baseUrl.trim()).putString("webdavUser",s.username.trim()).putString("webdavAppPassword",s.appPassword).putString("webdavPath",s.remotePath.trim()).putString("webdavSyncPassword",s.syncPassword).commit()){ "同步配置保存失败，请重试" }}
-    suspend fun testWebdav():WebdavTestResult=webdavSync.test(webdavSettings())
+    suspend fun testWebdav(settings: WebdavSettings = webdavSettings()):WebdavTestResult=webdavSync.test(settings)
     suspend fun syncCompletionMessage():String {
         val notices=buildList{
             if(syncBackend()==SyncBackend.WEBDAV){
@@ -832,10 +834,14 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         resolver.openInputStream(uri).use{input->requireNotNull(input){"无法读取私钥文件"}.copyTo(target.outputStream())}
         require(target.length()<=1_048_576){"私钥文件超过 1 MB，已拒绝导入"}
         target.setReadable(false,false);target.setReadable(true,true)
-        saveSettings(settings().copy(privateKeyPath=target.absolutePath,privateKeyPassphrase=passphrase))
+        savePrivateKey(target.absolutePath, passphrase)
         target.absolutePath
     }
-    fun clearPrivateKey(){saveSettings(settings().copy(privateKeyPath="",privateKeyPassphrase=""))}
+    fun clearPrivateKey() = savePrivateKey("", "")
+
+    private fun savePrivateKey(path: String, passphrase: String) {
+        prefs.edit().putString("privateKeyPath", path).putString("privateKeyPassphrase", passphrase).apply()
+    }
 
     suspend fun sync(onProgress:(String)->Unit={}){
         val operationId=DiagnosticLogger.operationId()
@@ -843,7 +849,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_START,operationId=operationId,counts=diagnosticSyncCounts())
         try{
             performSync(onProgress)
-            prefs.edit().putLong("lastSyncSuccessAt",System.currentTimeMillis()).apply()
+            val completedAt = System.currentTimeMillis()
+            prefs.edit().putLong("lastSyncSuccessAt", completedAt).apply()
+            _lastSyncSuccess.value = completedAt
             DiagnosticLogger.log(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_SUCCESS,operationId=operationId,durationMs=System.currentTimeMillis()-startedAt,counts=diagnosticSyncCounts())
         }catch(error:Throwable){
             if(error is CancellationException)throw error
