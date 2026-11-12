@@ -68,6 +68,8 @@ import io.github.notebook.android.sync.SyncBackend
 import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.sync.NoteSaveState
 import io.github.notebook.android.sync.NoteRevisionSummary
+import io.github.notebook.android.sync.ParsedQrConfig
+import io.github.notebook.android.sync.parseNotebookQrConfig
 import io.github.notebook.android.sync.parseSyncQrConfig
 import io.github.notebook.android.sync.parseWebdavQrConfig
 import io.github.notebook.android.sync.HostKeyChangedException
@@ -365,7 +367,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         }
     }}
     if(showAi){io.github.notebook.android.ai.AiAssistantScreen(repo,aiNoteId,{markdown,modifier->MarkdownView(markdown,modifier)},onOpenNote={id->showAi=false;openNote(id)},onBack={showAi=false});return}
-    if(showSettings){ReferenceSettings(repo,{showSettings=false;syncNowRequest=false},{back->ServerSettings(repo,back,syncNowRequest)},{manage=it;showSettings=false},startInSync=syncNowRequest);return}
+    if(showSettings){ReferenceSettings(repo,{showSettings=false;syncNowRequest=false},{scanOnStart,back->ServerSettings(repo,back,syncNowRequest,scanOnStart)},{manage=it;showSettings=false},startInSync=syncNowRequest);return}
     manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
 
     fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;scope.launch{drawer.close()}}
@@ -1088,7 +1090,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
 @Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理提醒文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新提醒文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit,autoSync:Boolean=false){
+@Composable private fun ServerSettings(repo:SyncRepository,onBack:()->Unit,autoSync:Boolean=false,scanOnStart:Boolean=false){
     BackHandler(onBack=onBack)
     val context=LocalContext.current
     var backend by remember{mutableStateOf(repo.syncBackend())}
@@ -1096,37 +1098,59 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
     var s by remember{mutableStateOf(repo.settings())};var message by remember{mutableStateOf<String?>(null)};var isError by remember{mutableStateOf(false)};var syncing by remember{mutableStateOf(false)};var changedKey by remember{mutableStateOf<HostKeyChangedException?>(null)};var newKey by remember{mutableStateOf<HostKeyConfirmationRequiredException?>(null)};val scope=rememberCoroutineScope()
     var showLegacySync by remember{mutableStateOf(backend==SyncBackend.SSH||backend==SyncBackend.API)}
     var diagnosticMessage by remember{mutableStateOf<String?>(null)}
-    suspend fun syncNow(){
+    suspend fun syncNow(fromQrPrefix:String?=null){
         if(syncing)return
-        syncing=true;message="正在连接服务器并同步…";isError=false;changedKey=null;newKey=null
+        syncing=true;message=if(fromQrPrefix!=null)"$fromQrPrefix，正在连接服务器并同步…" else "正在连接服务器并同步…";isError=false;changedKey=null;newKey=null
         try{
-            repo.sync{message=it}
-            message=repo.syncCompletionMessage()
+            repo.sync{message=if(fromQrPrefix!=null)"$fromQrPrefix · $it" else it}
+            val done=repo.syncCompletionMessage()
+            message=if(fromQrPrefix!=null)"$fromQrPrefix · $done" else done
         }catch(error:kotlinx.coroutines.CancellationException){
             message="同步已取消";throw error
         }catch(error:Exception){
             when(error){
                 is HostKeyConfirmationRequiredException->{newKey=error;message="首次连接需要确认服务器身份"}
                 is HostKeyChangedException->{changedKey=error;message="服务器主机密钥发生变化，需要你确认"}
-                else->message="连接或同步失败：${describeSyncError(error)}"
+                else->message="${if(fromQrPrefix!=null)"$fromQrPrefix，但" else ""}连接或同步失败：${describeSyncError(error)}"
             }
             isError=true
         }finally{syncing=false}
     }
     LaunchedEffect(autoSync){if(autoSync)syncNow()}
     fun testWebdavNow(){scope.launch{syncing=true;message="正在检测连接…";isError=false;runCatching{repo.testWebdav()}.onSuccess{result->if(result.ok)message=if(result.remotePathExists)"连接正常（${result.latencyMs} ms），远端目录可访问。" else "连接正常（${result.latencyMs} ms）；远端目录尚不存在，首次同步时会自动创建。" else{message="连接失败：${result.message}";isError=true}}.onFailure{error->message="连接失败：${error.localizedMessage?:error.message}";isError=true};syncing=false}}
-    val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->runCatching{
-        val type=runCatching{com.google.gson.JsonParser.parseString(payload).asJsonObject.get("type")?.asString}.getOrNull()
-        when(type){
-            "notebook-webdav"->{val config=parseWebdavQrConfig(payload);repo.saveWebdavSettings(config);repo.setSyncBackend(SyncBackend.WEBDAV);backend=SyncBackend.WEBDAV;w=config;message="已从二维码导入坚果云配置，正在同步…"}
-            else->{val config=parseSyncQrConfig(payload);s=config;repo.saveSettings(config)}
-        }
-    }.onSuccess{scope.launch{syncNow()}}.onFailure{message=it.message?:"无法读取配置二维码";isError=true}}}
+    val scanner=rememberLauncherForActivityResult(ScanContract()){result->result.contents?.let{payload->
+        var qrPrefix:String?=null
+        runCatching{
+            when(val parsed=parseNotebookQrConfig(payload)){
+                is ParsedQrConfig.Webdav->{
+                    val config=parsed.settings
+                    repo.saveWebdavSettings(config)
+                    repo.setSyncBackend(SyncBackend.WEBDAV)
+                    backend=SyncBackend.WEBDAV
+                    showLegacySync=false
+                    w=config
+                    qrPrefix="已从二维码导入坚果云配置"
+                }
+                is ParsedQrConfig.Ssh->{
+                    val config=parsed.settings
+                    s=config
+                    repo.saveSettings(config)
+                    backend=SyncBackend.SSH
+                    showLegacySync=true
+                    qrPrefix="已从二维码导入 SSH 配置"
+                }
+            }
+        }.onSuccess{scope.launch{syncNow(qrPrefix)}}.onFailure{message=it.message?:"无法读取配置二维码";isError=true}
+    }}
+    fun launchQrScanner(){
+        scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("请将取景框对准电脑端生成的同步配置二维码").setBeepEnabled(false).setOrientationLocked(false))
+    }
+    LaunchedEffect(scanOnStart){if(scanOnStart&&!autoSync)launchQrScanner()}
     var privateKeyPassphrase by remember{mutableStateOf(s.privateKeyPassphrase)}
     val keyPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->uri?.let{source->scope.launch{runCatching{repo.importPrivateKey(source,privateKeyPassphrase)}.onSuccess{s=repo.settings();message="私钥已导入"}.onFailure{message=it.message?:"无法导入私钥";isError=true}}}}
     newKey?.let{key->AlertDialog(onDismissRequest={newKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("确认服务器身份")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("首次连接不会自动信任服务器。请将下面的 SHA-256 指纹与桌面端或服务器管理员提供的值核对，确认一致后再继续。");Text(key.actual,style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(key.actual);s=repo.settings();newKey=null;scope.launch{syncNow()}}){Text("指纹一致，信任并继续")}},dismissButton={TextButton({newKey=null}){Text("取消")}})}
     changedKey?.let{change->AlertDialog(onDismissRequest={changedKey=null},icon={Icon(Icons.Default.Security,null)},title={Text("服务器身份已变化")},text={Column(verticalArrangement=Arrangement.spacedBy(8.dp)){Text("这可能是服务器重装、SSH 密钥更新，也可能存在安全风险。确认这是你的服务器后才能继续。");Text("原指纹\n${change.expected}",style=MaterialTheme.typography.bodySmall);Text("新指纹\n${change.actual}",style=MaterialTheme.typography.bodySmall)}},confirmButton={Button({repo.trustHostKey(change.actual);s=repo.settings();changedKey=null;scope.launch{syncNow()}}){Text("信任并继续")}},dismissButton={TextButton({changedKey=null}){Text("取消")}})}
-    Scaffold(topBar={TopAppBar(title={Text("设置与同步")},navigationIcon={IconButton(onBack){Icon(Icons.Default.ArrowBack,null)}})}){p->
+    Scaffold(topBar={TopAppBar(title={Text("设置与同步")},navigationIcon={IconButton(onBack){Icon(Icons.Default.ArrowBack,"返回")}},actions={IconButton({launchQrScanner()},enabled=!syncing){Icon(Icons.Default.QrCodeScanner,"扫码配置同步")}})}){p->
         Column(Modifier.padding(p).padding(20.dp).verticalScroll(androidx.compose.foundation.rememberScrollState()),verticalArrangement=Arrangement.spacedBy(10.dp)){
             ReminderPermissionCard()
             Text("正式同步",fontWeight=FontWeight.SemiBold)
@@ -1141,11 +1165,13 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
             HorizontalDivider()
             if(backend==SyncBackend.WEBDAV){
                 Text("坚果云 WebDAV",fontWeight=FontWeight.SemiBold)
-                OutlinedTextField(w.baseUrl,{w=w.copy(baseUrl=it)},label={Text("服务器地址")},placeholder={Text("https://dav.jianguoyun.com/dav/")})
-                OutlinedTextField(w.username,{w=w.copy(username=it)},label={Text("用户名")})
-                OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
-                OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},label={Text("远程目录")})
-                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},label={Text("隐私同步密钥")},visualTransformation=PasswordVisualTransformation())
+                Button({launchQrScanner()},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描电脑端配置二维码")}
+                Text("在电脑端打开「设置 → 同步与连接 → 生成配置二维码」，扫码即可自动填入服务器地址、用户名、应用密码、远程目录与隐私同步密钥并立即同步。",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedTextField(w.baseUrl,{w=w.copy(baseUrl=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("服务器地址")},placeholder={Text("https://dav.jianguoyun.com/dav/")})
+                OutlinedTextField(w.username,{w=w.copy(username=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("用户名")})
+                OutlinedTextField(w.appPassword,{w=w.copy(appPassword=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("应用密码")},visualTransformation=PasswordVisualTransformation())
+                OutlinedTextField(w.remotePath,{w=w.copy(remotePath=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("远程目录")})
+                OutlinedTextField(w.syncPassword,{w=w.copy(syncPassword=it)},Modifier.fillMaxWidth(),singleLine=true,label={Text("隐私同步密钥")},visualTransformation=PasswordVisualTransformation())
                 Text("坚果云需先在网页版“安全选项”中生成应用密码。正文和一般变更停止 30 秒后合并同步；应用进入前台或后台时立即同步。阅读位置只在进入后台时发布。配置与电脑相同的隐私同步密钥后，私密笔记、附件及历史以密文同步；密钥只保存在设备上。",style=MaterialTheme.typography.bodySmall)
                 Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.secondaryContainer),modifier=Modifier.fillMaxWidth()){
                     Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(4.dp)){
@@ -1176,7 +1202,7 @@ private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024-
                 Card(colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surfaceVariant),modifier=Modifier.fillMaxWidth()){
                     Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(8.dp)){
                 Text("SSH/SFTP 同步（仅迁移）",fontWeight=FontWeight.SemiBold)
-                Button({scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("扫描 Notebook 配置二维码").setBeepEnabled(false).setOrientationLocked(false))},Modifier.fillMaxWidth()){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描配置二维码")}
+                Button({launchQrScanner()},Modifier.fillMaxWidth(),enabled=!syncing){Icon(Icons.Default.QrCodeScanner,null);Spacer(Modifier.width(8.dp));Text("扫描配置二维码")}
                 fun update(host:String=s.host,port:Int=s.port,user:String=s.username,password:String=s.password,path:String=s.path,privateKeyPath:String=s.privateKeyPath){s=SshSettings(host,port,user,password,path,s.fingerprint,privateKeyPath,privateKeyPassphrase)}
                 OutlinedTextField(s.host,{update(host=it)},label={Text("服务器地址")});OutlinedTextField(s.port.toString(),{update(port=it.toIntOrNull()?:22)},label={Text("端口")});OutlinedTextField(s.username,{update(user=it)},label={Text("用户名")});OutlinedTextField(s.password,{update(password=it)},label={Text("密码（可选）")},visualTransformation=PasswordVisualTransformation());OutlinedTextField(s.path,{update(path=it)},label={Text("远程目录")})
                 HorizontalDivider();Text("SSH 私钥",fontWeight=FontWeight.SemiBold)

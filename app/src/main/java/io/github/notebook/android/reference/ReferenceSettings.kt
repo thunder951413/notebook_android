@@ -26,11 +26,12 @@ import io.github.notebook.android.sync.SyncRepository
 internal fun ReferenceSettings(
     repo: SyncRepository,
     onBack: () -> Unit,
-    onSyncSettings: @Composable (() -> Unit) -> Unit,
+    onSyncSettings: @Composable (scanOnStart: Boolean, onBack: () -> Unit) -> Unit,
     onManage: (String) -> Unit,
     startInSync: Boolean = false,
 ) {
     var sync by remember { mutableStateOf(startInSync) }
+    var scanOnStart by remember { mutableStateOf(false) }
     var about by remember { mutableStateOf(false) }
     var tts by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -39,7 +40,10 @@ internal fun ReferenceSettings(
     var quickCreate by remember { mutableStateOf(preferences.getBoolean("quickCreate", true)) }
     if (sync) {
         // Opened straight from the menu's 立即同步: back leaves settings entirely.
-        onSyncSettings { if (startInSync) onBack() else sync = false }
+        onSyncSettings(scanOnStart) {
+            scanOnStart = false
+            if (startInSync) onBack() else sync = false
+        }
         return
     }
     if (tts) {
@@ -62,7 +66,13 @@ internal fun ReferenceSettings(
             RoundTool(Icons.Default.ArrowBack, "返回", onBack, filled = false)
             Text("设置", fontSize = 28.sp)
         }
-        SettingsGroup("同步", listOf("同步配置与状态" to { sync = true }))
+        SettingsGroup(
+            "同步",
+            listOf(
+                "同步配置与状态" to { scanOnStart = false; sync = true },
+                "扫码配置同步" to { scanOnStart = true; sync = true },
+            ),
+        )
         BackgroundPicker()
         SettingsGroup("朗读", listOf("语音朗读（通义千问 TTS）" to { tts = true }))
         SettingsGroup(

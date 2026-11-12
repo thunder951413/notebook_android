@@ -60,3 +60,18 @@ fun parseWebdavQrConfig(payload:String):WebdavSettings {
     val syncPassword=root.get("syncPassword")?.takeUnless{it.isJsonNull}?.asString.orEmpty()
     return WebdavSettings(baseUrl,username,appPassword,remotePath,syncPassword)
 }
+
+sealed interface ParsedQrConfig {
+    data class Webdav(val settings:WebdavSettings):ParsedQrConfig
+    data class Ssh(val settings:SshSettings):ParsedQrConfig
+}
+
+fun parseNotebookQrConfig(payload:String):ParsedQrConfig {
+    val root=runCatching{JsonParser.parseString(payload.trim()).asJsonObject}
+        .getOrElse{throw IllegalArgumentException("这不是有效的 Notebook 配置二维码")}
+    return when(root.get("type")?.takeUnless{it.isJsonNull}?.asString){
+        "notebook-webdav"->ParsedQrConfig.Webdav(parseWebdavQrConfig(payload))
+        "notebook-sync"->ParsedQrConfig.Ssh(parseSyncQrConfig(payload))
+        else->throw IllegalArgumentException("二维码类型不正确，请在电脑端「设置 → 同步与连接 → 生成配置二维码」重新生成")
+    }
+}

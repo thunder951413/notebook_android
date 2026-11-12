@@ -32,4 +32,18 @@ class WebdavQrConfigTest {
     @Test(expected=IllegalArgumentException::class) fun rejectsWebdavConfigWithoutAppPassword(){parseWebdavQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"https://dav.jianguoyun.com/dav/","username":"me","remotePath":"dir"}""")}
     @Test(expected=IllegalArgumentException::class) fun rejectsWebdavConfigWithBadUrl(){parseWebdavQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"ftp://x","username":"me","appPassword":"pw","remotePath":"dir"}""")}
     @Test(expected=IllegalArgumentException::class) fun rejectsWebdavConfigWithWrongType(){parseWebdavQrConfig("""{"type":"notebook-sync","version":1,"host":"x","username":"me"}""")}
+
+    @Test fun dispatchesUnifiedQrConfig(){
+        val webdav=parseNotebookQrConfig("""{"type":"notebook-webdav","version":1,"baseUrl":"https://dav.jianguoyun.com/dav/","username":"user@example.com","appPassword":"app-pw","remotePath":"notebook_backup","syncPassword":"sync-pw"}""")
+        assertTrue(webdav is ParsedQrConfig.Webdav)
+        assertEquals("user@example.com",(webdav as ParsedQrConfig.Webdav).settings.username)
+
+        val ssh=parseNotebookQrConfig("""{"type":"notebook-sync","version":1,"host":"192.168.1.8","port":2222,"username":"me","password":"pw","path":"/sync"}""")
+        assertTrue(ssh is ParsedQrConfig.Ssh)
+        assertEquals("192.168.1.8",(ssh as ParsedQrConfig.Ssh).settings.host)
+    }
+
+    @Test(expected=IllegalArgumentException::class) fun rejectsUnifiedUnknownQrType(){
+        parseNotebookQrConfig("""{"type":"unknown","version":1}""")
+    }
 }
