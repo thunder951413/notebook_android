@@ -196,14 +196,16 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
     val keyboardController=androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val drawer=rememberDrawerState(DrawerValue.Closed)
     var destination by rememberSaveable {
+        val startInTodos = context.getSharedPreferences("editor_preferences", 0).getBoolean("startInTodos", false)
         mutableStateOf(
-            if (all.any { it.isOpenTodo() && !repo.isEncrypted(it) }) Destination.Todos
+            if (startInTodos && all.any { it.isOpenTodo() && !repo.isEncrypted(it) }) Destination.Todos
             else Destination.All
         )
     }
     var folderId by rememberSaveable{mutableStateOf<String?>(null)}
     var tagId by rememberSaveable{mutableStateOf<String?>(null)};var manage by remember{mutableStateOf<String?>(null)}
-    var query by rememberSaveable{mutableStateOf("")};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by rememberSaveable{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
+    var query by rememberSaveable{mutableStateOf("")};var searchAllScope by rememberSaveable{mutableStateOf(false)};var matchingNoteIds by remember{mutableStateOf<Set<String>?>(null)}; var editing by remember{mutableStateOf<NoteEntity?>(null)};var startInEditMode by rememberSaveable{mutableStateOf(false)};var loadingNoteId by remember{mutableStateOf<String?>(null)}
+    var initialReaderSearch by remember{mutableStateOf<String?>(null)}
     val homeHolder=androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     var activeDocumentId by rememberSaveable{mutableStateOf<String?>(null)}
     LaunchedEffect(Unit){if(activeDocumentId!=null&&editing==null){repo.flushAll();val restored=repo.loadNote(activeDocumentId!!);if(restored!=null&&!repo.isEncrypted(restored))editing=restored else{activeDocumentId=null;folderId=null;startInEditMode=false}}}
@@ -219,6 +221,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         editing?.id?.let{editorSurfaces.remove(it)}
         focusManager.clearFocus();keyboardController?.hide()
         predictiveProgress=0f
+        initialReaderSearch=null
         if(documentStack.isEmpty()){editing=null;activeDocumentId=null;startInEditMode=false}
         else {val previous=documentStack.removeAt(documentStack.lastIndex);scope.launch{val note=repo.loadNote(previous.first);editing=note?.takeIf{!repo.isEncrypted(it)||encryptedUnlocked};startInEditMode=previous.second}}
     }
@@ -297,11 +300,12 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
         }
     }
     var searchResult by remember{mutableStateOf<io.github.notebook.android.sync.NoteSearchResult?>(null)}
-    LaunchedEffect(query){
-        if(query.isBlank()){searchResult=null;matchingNoteIds=null}
+    LaunchedEffect(query, encryptedUnlocked, all.size){
+        if(query.isBlank()){searchResult=null;matchingNoteIds=null;searchAllScope=false}
         else{
             delay(180)
-            val result=runCatching{repo.searchNotes(query,all,tags)}.getOrElse{status="搜索失败：${it.localizedMessage}";null}
+            val searchable=all.filter{it.deletedAt==null&&canExposeNote(it,encryptedUnlocked,repo::isEncrypted)}
+            val result=runCatching{repo.searchNotes(query,searchable,tags)}.getOrElse{status="搜索失败：${it.localizedMessage}";null}
             searchResult=result;matchingNoteIds=result?.ids?.toSet()?:emptySet()
             // Remember a query once the user pauses on it.
             if(result!=null&&result.ids.isNotEmpty()){delay(1_500);repo.rememberSearch(query)}
@@ -377,19 +381,23 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             repo = repo,
             startWithSync = syncNowRequest,
             onBack = { showSettings = false; syncNowRequest = false },
-            manage = { kind, back -> ManagementScreen(kind, repo, folders, tags, back) },
+            manage = { kind, back -> ManagementScreen(kind, repo, folders, tags, all, back) },
+            encryptedUnlocked = encryptedUnlocked,
         )
         return
     }
-    manage?.let{kind->ManagementScreen(kind,repo,folders,tags){manage=null};return}
+    manage?.let{kind->ManagementScreen(kind,repo,folders,tags,all){manage=null};return}
 
-    fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;scope.launch{drawer.close()}}
+    fun select(d:Destination,folder:String?=null,tag:String?=null){destination=d;folderId=folder;tagId=tag;searchAllScope=false;scope.launch{drawer.close()}}
     fun openEncrypted(folder:String){if(encryptedUnlocked){select(Destination.All,folder)}else{requestPrivateUnlock(folder);scope.launch{drawer.close()}}}
     var todayKey by remember{mutableStateOf(Calendar.getInstance().get(Calendar.DAY_OF_YEAR) to Calendar.getInstance().get(Calendar.YEAR))}
     LaunchedEffect(Unit){while(true){delay(60_000);val now=Calendar.getInstance();todayKey=now.get(Calendar.DAY_OF_YEAR) to now.get(Calendar.YEAR)}}
     val endOfToday=remember(todayKey){Calendar.getInstance().apply{set(Calendar.HOUR_OF_DAY,23);set(Calendar.MINUTE,59);set(Calendar.SECOND,59);set(Calendar.MILLISECOND,999)}.timeInMillis}
-    val visible=remember(all,folders,tagId,folderId,destination,encryptedUnlocked,endOfToday,query,matchingNoteIds){all.filter { n ->
+    val visible=remember(all,folders,tagId,folderId,destination,encryptedUnlocked,endOfToday,query,matchingNoteIds,searchAllScope){all.filter { n ->
         val encrypted=repo.isEncrypted(n);val selectedFolderType=folders.firstOrNull{it.id==folderId}?.type
+        if(query.isNotBlank()&&searchAllScope){
+            return@filter n.deletedAt==null&&(!encrypted||encryptedUnlocked)&&matchingNoteIds?.contains(n.id)==true
+        }
         val section=when {
             tagId!=null -> !encrypted&&n.deletedAt==null&&n.tagIds.split(',').contains(tagId)
             folderId!=null&&selectedFolderType=="encryptedFolder" -> encryptedUnlocked&&n.deletedAt==null&&repo.encryptedFolderId(n)==folderId
@@ -398,7 +406,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             destination==Destination.Important -> !encrypted&&n.itemType=="todo"&&n.deletedAt==null&&n.completedAt==null&&n.important
             destination==Destination.Todos -> !encrypted&&n.isOpenTodo()
             destination==Destination.Completed -> !encrypted&&n.itemType=="todo"&&n.deletedAt==null&&n.completedAt!=null
-            destination==Destination.All -> !encrypted&&(n.itemType=="note"||query.isNotBlank())&&n.deletedAt==null
+            destination==Destination.All -> (!encrypted||(encryptedUnlocked&&query.isNotBlank()))&&(n.itemType=="note"||query.isNotBlank())&&n.deletedAt==null
             destination==Destination.Unfiled -> !encrypted&&n.itemType=="note"&&n.deletedAt==null&&n.folderId==null
             destination==Destination.Conflicts -> !encrypted&&n.conflict
             else -> n.deletedAt!=null&&(!encrypted||encryptedUnlocked)
@@ -423,26 +431,53 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("文件夹",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("管理",Modifier.clickable{manage="folder"},style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)}
             val noteFolders=folders.filter{it.type=="noteFolder"}.sortedBy{it.sortOrder};noteFolders.take(if(showAllFolders)noteFolders.size else 6).forEach{f->DrawerRow(f.name,Icons.Default.Folder,folderId==f.id,all.count{it.itemType=="note"&&it.deletedAt==null&&it.folderId==f.id}){select(Destination.All,f.id)}}
             if(noteFolders.size>6)Text(if(showAllFolders)"收起文件夹" else "查看全部文件夹（${noteFolders.size}）",Modifier.fillMaxWidth().clickable{showAllFolders=!showAllFolders}.padding(start=28.dp,top=6.dp,bottom=8.dp),style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.primary)
-            Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("私密文件夹",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Icon(if(encryptedUnlocked)Icons.Default.LockOpen else Icons.Default.Lock,null,Modifier.size(16.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)}
+            Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp),verticalAlignment=Alignment.CenterVertically){
+                Text("私密文件夹",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+                if(encryptedUnlocked){
+                    Text("立即锁定",Modifier.clickable{lockPrivateContent();status="私密内容已锁定";scope.launch{drawer.close()}}.padding(end=6.dp),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)
+                }
+                Icon(if(encryptedUnlocked)Icons.Default.LockOpen else Icons.Default.Lock,null,Modifier.size(16.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             val encryptedFolders=folders.filter{it.type=="encryptedFolder"}.sortedBy{it.sortOrder};if(encryptedFolders.isNotEmpty()){if(!encryptedUnlocked)DrawerRow("点击解锁私密内容",Icons.Default.Lock,false){openEncrypted(encryptedFolders.first().id)}else encryptedFolders.forEach{f->DrawerRow(f.name,Icons.Default.Lock,folderId==f.id,all.count{it.deletedAt==null&&repo.encryptedFolderId(it)==f.id}){openEncrypted(f.id)}}}
             Row(Modifier.fillMaxWidth().padding(20.dp,18.dp,12.dp,6.dp)){Text("标签",Modifier.weight(1f),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant);Text("管理",Modifier.clickable{manage="tag"},style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.primary)}
             tags.take(if(showAllTags)tags.size else 6).forEach{tag->DrawerRow(tag.name,Icons.Default.Label,tagId==tag.id){select(Destination.All,tag=tag.id)}}
             if(tags.size>6)Text(if(showAllTags)"收起标签" else "查看全部标签（${tags.size}）",Modifier.fillMaxWidth().clickable{showAllTags=!showAllTags}.padding(start=28.dp,top=6.dp,bottom=8.dp),style=MaterialTheme.typography.labelMedium,color=MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(20.dp));HorizontalDivider();DrawerRow("AI 助手",Icons.Default.AutoAwesome,false){aiNoteId=null;showAi=true;scope.launch{drawer.close()}};DrawerRow("设置",Icons.Default.Settings,false){showSettings=true;scope.launch{drawer.close()}};Spacer(Modifier.height(12.dp))
     }
+    val openAiForNote:(NoteEntity)->Unit={note->aiNoteId=note.id;showAi=true}
     val mainContent:@Composable ()->Unit={
         homeHolder.SaveableStateProvider("home"){ReferenceHome(
             notes=visible,all=all,folders=folders,tags=tags,repo=repo,destination=destination,folderId=folderId,tagId=tagId,
             query=query,onQuery={query=it},searchOrder=searchResult?.ids,searchSnippets=searchResult?.snippets.orEmpty(),searchTerms=searchResult?.terms.orEmpty(),loadingId=loadingNoteId,status=status?.takeIf(String::isNotBlank),syncing=syncing,error=saveError,
-            onOpen={openNote(it)},onCreate={
+            onOpen={id->
+                initialReaderSearch=if(query.isNotBlank())(searchResult?.terms?.firstOrNull()?:query.trim().takeIf(String::isNotEmpty)) else null
+                openNote(id)
+            },
+            onCreate={
+                initialReaderSearch=null
                 val folder=folders.firstOrNull{it.id==folderId}
                 val draft=newItemDraft(destination,folder,folderId,tagId,endOfToday)
                 if(folder?.type=="encryptedFolder")repo.markEncrypted(draft.id,folder.id)
                 repo.markUnsaved(draft.id);cardOrigin=null;startInEditMode=true;editing=draft
-            },onSelect={d,f,t->select(d,f,t)},onNavigation={scope.launch{drawer.open()}},onSettings={showSettings=true},onSync={syncNowRequest=true;showSettings=true},
-            onImport={textImporter.launch(io.github.notebook.android.data.TextImport.MIME_TYPES)},onAiAssistant={aiNoteId=null;showAi=true},onStatus={status=it},onCardBounds={cardOrigin=it},
-            encryptedUnlocked=encryptedUnlocked,onCreateChild={id->cardOrigin=null;scope.launch{repo.loadNote(id)?.let{createChild(it)}}},onHierarchyOpen={cardOrigin=null;openNote(it)},
-            tabletEditor=if(isTablet){{editing?.let{note->key(note.id){EditorPane(note,repo,surfaceFor(note.id),initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,onOpenNote={openNote(it)},onNewChild={createChild(it)},onEditModeChanged={startInEditMode=it},onDone={closeDocument()})}}?:EmptyNotes("选择一篇笔记","在左侧打开笔记开始阅读")}}else null
+            },
+            onSelect={d,f,t->select(d,f,t)},
+            onNavigation={scope.launch{drawer.open()}},
+            onSettings={showSettings=true},
+            onSync={if(repo.hasRemoteConfiguration())runSync() else {syncNowRequest=true;showSettings=true}},
+            onOpenSyncSettings={syncNowRequest=true;showSettings=true},
+            onImport={textImporter.launch(io.github.notebook.android.data.TextImport.MIME_TYPES)},
+            onAiAssistant={aiNoteId=null;showAi=true},
+            onStatus={status=it},
+            onCardBounds={cardOrigin=it},
+            encryptedUnlocked=encryptedUnlocked,
+            onLockPrivate={lockPrivateContent();status="私密内容已锁定"},
+            onUnlockPrivate={folders.firstOrNull{it.type=="encryptedFolder"}?.let{requestPrivateUnlock(it.id)}},
+            searchAllScope=searchAllScope,
+            onSearchAllScope={searchAllScope=it},
+            globalMatchCount=matchingNoteIds?.size?:0,
+            onCreateChild={id->cardOrigin=null;scope.launch{repo.loadNote(id)?.let{createChild(it)}}},
+            onHierarchyOpen={cardOrigin=null;openNote(it)},
+            tabletEditor=if(isTablet){{editing?.let{note->key(note.id){EditorPane(note,repo,surfaceFor(note.id),initiallyEditing=startInEditMode,encryptedUnlocked=encryptedUnlocked,initialSearchQuery=initialReaderSearch,onOpenNote={initialReaderSearch=null;openNote(it)},onNewChild={createChild(it)},onEditModeChanged={startInEditMode=it},onOpenAiForNote=openAiForNote,onDone={closeDocument()})}}?:EmptyNotes("选择一篇笔记","在左侧打开笔记开始阅读")}}else null
         )}
     }
     if(isTablet)PermanentNavigationDrawer(drawerContent={PermanentDrawerSheet(Modifier.width(280.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
@@ -454,7 +489,7 @@ internal fun swipeDeleteTargetOffset(offsetPx:Float,actionWidthPx:Float,velocity
             Box(Modifier.fillMaxSize().then(if(editing!=null)Modifier.clearAndSetSemantics{}else Modifier)){
                 ModalNavigationDrawer(drawerState=drawer,drawerContent={ModalDrawerSheet(Modifier.width(300.dp),drawerContainerColor=MaterialTheme.colorScheme.surfaceVariant){Column(Modifier.fillMaxHeight().verticalScroll(drawerScroll).testTag("drawer-scroll"),content=drawerItems)}},content=mainContent)
             }
-            DocumentContainer(editing!=null,cardOrigin,predictiveProgress){displayed?.let{(note,edit)->key(note.id){Editor(note,repo,surfaceFor(note.id),edit,encryptedUnlocked,{openNote(it)},{closeDocument()},{predictiveProgress=it},{createChild(it)},{startInEditMode=it})}}}
+            DocumentContainer(editing!=null,cardOrigin,predictiveProgress){displayed?.let{(note,edit)->key(note.id){Editor(note,repo,surfaceFor(note.id),edit,encryptedUnlocked,initialReaderSearch,{initialReaderSearch=null;openNote(it)},{closeDocument()},{predictiveProgress=it},{createChild(it)},{startInEditMode=it},openAiForNote)}}}
         }
     }
 
@@ -493,10 +528,10 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     AlertDialog(onDismissRequest=onDismiss,title={Text("移动页面")},text={Column(Modifier.fillMaxWidth().heightIn(max=540.dp)){OutlinedTextField(query,{query=it},Modifier.fillMaxWidth(),singleLine=true,label={Text("搜索目标页面")});LazyColumn(Modifier.fillMaxWidth().weight(1f,false)){item{ListItem(headlineContent={Text("当前分区的顶层")},leadingContent={Icon(Icons.Default.Home,null)},modifier=Modifier.clickable{onMove(null)})};items(targets,key={it.id}){target->ListItem(headlineContent={Text(target.title.ifBlank{"无标题"})},supportingContent={Text(index.path(target.id,false),maxLines=2)},leadingContent={Icon(Icons.Default.Description,null)},modifier=Modifier.clickable{onMove(target.id)}.testTag("move-target-${target.id}"))}}}},confirmButton={},dismissButton={TextButton(onDismiss){Text("取消")}})
 }
 
-@Composable private fun Editor(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,initiallyEditing:Boolean,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,onBack:()->Unit,onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={}){EditorPane(original,repo,surface,showBack=true,initiallyEditing=initiallyEditing,encryptedUnlocked=encryptedUnlocked,onOpenNote=onOpenNote,onBackProgress=onBackProgress,onNewChild=onNewChild,onEditModeChanged=onEditModeChanged,onDone={onBack()})}
+@Composable private fun Editor(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,initiallyEditing:Boolean,encryptedUnlocked:Boolean,initialSearchQuery:String?=null,onOpenNote:(String)->Unit,onBack:()->Unit,onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={},onOpenAiForNote:(NoteEntity)->Unit={}){EditorPane(original,repo,surface,showBack=true,initiallyEditing=initiallyEditing,encryptedUnlocked=encryptedUnlocked,initialSearchQuery=initialSearchQuery,onOpenNote=onOpenNote,onBackProgress=onBackProgress,onNewChild=onNewChild,onEditModeChanged=onEditModeChanged,onOpenAiForNote=onOpenAiForNote,onDone={onBack()})}
 
 @OptIn(ExperimentalMaterial3Api::class,ExperimentalLayoutApi::class)
-@Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,showBack:Boolean=false,initiallyEditing:Boolean=false,encryptedUnlocked:Boolean=false,onOpenNote:(String)->Unit={},onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={},onDone:(NoteEntity)->Unit){
+@Composable private fun EditorPane(original:NoteEntity,repo:SyncRepository,surface:EditorSurfaceState,showBack:Boolean=false,initiallyEditing:Boolean=false,encryptedUnlocked:Boolean=false,initialSearchQuery:String?=null,onOpenNote:(String)->Unit={},onBackProgress:(Float)->Unit={},onNewChild:(NoteEntity)->Unit={},onEditModeChanged:(Boolean)->Unit={},onOpenAiForNote:(NoteEntity)->Unit={},onDone:(NoteEntity)->Unit){
     var n by remember(original.id,original.version){mutableStateOf(original)}
     val latestDraft=remember(original.id,original.version){mutableStateOf(original)}
     var caretStart by surface.caretStart
@@ -512,7 +547,9 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     var pageMove by remember{mutableStateOf(false)}
     var editorOutline by remember{mutableStateOf(false)}
     var permanentConfirm by remember{mutableStateOf(false)}
+    var privateAiNotice by remember{mutableStateOf(false)}
     var editorMessage by remember{mutableStateOf<String?>(null)}
+    var editorNotice by remember{mutableStateOf<String?>(null)}
     var readerAction by remember{mutableStateOf<String?>(null)}
     var showHierarchy by rememberSaveable{mutableStateOf(false)}
     // Outline headings only; parsed off the main thread after typing pauses.
@@ -622,7 +659,19 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
     Column(Modifier.fillMaxSize().background(notePageBackground()).statusBarsPadding().navigationBarsPadding()){
         saveError?.let{Text(it,Modifier.padding(16.dp).clickable{repo.clearSaveError()},color=MaterialTheme.colorScheme.error)}
         editorMessage?.let{Text(it,Modifier.padding(16.dp).clickable{editorMessage=null},color=MaterialTheme.colorScheme.error)}
+        editorNotice?.let{Text(it,Modifier.padding(horizontal=16.dp,vertical=8.dp).clickable{editorNotice=null},color=MaterialTheme.colorScheme.primary,fontSize=13.sp)}
+        LaunchedEffect(editorNotice){if(editorNotice!=null){delay(2_200);editorNotice=null}}
         if(n.conflict){Surface(color=MaterialTheme.colorScheme.errorContainer){Column(Modifier.padding(12.dp)){Text("此项目在本机和服务器上都被修改");Row{TextButton({scope.launch{repo.keepLocal(n.id);repo.loadNote(n.id)?.let{updateNote(it)}}}){Text("保留本机")};TextButton({scope.launch{repo.acceptRemote(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it;bodyValue=TextFieldValue(it.body)}}}){Text("采用服务器版本")}}}}}
+        val triggerNoteAi:()->Unit={
+            scope.launch{
+                repo.flushDraft(latestDraft.value).join()
+                if(repo.isEncrypted(latestDraft.value)){
+                    privateAiNotice=true
+                }else{
+                    onOpenAiForNote(latestDraft.value)
+                }
+            }
+        }
         Row(Modifier.fillMaxWidth().padding(start=12.dp,end=12.dp,top=0.dp,bottom=4.dp),verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
             if(showBack)RoundTool(Icons.Default.ArrowBack,"返回",{if(editMode)finishEditing()else flushLatestAndFinish()},enabled=!leaving)
             if(editMode){
@@ -639,15 +688,18 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 if(n.deletedAt!=null)Text("最近删除",Modifier.weight(1f).padding(start=8.dp),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)else Spacer(Modifier.weight(1f))
                 // Editing sits with the other tools instead of a large bar over the text.
                 if(n.deletedAt==null&&n.itemType!="todo")TextButton({editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.testTag("edit-mode"),shape=androidx.compose.foundation.shape.CircleShape,colors=ButtonDefaults.textButtonColors(containerColor=MaterialTheme.colorScheme.surface,contentColor=MaterialTheme.colorScheme.onSurface),contentPadding=PaddingValues(horizontal=14.dp)){Icon(Icons.Default.Edit,null,Modifier.size(18.dp));Spacer(Modifier.width(6.dp));Text("编辑")}
+                if(n.deletedAt==null&&n.itemType!="todo")RoundTool(Icons.Default.AutoAwesome,"AI 解读",triggerNoteAi,modifier=Modifier.testTag("note-ai"))
                 if(n.itemType!="todo")RoundTool(Icons.Default.Toc,"目录",{readerAction="outline"})
                 RoundTool(Icons.Default.IosShare,"分享与导出",{exportSheet=true})
                 Box{RoundTool(Icons.Default.MoreVert,"笔记更多",{moreMenu=true});DropdownMenu(moreMenu,{moreMenu=false}){
                     if(n.itemType!="todo"){
+                        DropdownMenuItem({Text("AI 解读与提问")},{moreMenu=false;triggerNoteAi()},leadingIcon={Icon(Icons.Default.AutoAwesome,null)})
                         DropdownMenuItem({Text("朗读全文")},{moreMenu=false;readerAction="speak"},leadingIcon={Icon(Icons.Default.RecordVoiceOver,null)})
                         DropdownMenuItem({Text("文档内查找")},{moreMenu=false;readerAction="find"})
                         DropdownMenuItem({Text("反向链接")},{moreMenu=false;readerAction="backlinks"},leadingIcon={Icon(Icons.Default.Link,null)})
                         DropdownMenuItem({Text("阅读设置")},{moreMenu=false;readerAction="settings"},leadingIcon={Icon(Icons.Default.TextFields,null)})
                     }
+                    DropdownMenuItem({Text("保存历史快照")},{moreMenu=false;scope.launch{repo.flushDraft(latestDraft.value).join();runCatching{repo.createManualSnapshot(n.id)}.onSuccess{editorNotice="已创建当前版本历史快照"}.onFailure{editorMessage=it.localizedMessage}}},leadingIcon={Icon(Icons.Default.BookmarkAdded,null)})
                     DropdownMenuItem({Text("版本历史")},{moreMenu=false;scope.launch{repo.flushDraft(n).join();historyRevisions=repo.revisions(n.id);historyDialog=true}},leadingIcon={Icon(Icons.Default.History,"版本历史")})
                     if(n.deletedAt==null){
                         if(!repo.isEncrypted(n))DropdownMenuItem({Text("标签")},{moreMenu=false;tagsSheet=true})
@@ -671,12 +723,13 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                 onRequestNotifications=::requestNotifications,
                 onOpenNotificationSettings={runCatching{context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE,context.packageName))}},
                 modifier=Modifier.fillMaxWidth().weight(1f),
-            )else if(emptyParent!=null)ChildNotesOverview(n.title,n.icon,emptyParent.first,emptyParent.second,onOpenNote,{editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp))else ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to})
+            )else if(emptyParent!=null)ChildNotesOverview(n.title,n.icon,emptyParent.first,emptyParent.second,onOpenNote,{editMode=true;bodyValue=TextFieldValue(n.body,TextRange(n.body.length))},Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp))else ReadingPane(n,repo,steps,attachments,encryptedUnlocked,onOpenNote,Modifier.fillMaxWidth().weight(1f).padding(horizontal=24.dp).testTag("markdown-view"),onUpdateBody={changeBody(TextFieldValue(it))},readerAction=readerAction,onActionConsumed={readerAction=null},onTags={tagsSheet=true},onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},initialSearchQuery=initialSearchQuery)
             if(n.deletedAt!=null)FloatingPill(Modifier.align(androidx.compose.ui.Alignment.CenterHorizontally).padding(horizontal=24.dp,vertical=16.dp)){
                 run {TextButton({scope.launch{runCatching{repo.restore(n.id);repo.loadNote(n.id)?.let{latestDraft.value=it;n=it}}.onFailure{editorMessage=it.localizedMessage}}}){Text("恢复")};TextButton({permanentConfirm=true}){Text("彻底删除",color=MaterialTheme.colorScheme.error)}}
             }
         }else Box(Modifier.weight(1f)){
-            ReferenceEditorBody(n.title,::changeTitle,bodyValue,{changeBody(it,true)},{referencePicker=true},{picker.launch("image/*")},{picker.launch("*/*")},{if(recording)stopRecording()else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)},recording,surface=surface,onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},onCommand={changeBody(it,false)},assets=attachments,timestamp=java.text.SimpleDateFormat("yyyy/M/d HH:mm",Locale.CHINA).format(Date(n.createdAt)),afterTitle={if(!repo.isEncrypted(n))ReferenceMetaChip(if(n.tagIds.isBlank())"添加标签" else "标签",Icons.Default.Add){tagsSheet=true}},titles=linkTitles,onCaret={at->bodyValue=bodyValue.copy(selection=TextRange(at.coerceIn(0,bodyValue.text.length)),composition=null)}){
+            val bottomHistoryTick=historyTick
+            ReferenceEditorBody(n.title,::changeTitle,bodyValue,{changeBody(it,true)},{referencePicker=true},{picker.launch("image/*")},{picker.launch("*/*")},{if(recording)stopRecording()else microphonePermission.launch(Manifest.permission.RECORD_AUDIO)},recording,surface=surface,onTable={from,to->surface.tableStart.intValue=from;surface.tableEnd.intValue=to},onCommand={changeBody(it,false)},assets=attachments,timestamp=java.text.SimpleDateFormat("yyyy/M/d HH:mm",Locale.CHINA).format(Date(n.createdAt)),afterTitle={if(!repo.isEncrypted(n))ReferenceMetaChip(if(n.tagIds.isBlank())"添加标签" else "标签",Icons.Default.Add){tagsSheet=true}},titles=linkTitles,onCaret={at->bodyValue=bodyValue.copy(selection=TextRange(at.coerceIn(0,bodyValue.text.length)),composition=null)},canUndo=undoHistory.canUndo&&bottomHistoryTick>=0,canRedo=undoHistory.canRedo&&bottomHistoryTick>=0,onUndo={restoreEditor(undoHistory.undo(EditorSnapshot(n.title,bodyValue)))},onRedo={restoreEditor(undoHistory.redo(EditorSnapshot(n.title,bodyValue)))}){
                 attachments.filter{it.id !in NotebookAssetSyntax.images(n.body).map{image->image.assetId}}.forEach{AttachmentView(it)}
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                     ReferenceMetaChip(folders.firstOrNull{it.id==n.folderId}?.name?:n.folderName,Icons.Default.Folder){folderMenu=true}
@@ -720,9 +773,25 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
             referencePicker=false
         }
     )
+    if(privateAiNotice)AlertDialog(
+        onDismissRequest={privateAiNotice=false},
+        icon={Icon(Icons.Default.Security,null)},
+        title={Text("私密内容保护")},
+        text={Text("为保障数据安全，私密文件夹中的笔记不会发送给外部 AI 服务（${repo.aiSettings().provider.label}）。")},
+        confirmButton={TextButton({privateAiNotice=false}){Text("知道了")}},
+    )
     if(historyDialog)RevisionHistoryDialog(
         revisions=historyRevisions,
         onDismiss={historyDialog=false},
+        onCreateSnapshot={
+            scope.launch{
+                repo.flushDraft(latestDraft.value).join()
+                runCatching{repo.createManualSnapshot(n.id)}.onSuccess{
+                    historyRevisions=repo.revisions(n.id)
+                    editorNotice="已保存当前内容快照"
+                }.onFailure{editorMessage=it.localizedMessage}
+            }
+        },
         onRestore={revision->
             scope.launch{
                 runCatching{repo.restoreRevision(n.id,revision.id)}.onSuccess{restored->
@@ -731,6 +800,7 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
                     bodyValue=TextFieldValue(restored.body)
                     editMode=false
                     historyDialog=false
+                    editorNotice="已恢复历史版本（恢复前内容已自动存为快照）"
                 }
             }
         }
@@ -740,23 +810,35 @@ internal fun flattenNoteTree(notes:List<NoteSummary>,expanded:Map<String,Boolean
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun RevisionHistoryDialog(revisions:List<NoteRevisionSummary>,onDismiss:()->Unit,onRestore:(NoteRevisionSummary)->Unit){
+@Composable private fun RevisionHistoryDialog(revisions:List<NoteRevisionSummary>,onDismiss:()->Unit,onCreateSnapshot:()->Unit={},onRestore:(NoteRevisionSummary)->Unit){
     var selected by remember(revisions){mutableStateOf<NoteRevisionSummary?>(null)}
     var confirmRestore by remember{mutableStateOf(false)}
     ModalBottomSheet(onDismissRequest=onDismiss){
         Column(Modifier.fillMaxWidth().fillMaxHeight(.9f).padding(horizontal=20.dp)){
-            Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){Text("版本历史",style=MaterialTheme.typography.titleLarge);Spacer(Modifier.weight(1f));selected?.let{Button({confirmRestore=true}){Text("恢复此版本")}}}
+            Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically){
+                Text("版本历史",style=MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.weight(1f))
+                if(selected==null){
+                    OutlinedButton(onCreateSnapshot){
+                        Icon(Icons.Default.BookmarkAdded,null,Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("创建快照")
+                    }
+                }else{
+                    Button({confirmRestore=true}){Text("恢复此版本")}
+                }
+            }
             when {
                 selected==null -> {
                     val items=revisions
-                    if(items.isEmpty())Box(Modifier.fillMaxSize(),contentAlignment=androidx.compose.ui.Alignment.Center){Text("还没有可恢复的历史版本",color=MaterialTheme.colorScheme.onSurfaceVariant)}
-                    else LazyColumn(Modifier.fillMaxSize()){items(items,key={it.id}){revision->ListItem(headlineContent={Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM,DateFormat.SHORT).format(Date(revision.createdAt)))},supportingContent={Text(when(revision.reason){"manual"->"手动快照";"import"->"同步或导入";else->"自动保存"})},leadingContent={Icon(Icons.Default.Restore,null)},modifier=Modifier.testTag("history-revision-${revision.id}").clickable{selected=revision})}}
+                    if(items.isEmpty())Box(Modifier.fillMaxSize(),contentAlignment=androidx.compose.ui.Alignment.Center){Text("还没有可恢复的历史版本，可点击右上角创建快照",color=MaterialTheme.colorScheme.onSurfaceVariant)}
+                    else LazyColumn(Modifier.fillMaxSize()){items(items,key={it.id}){revision->ListItem(headlineContent={Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM,DateFormat.SHORT).format(Date(revision.createdAt)))},supportingContent={Text(when(revision.reason){"manual"->"手动快照 / 恢复前备份";"import"->"同步或导入";else->"自动保存"})},leadingContent={Icon(Icons.Default.Restore,null)},modifier=Modifier.testTag("history-revision-${revision.id}").clickable{selected=revision})}}
                 }
                 else -> Column(Modifier.fillMaxSize()){TextButton({selected=null}){Icon(Icons.Default.ArrowBack,null);Text("返回版本列表")};MarkdownView(selected!!.markdown,Modifier.fillMaxWidth().weight(1f).testTag("history-preview").verticalScroll(androidx.compose.foundation.rememberScrollState()))}
             }
         }
     }
-    if(confirmRestore)AlertDialog(onDismissRequest={confirmRestore=false},title={Text("恢复这个版本？")},text={Text("当前正文会先在下一次同步时进入历史，然后以所选版本创建新的当前版本。")},confirmButton={Button({confirmRestore=false;selected?.let(onRestore)}){Text("恢复")}},dismissButton={TextButton({confirmRestore=false}){Text("取消")}})
+    if(confirmRestore)AlertDialog(onDismissRequest={confirmRestore=false},title={Text("恢复这个版本？")},text={Text("恢复前会自动将当前正文保存为一条快照，你可以随时撤销恢复。")},confirmButton={Button({confirmRestore=false;selected?.let(onRestore)}){Text("恢复")}},dismissButton={TextButton({confirmRestore=false}){Text("取消")}})
 }
 
 @Composable private fun ReferencePickerDialog(notes:List<NoteSummary>,onDismiss:()->Unit,onSelect:(NoteSummary,Boolean)->Unit){
@@ -844,7 +926,7 @@ private object ReaderDocumentCache {
 private sealed interface ReaderDocumentState { data object Loading:ReaderDocumentState;data class Ready(val document:ParsedMarkdownDocument,val spans:Map<String,android.text.Spanned> = emptyMap()):ReaderDocumentState;data class Failed(val message:String):ReaderDocumentState }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,modifier:Modifier=Modifier,onUpdateBody:(String)->Unit={},readerAction:String?=null,onActionConsumed:()->Unit={},onTags:()->Unit={},onTable:(Int,Int)->Unit={_,_->}){
+@Composable private fun ReadingPane(note:NoteEntity,repo:SyncRepository,steps:List<TodoStepEntity>,attachments:List<AssetEntity>,encryptedUnlocked:Boolean,onOpenNote:(String)->Unit,modifier:Modifier=Modifier,onUpdateBody:(String)->Unit={},readerAction:String?=null,onActionConsumed:()->Unit={},onTags:()->Unit={},onTable:(Int,Int)->Unit={_,_->},initialSearchQuery:String?=null){
     val allNotes by repo.notes.collectAsState(initial=emptyList())
     val noteTags by repo.tags.collectAsState(initial=emptyList())
     val readerFolders by repo.folders.collectAsState(initial=emptyList())
@@ -894,7 +976,7 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     if(ready==null){Box(modifier,contentAlignment=androidx.compose.ui.Alignment.Center){when(val current=documentState){ReaderDocumentState.Loading->Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){CircularProgressIndicator();Spacer(Modifier.height(10.dp));Text("正在准备长文阅读视图…",color=MaterialTheme.colorScheme.onSurfaceVariant)};is ReaderDocumentState.Failed->Column(horizontalAlignment=androidx.compose.ui.Alignment.CenterHorizontally){Icon(Icons.Default.ErrorOutline,null,tint=MaterialTheme.colorScheme.error);Text(current.message,color=MaterialTheme.colorScheme.error)};is ReaderDocumentState.Ready->Unit}};return}
     val showBody=LocalDocumentSettled.current
     val document=ready.document;val blocks=if(showBody)document.blocks else emptyList();val hasMetadata=note.folderName.isNotBlank()||note.tagIds.isNotBlank();val bodyStart=if(hasMetadata)3 else 2;val state=remember(note.id){val anchor=ReaderDocumentCache.takeStart(note.id);androidx.compose.foundation.lazy.LazyListState(anchor?.let{a->bodyStart+document.blocks.indexOfLast{it.startUtf16<=a}.coerceAtLeast(0)}?:0)};val scope=rememberCoroutineScope();val views=remember(note.id,note.body){mutableMapOf<Int,TextView>()}
-    val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingBacklinks by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id){mutableStateOf(false)};var searchQuery by remember(note.id){mutableStateOf("")};var searchIndex by remember(note.id){mutableIntStateOf(0)}
+    val (readerStyle,updateReaderStyle)=rememberReaderStyle();var showingOutline by remember(note.id){mutableStateOf(false)};var showingBacklinks by remember(note.id){mutableStateOf(false)};var showingSettings by remember{mutableStateOf(false)};var showingSearch by remember(note.id,initialSearchQuery){mutableStateOf(!initialSearchQuery.isNullOrBlank())};var searchQuery by remember(note.id,initialSearchQuery){mutableStateOf(initialSearchQuery.orEmpty())};var searchIndex by remember(note.id,initialSearchQuery){mutableIntStateOf(0)}
     val searchMatches=remember(note.body,searchQuery){if(searchQuery.isBlank())emptyList()else buildList{var start=0;while(size<10_000){val found=note.body.indexOf(searchQuery,start,ignoreCase=true);if(found<0)break;add(found);start=found+searchQuery.length.coerceAtLeast(1)}}}
     val speechContext=LocalContext.current
     var pendingSpeech by remember{mutableStateOf<(()->Unit)?>(null)}
@@ -949,6 +1031,13 @@ private sealed interface ReaderDocumentState { data object Loading:ReaderDocumen
     }
     LaunchedEffect(note.id,note.body,showBody){
         if(!showBody)return@LaunchedEffect
+        if(!initialSearchQuery.isNullOrBlank()&&searchMatches.isNotEmpty()){
+            val offset=searchMatches.first()
+            val blockIndex=blocks.indexOfLast{it.startUtf16<=offset}.coerceAtLeast(0)
+            withContext(Dispatchers.Main.immediate){state.scrollToItem(bodyStart+blockIndex)}
+            restored=true
+            return@LaunchedEffect
+        }
         val position=repo.readingPosition(note.id);if(position!=null&&note.body.isNotEmpty()){
             val anchor=position.anchorUtf16Offset.coerceIn(0,note.body.length);val blockIndex=blocks.indexOfLast{it.startUtf16<=anchor}.coerceAtLeast(0);val itemIndex=bodyStart+blockIndex;withContext(Dispatchers.Main.immediate){state.scrollToItem(itemIndex)}
             for(attempt in 0 until 30){val view=views[blockIndex];val layout=view?.layout;if(layout!=null&&view.text.isNotEmpty()){val block=blocks[blockIndex];val sourceLocal=(anchor-block.startUtf16).coerceIn(0,block.text.length);val rendered=(sourceLocal.toDouble()/block.text.length.coerceAtLeast(1)*view.text.length).roundToInt().coerceIn(0,maxOf(0,view.text.length-1));val line=layout.getLineForOffset(rendered);val viewport=state.layoutInfo.viewportSize.height.coerceAtLeast(1);val desired=(layout.getLineTop(line)-position.viewportOffsetFraction*viewport).roundToInt().coerceAtLeast(0);withContext(Dispatchers.Main.immediate){state.scrollToItem(itemIndex,desired)};break};delay(16)}
@@ -1131,7 +1220,72 @@ internal fun imageAspectRatio(asset:AssetEntity,file:java.io.File):Float?{
 private fun formatBytes(bytes:Long)=when{bytes<1024->"$bytes B";bytes<1024*1024->String.format(Locale.getDefault(),"%.1f KB",bytes/1024.0);else->String.format(Locale.getDefault(),"%.1f MB",bytes/(1024.0*1024.0))}
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,onBack:()->Unit){BackHandler(onBack=onBack);val scope=rememberCoroutineScope();var name by remember{mutableStateOf("")};var pendingDelete by remember{mutableStateOf<Pair<String,String>?>(null)};val isTag=kind=="tag";val folderType=if(kind=="todoList")"todoList" else "noteFolder";val title=when(kind){"todoList"->"管理待办文件夹";"tag"->"管理标签";else->"管理笔记文件夹"};Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->Column(Modifier.padding(p).padding(16.dp)){Row{OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新待办文件夹名称" else "新文件夹名称")});IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}};Spacer(Modifier.height(12.dp));LazyColumn{if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}else items(tags,key={it.id}){item->ListItem(headlineContent={Text(item.name)},leadingContent={Icon(Icons.Default.Label,null)},trailingContent={IconButton({pendingDelete=item.id to item.name},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}})}}}};pendingDelete?.let{(id,label)->AlertDialog(onDismissRequest={pendingDelete=null},icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},title={Text("删除 $label？")},text={Text("此操作会影响使用该${if(isTag)"标签" else "文件夹"}的内容。")},confirmButton={Button({scope.launch{if(isTag)repo.deleteTag(id)else repo.deleteFolder(id)};pendingDelete=null},colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)){Text("删除")}},dismissButton={TextButton({pendingDelete=null}){Text("取消")}})}}
+@Composable private fun ManagementScreen(kind:String,repo:SyncRepository,folders:List<FolderEntity>,tags:List<TagEntity>,allNotes:List<NoteSummary> = emptyList(),onBack:()->Unit){
+    BackHandler(onBack=onBack)
+    val scope=rememberCoroutineScope()
+    var name by remember{mutableStateOf("")}
+    var pendingDelete by remember{mutableStateOf<Triple<String,String,Int>?>(null)}
+    val isTag=kind=="tag"
+    val folderType=if(kind=="todoList")"todoList" else "noteFolder"
+    val title=when(kind){"todoList"->"管理待办文件夹";"tag"->"管理标签";else->"管理笔记文件夹"}
+    Scaffold(topBar={TopAppBar(title={Text(title)},navigationIcon={IconButton(onBack,Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.ArrowBack,"返回")}})}){p->
+        Column(Modifier.padding(p).padding(16.dp)){
+            Row{
+                OutlinedTextField(name,{name=it},Modifier.weight(1f),singleLine=true,label={Text(if(isTag)"新标签名称" else if(folderType=="todoList")"新待办文件夹名称" else "新文件夹名称")})
+                IconButton({if(name.isNotBlank()){scope.launch{if(isTag)repo.saveTag(name.trim())else repo.saveFolder(name.trim(),folderType)};name=""}},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Add,"添加")}
+            }
+            Spacer(Modifier.height(12.dp))
+            LazyColumn{
+                if(!isTag)items(folders.filter{it.type==folderType},key={it.id}){item->
+                    val count=allNotes.count{it.deletedAt==null&&it.folderId==item.id}
+                    ListItem(
+                        headlineContent={Text(item.name)},
+                        supportingContent={Text(if(count==0)"空文件夹" else "包含 $count 条内容")},
+                        leadingContent={Icon(if(folderType=="todoList")Icons.Default.ListAlt else Icons.Default.Folder,null)},
+                        trailingContent={IconButton({pendingDelete=Triple(item.id,item.name,count)},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}}
+                    )
+                }else items(tags,key={it.id}){item->
+                    val count=allNotes.count{it.deletedAt==null&&it.tagIds.split(',').contains(item.id)}
+                    ListItem(
+                        headlineContent={Text(item.name)},
+                        supportingContent={Text(if(count==0)"未使用" else "关联 $count 篇笔记")},
+                        leadingContent={Icon(Icons.Default.Label,null)},
+                        trailingContent={IconButton({pendingDelete=Triple(item.id,item.name,count)},Modifier.minimumInteractiveComponentSize()){Icon(Icons.Default.Delete,"删除 ${item.name}")}}
+                    )
+                }
+            }
+        }
+    }
+    pendingDelete?.let{(id,label,count)->
+        AlertDialog(
+            onDismissRequest={pendingDelete=null},
+            icon={Icon(Icons.Default.Warning,null,tint=MaterialTheme.colorScheme.error)},
+            title={Text("删除「$label」？")},
+            text={
+                Text(
+                    if(isTag){
+                        if(count>0)"该标签将从 $count 篇笔记上移除，笔记正文和归属不会丢失。" else "该标签当前未被任何笔记使用，可以安全删除。"
+                    }else{
+                        if(count>0)"删除后其中 $count 条内容不会丢失，将自动移至「未分类」。" else "该文件夹当前为空，可以安全删除。"
+                    }
+                )
+            },
+            confirmButton={
+                Button(
+                    {
+                        scope.launch{
+                            if(isTag)repo.safeDeleteTag(id)
+                            else repo.safeDeleteFolder(id,deleteItems=false)
+                        }
+                        pendingDelete=null
+                    },
+                    colors=ButtonDefaults.buttonColors(containerColor=MaterialTheme.colorScheme.error)
+                ){Text(if(count>0&&!isTag)"删除并保留内容" else "删除")}
+            },
+            dismissButton={TextButton({pendingDelete=null}){Text("取消")}}
+        )
+    }
+}
 
 @Composable private fun UpdateAction(state:AppUpdateViewModel){
     if(state.release==null)return

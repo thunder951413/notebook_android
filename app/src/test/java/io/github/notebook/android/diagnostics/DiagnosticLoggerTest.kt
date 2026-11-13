@@ -100,4 +100,23 @@ class DiagnosticLoggerTest {
             assertTrue(text.contains("\"event\":\"app.start\""))
         }
     }
+
+    @Test fun readRecentReturnsNewestEntriesFirstWithChineseLabels(){
+        val directory=Files.createTempDirectory("diagnostic-read-recent").toFile()
+        var clock=1_700_000_000_000L
+        val store=DiagnosticStore(directory,"session","1.2.3","7",now={clock++})
+        store.append(DiagnosticLevel.INFO,DiagnosticEvent.SYNC_START)
+        store.append(DiagnosticLevel.ERROR,DiagnosticEvent.SYNC_FAILURE,resourceId="secret-note",error=IllegalStateException("token=abc"))
+
+        val entries=store.readRecent(limit=10)
+        assertEquals(2,entries.size)
+        assertEquals("sync.failure",entries[0].event)
+        assertEquals("同步失败 / 延后",diagnosticEventLabel(entries[0].event))
+        assertEquals("sync.start",entries[1].event)
+        assertEquals("java.lang.IllegalStateException",entries[0].errorClass)
+        assertTrue(entries[0].resource.orEmpty().startsWith("r:"))
+        assertFalse(entries[0].resource.orEmpty().contains("secret-note"))
+    }
 }
+
+

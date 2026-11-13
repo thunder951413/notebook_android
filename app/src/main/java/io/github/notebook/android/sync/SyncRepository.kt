@@ -369,9 +369,9 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     suspend fun revisions(noteId:String):List<NoteRevisionSummary> = withContext(Dispatchers.IO){
         val remote=dao.remoteRevisions(noteId).map{NoteRevisionSummary(it.id,it.createdAt,it.reason,it.markdown,it.pageIcon)}
         val raw=loadSnapshot(noteId)?:return@withContext remote
-        val envelope=runCatching{JsonParser.parseString(raw).asJsonObject}.getOrNull()?:return@withContext emptyList()
+        val envelope=runCatching{JsonParser.parseString(raw).asJsonObject}.getOrNull()?:return@withContext remote
         if(envelope["schemaVersion"]?.asInt==3){
-            val objects=envelope["contentObjects"]?.takeIf{it.isJsonObject}?.asJsonObject?:return@withContext emptyList()
+            val objects=envelope["contentObjects"]?.takeIf{it.isJsonObject}?.asJsonObject?:return@withContext remote
             envelope["history"]?.takeIf{it.isJsonArray}?.asJsonArray?.mapNotNull{item->
                 val entry=item.asJsonObject
                 val hash=entry["contentHash"]?.asString?:return@mapNotNull null
@@ -396,7 +396,190 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
     suspend fun restoreRevision(noteId:String,revisionId:String):NoteEntity{
         val revision=revisions(noteId).firstOrNull{it.id==revisionId}?:error("历史版本不存在")
         val current=loadEditable(noteId)?:error("笔记不存在")
+        // Snapshot the current body before overwriting it so restoring a revision is itself reversible!
+        if(current.body!=revision.markdown){
+            dao.putRemoteRevision(RemoteRevisionEntity(UUID.randomUUID().toString(),noteId,System.currentTimeMillis(),"manual",current.body,current.icon))
+        }
         return save(current.copy(body=revision.markdown,icon=revision.pageIcon))
+    }
+    /** Explicitly checkpoints the current note body into durable local revision history. */
+    suspend fun createManualSnapshot(noteId:String):NoteRevisionSummary=withContext(Dispatchers.IO){
+        flushAll()
+        val current=loadEditable(noteId)?:error("笔记不存在")
+        val now=System.currentTimeMillis()
+        val revision=RemoteRevisionEntity(UUID.randomUUID().toString(),noteId,now,"manual",current.body,current.icon)
+        dao.putRemoteRevision(revision)
+        NoteRevisionSummary(revision.id,revision.createdAt,revision.reason,revision.markdown,revision.pageIcon)
+    }
+    fun lastLocalBackupAt():Long?=prefs.getLong("lastLocalBackupAt",0L).takeIf{it>0}
+    suspend fun dataSafetySummary():DataSafetySummary=withContext(Dispatchers.IO){
+        val summaries=dao.observeNoteSummaries().first()
+        val allAssets=dao.observeAllAssets().first()
+        val present=allAssets.count{it.localPath?.let(::File)?.isFile==true}
+        DataSafetySummary(
+            activeNotes=summaries.count{it.deletedAt==null&&it.itemType!="todo"&&!isEncrypted(it)},
+            activeTodos=summaries.count{it.deletedAt==null&&it.itemType=="todo"&&!isEncrypted(it)},
+            trashedItems=summaries.count{it.deletedAt!=null},
+            privateItems=summaries.count{it.deletedAt==null&&isEncrypted(it)},
+            localAttachments=present,
+            missingAttachments=(allAssets.size-present).coerceAtLeast(0),
+            pendingDrafts=pendingDrafts.size+dao.draftNoteIds().size,
+            pendingUploads=pendingUploadCount(),
+            conflictCount=summaries.count{it.deletedAt==null&&(it.conflict||it.title.contains("（冲突副本"))},
+            lastLocalBackupAt=lastLocalBackupAt(),
+        )
+    }
+    /**
+     * Flushes all in-memory drafts and writes a portable, SHA-256 verified `.zip` archive.
+     * Private notes/folders are excluded unless [encryptedUnlocked] AND [includePrivate] are both true.
+     */
+    suspend fun exportLocalBackup(output:java.io.OutputStream,includePrivate:Boolean=false,encryptedUnlocked:Boolean=false):BackupExportSummary=withContext(Dispatchers.IO){
+        flushAll()
+        val allowPrivate=includePrivate&&encryptedUnlocked
+        val folders=dao.allFolders().filter{it.type!="encryptedFolder"||allowPrivate}
+        val tags=dao.observeTags().first()
+        val allHeaders=dao.allNotes()
+        val exportedNotes=mutableListOf<BackupNoteRecord>()
+        val exportedSteps=mutableListOf<TodoStepEntity>()
+        val exportedRevisions=mutableListOf<RemoteRevisionEntity>()
+        val exportedAssets=mutableListOf<Pair<AssetEntity,File?>>()
+        for(header in allHeaders){
+            val privateNote=isEncrypted(header)
+            if(privateNote&&!allowPrivate)continue
+            val full=loadEditable(header.id)?:continue
+            exportedNotes+=BackupNoteRecord(full,if(privateNote)encryptedFolderId(full) else null)
+            exportedSteps+=dao.steps(full.id)
+            exportedRevisions+=dao.remoteRevisions(full.id)
+            dao.assets(full.id).forEach{asset->exportedAssets+=asset to asset.localPath?.let(::File)}
+        }
+        val now=System.currentTimeMillis()
+        LocalBackupCodec.writeArchive(output,folders,tags,exportedNotes,exportedSteps,exportedRevisions,exportedAssets,allowPrivate,now).also{
+            prefs.edit().putLong("lastLocalBackupAt",now).apply()
+        }
+    }
+    /**
+     * Non-destructively restores a backup `.zip` archive:
+     * - Existing local notes with different text are NEVER overwritten; instead, the backup
+     *   record is saved alongside as `（备份恢复副本）` so zero local edits can ever be lost.
+     */
+    suspend fun restoreLocalBackup(uri:android.net.Uri,encryptedUnlocked:Boolean=false):BackupRestoreSummary=syncMutex.withLock{withContext(Dispatchers.IO){
+        flushAll()
+        val staging=File(appContext.cacheDir,"backup-restore-${UUID.randomUUID()}").apply{mkdirs()}
+        try{
+            val parsed=appContext.contentResolver.openInputStream(uri)?.use{input->
+                LocalBackupCodec.readArchive(input,staging)
+            }?:error("无法读取所选备份文件")
+            restoreParsedBackup(parsed,encryptedUnlocked)
+        }finally{
+            runCatching{staging.deleteRecursively()}
+        }
+    }}
+    internal suspend fun restoreParsedBackup(parsed:ParsedBackupArchive,encryptedUnlocked:Boolean):BackupRestoreSummary{
+        val existingFolders=dao.allFolders().associateBy{it.id}
+        var restoredFolders=0
+        for(folder in parsed.payload.folders){
+            if(folder.type=="encryptedFolder"&&!encryptedUnlocked)continue
+            if(existingFolders[folder.id]==null){
+                dao.putFolder(folder)
+                if(syncBackend()!=SyncBackend.SSH)apiSync.queueFolder(syncWorkspaceId(),folder)
+                restoredFolders++
+            }
+        }
+        val existingTags=dao.observeTags().first().associateBy{it.id}
+        var restoredTags=0
+        for(tag in parsed.payload.tags){
+            if(existingTags[tag.id]==null){
+                dao.putTag(tag)
+                if(syncBackend()!=SyncBackend.SSH)apiSync.queueTag(syncWorkspaceId(),tag)
+                restoredTags++
+            }
+        }
+        val stepsByNote=parsed.payload.steps.groupBy{it.noteId}
+        val assetsByNote=parsed.payload.assets.groupBy{it.asset.noteId}
+        val revisionsByNote=parsed.payload.revisions.groupBy{it.noteId}
+        var restoredNotes=0;var conflictCopies=0;var skippedIdentical=0;var restoredAttachments=0;var skippedPrivateLocked=0
+
+        for(record in parsed.payload.notes){
+            val incoming=record.note
+            val isPrivate=record.privateFolderId!=null
+            if(isPrivate&&!encryptedUnlocked){skippedPrivateLocked++;continue}
+            val current=loadEditable(incoming.id)
+            if(current!=null&&current.deletedAt==null){
+                if(current.title==incoming.title&&current.body==incoming.body&&current.completedAt==incoming.completedAt){
+                    skippedIdentical++
+                    continue
+                }
+                // Local active note differs: keep local note untouched and save backup as a conflict-safe copy!
+                val copyId=UUID.randomUUID().toString()
+                if(isPrivate)markEncrypted(copyId,record.privateFolderId!!)
+                val remappedAssets=mutableListOf<AssetEntity>()
+                val assetIdMap=HashMap<String,String>()
+                for(assetRecord in assetsByNote[incoming.id].orEmpty()){
+                    val staged=parsed.attachmentFiles[assetRecord.archiveEntry]?:continue
+                    val newAssetId=UUID.randomUUID().toString()
+                    assetIdMap[assetRecord.asset.id]=newAssetId
+                    val safeName=assetRecord.asset.filename.replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_")
+                    val relative="$copyId/$newAssetId-$safeName"
+                    val target=File(appContext.filesDir,"attachments/$relative").apply{parentFile?.mkdirs()}
+                    staged.copyTo(target,overwrite=true)
+                    remappedAssets+=assetRecord.asset.copy(id=newAssetId,noteId=copyId,relativePath=relative,localPath=target.absolutePath,dirty=true)
+                }
+                val remappedBody=Regex("notebook-asset:([A-Za-z0-9._:-]+)").replace(incoming.body){m->
+                    assetIdMap[m.groupValues[1]]?.let{"notebook-asset:$it"}?:m.value
+                }
+                val savedCopy=save(incoming.copy(
+                    id=copyId,
+                    title="${incoming.title.ifBlank{"无标题"}}（备份恢复副本）",
+                    body=remappedBody,
+                    parentPageId=null,
+                    version=1,
+                    lastSyncedVersion=0,
+                    conflict=false,
+                    conflictSnapshotJson=null,
+                    snapshotJson=null,
+                ))
+                if(remappedAssets.isNotEmpty()){
+                    dao.putAssets(remappedAssets)
+                    if(syncBackend()!=SyncBackend.SSH)remappedAssets.forEach{apiSync.queueAsset(syncWorkspaceId(),it)}
+                    restoredAttachments+=remappedAssets.size
+                }
+                stepsByNote[incoming.id].orEmpty().forEach{step->
+                    val copiedStep=step.copy(id=UUID.randomUUID().toString(),noteId=savedCopy.id)
+                    dao.putStep(copiedStep)
+                    if(syncBackend()!=SyncBackend.SSH)apiSync.queueStep(syncWorkspaceId(),copiedStep)
+                }
+                conflictCopies++
+            }else{
+                // Note is missing locally or was in Trash: restore cleanly under its original ID!
+                permanentlyDeletedNoteIds.remove(incoming.id)
+                trashedNoteIds.remove(incoming.id)
+                dao.tombstone("note|${incoming.id}")?.let{dao.deleteTombstone("note|${incoming.id}")}
+                if(isPrivate)markEncrypted(incoming.id,record.privateFolderId!!)
+                val restored=save(incoming.copy(deletedAt=incoming.deletedAt,conflict=false,conflictSnapshotJson=null,snapshotJson=null),restoring=true)
+                val noteAssets=mutableListOf<AssetEntity>()
+                for(assetRecord in assetsByNote[incoming.id].orEmpty()){
+                    val staged=parsed.attachmentFiles[assetRecord.archiveEntry]?:continue
+                    val safeName=assetRecord.asset.filename.replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fff]"),"_")
+                    val relative="${restored.id}/${assetRecord.asset.id}-$safeName"
+                    val target=File(appContext.filesDir,"attachments/$relative").apply{parentFile?.mkdirs()}
+                    staged.copyTo(target,overwrite=true)
+                    noteAssets+=assetRecord.asset.copy(noteId=restored.id,relativePath=relative,localPath=target.absolutePath,dirty=true)
+                }
+                if(noteAssets.isNotEmpty()){
+                    dao.putAssets(noteAssets)
+                    if(syncBackend()!=SyncBackend.SSH)noteAssets.forEach{apiSync.queueAsset(syncWorkspaceId(),it)}
+                    restoredAttachments+=noteAssets.size
+                }
+                stepsByNote[incoming.id].orEmpty().forEach{step->
+                    dao.putStep(step.copy(noteId=restored.id))
+                    if(syncBackend()!=SyncBackend.SSH)apiSync.queueStep(syncWorkspaceId(),step.copy(noteId=restored.id))
+                }
+                revisionsByNote[incoming.id].orEmpty().forEach{rev->dao.putRemoteRevision(rev)}
+                restoredNotes++
+            }
+        }
+        requestSyncIfConfigured()
+        return BackupRestoreSummary(restoredNotes,conflictCopies,skippedIdentical,restoredFolders,restoredTags,restoredAttachments,skippedPrivateLocked)
     }
     suspend fun searchNoteIds(query:String)=withContext(Dispatchers.IO){dao.searchNoteIds(query).toSet()}
     /**
@@ -706,8 +889,30 @@ class SyncRepository(context:Context, private val dao:NotebookDao,preferences:an
         copy
     }}
     suspend fun deleteFolder(id:String){if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"section",id);dao.deleteFolder(id);dao.putTombstone(TombstoneEntity("folder|$id",id,"folder",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
+    /** Safely deletes a noteFolder or todoList by first moving any contained items to Unfiled (or Trash when requested). */
+    suspend fun safeDeleteFolder(id:String,deleteItems:Boolean=false){
+        val folder=dao.getFolder(id)?:return
+        if(folder.type=="noteFolder"){dissolveLibrary(id,deleteItems);return}
+        flushAll()
+        val targets=dao.observeNoteSummaries().first().filter{it.folderId==id}
+        if(deleteItems)targets.filter{it.deletedAt==null}.forEach{moveToTrash(it.id)}
+        targets.forEach{target->loadEditable(target.id)?.let{save(it.copy(folderId=null,folderName="未分类",treeUpdatedAt=System.currentTimeMillis()))}}
+        deleteFolder(id)
+    }
     suspend fun saveTag(name:String,color:String="gray",id:String=UUID.randomUUID().toString()){val tag=TagEntity(id,name,color);dao.putTag(tag);if(syncBackend()!=SyncBackend.SSH)apiSync.queueTag(syncWorkspaceId(),tag);requestSyncIfConfigured()}
     suspend fun deleteTag(id:String){if(syncBackend()!=SyncBackend.SSH)apiSync.queueDelete(syncWorkspaceId(),"tag",id);dao.deleteTag(id);dao.putTombstone(TombstoneEntity("tag|$id",id,"tag",System.currentTimeMillis(),deviceId()));requestSyncIfConfigured()}
+    /** Safely deletes a tag and cleans dangling tag references on affected notes after flushing drafts. */
+    suspend fun safeDeleteTag(id:String){
+        flushAll()
+        val affected=dao.observeNoteSummaries().first().filter{it.tagIds.split(',').contains(id)}
+        affected.forEach{summary->
+            loadEditable(summary.id)?.let{note->
+                val cleaned=note.tagIds.split(',').filter{it.isNotBlank()&&it!=id}.joinToString(",")
+                save(note.copy(tagIds=cleaned))
+            }
+        }
+        deleteTag(id)
+    }
     fun steps(noteId:String)=dao.observeSteps(noteId)
     fun assets(noteId:String)=dao.observeAssets(noteId)
     suspend fun assetList(noteId:String)=dao.assets(noteId)

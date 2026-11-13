@@ -35,12 +35,20 @@ internal fun BoxScope.ReferenceFilters(
     compact: Boolean = false,
     onCompact: () -> Unit = {},
     showDue: Boolean = false,
+    time: TimeFilter = TimeFilter.All,
+    yearMonth: YearMonthFilter? = null,
+    timeBasis: TimeBasis = TimeBasis.Updated,
+    onTime: (TimeFilter) -> Unit = {},
+    onClearYearMonth: () -> Unit = {},
+    onPickYearMonth: () -> Unit = {},
+    onTimeBasis: (TimeBasis) -> Unit = {},
 ) {
     var displayedChild by remember { mutableStateOf("sort") }
     child?.let { displayedChild = it }
     val fraction by
         animateFloatAsState(if (child == null) 0f else 1f, tween(180), label = "filter-layer")
     val shift = with(LocalDensity.current) { 32.dp.toPx() }
+    val timeSummary = yearMonth?.label ?: time.label
     Box(
         Modifier.fillMaxSize()
             .background(Color.Black.copy(alpha = .12f))
@@ -50,7 +58,7 @@ internal fun BoxScope.ReferenceFilters(
         Modifier.align(Alignment.TopEnd)
             .statusBarsPadding()
             .padding(top = 64.dp, end = 16.dp)
-            .width(256.dp)
+            .width(268.dp)
             .graphicsLayer {
                 scaleX = 1f - fraction * .05f
                 scaleY = 1f - fraction * .05f
@@ -65,6 +73,11 @@ internal fun BoxScope.ReferenceFilters(
                 headlineContent = { Text("排序 · ${order.label}") },
                 trailingContent = { Icon(Icons.Default.ChevronRight, null) },
                 modifier = Modifier.clickable { onChild("sort") },
+            )
+            ListItem(
+                headlineContent = { Text("时间 · $timeSummary") },
+                trailingContent = { Icon(Icons.Default.ChevronRight, null) },
+                modifier = Modifier.clickable { onChild("time") },
             )
             ListItem(
                 headlineContent = { Text(content.label) },
@@ -91,7 +104,7 @@ internal fun BoxScope.ReferenceFilters(
         Modifier.align(Alignment.TopEnd)
             .statusBarsPadding()
             .padding(top = 80.dp, end = 16.dp)
-            .width(240.dp),
+            .width(252.dp),
         enter = fadeIn(tween(180)) + scaleIn(tween(200), initialScale = .92f),
         exit = fadeOut(tween(140)) + scaleOut(tween(160), targetScale = .96f),
     ) {
@@ -136,6 +149,43 @@ internal fun BoxScope.ReferenceFilters(
                                 )
                             },
                             modifier = Modifier.clickable(onClick = onDescending),
+                        )
+                    }
+                    "time" -> {
+                        ListItem(
+                            headlineContent = { Text(timeBasis.label) },
+                            supportingContent = { Text("点击切换修改时间 / 创建时间") },
+                            leadingContent = { Icon(Icons.Default.Schedule, null) },
+                            modifier = Modifier.clickable {
+                                onTimeBasis(if (timeBasis == TimeBasis.Updated) TimeBasis.Created else TimeBasis.Updated)
+                            },
+                        )
+                        HorizontalDivider()
+                        TimeFilter.entries.forEach { value ->
+                            ListItem(
+                                headlineContent = { Text(value.label) },
+                                trailingContent = {
+                                    if (time == value && yearMonth == null)
+                                        Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
+                                },
+                                modifier = Modifier.clickable {
+                                    onClearYearMonth()
+                                    onTime(value)
+                                    onDismiss()
+                                },
+                            )
+                        }
+                        ListItem(
+                            headlineContent = { Text(yearMonth?.let { "指定年月 · ${it.label}" } ?: "指定年月…") },
+                            leadingContent = { Icon(Icons.Default.CalendarMonth, null) },
+                            trailingContent = {
+                                if (yearMonth != null)
+                                    Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
+                            },
+                            modifier = Modifier.clickable {
+                                onDismiss()
+                                onPickYearMonth()
+                            },
                         )
                     }
                     "type" ->

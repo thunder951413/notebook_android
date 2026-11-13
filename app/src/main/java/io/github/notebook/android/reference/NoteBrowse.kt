@@ -78,11 +78,43 @@ internal data class NoteSearchQuery(
     }
 }
 
+internal enum class TimeBasis(val label: String) {
+    Updated("按修改时间"),
+    Created("按创建时间"),
+}
+
 internal enum class TimeFilter(val label: String, val days: Int) {
     All("任何时间", 0),
     Today("今天", 1),
     Week("7 天内", 7),
     Month("30 天内", 30),
+}
+
+internal data class YearMonthFilter(val year: Int, val month: Int) : java.io.Serializable {
+    val label: String get() = "${year}年${month}月"
+    fun accepts(timestamp: Long): Boolean {
+        val cal = Calendar.getInstance().apply { timeInMillis = timestamp }
+        return cal.get(Calendar.YEAR) == year && (cal.get(Calendar.MONTH) + 1) == month
+    }
+}
+
+internal fun NoteSummary.timestampFor(basis: TimeBasis): Long =
+    if (basis == TimeBasis.Created) createdAt else updatedAt
+
+internal fun availableYearMonths(
+    notes: List<NoteSummary>,
+    basis: TimeBasis = TimeBasis.Updated,
+): List<Pair<YearMonthFilter, Int>> {
+    val counts = LinkedHashMap<YearMonthFilter, Int>()
+    for (note in notes) {
+        if (note.deletedAt != null) continue
+        val cal = Calendar.getInstance().apply { timeInMillis = note.timestampFor(basis) }
+        val key = YearMonthFilter(cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1)
+        counts[key] = (counts[key] ?: 0) + 1
+    }
+    return counts.entries
+        .sortedWith(compareByDescending<Map.Entry<YearMonthFilter, Int>> { it.key.year }.thenByDescending { it.key.month })
+        .map { it.key to it.value }
 }
 
 internal fun startOfToday(now: Long = System.currentTimeMillis()): Long =
@@ -215,27 +247,151 @@ internal fun SearchStartPanel(
     }
 }
 
-/** One-tap filters while searching (type and time). */
+/** One-tap filters while searching (date basis, specific year-month, relative time, and content type). */
 @Composable
 internal fun SearchFilterChips(
     content: ContentFilter,
     time: TimeFilter,
     onContent: (ContentFilter) -> Unit,
     onTime: (TimeFilter) -> Unit,
+    yearMonth: YearMonthFilter? = null,
+    onClearYearMonth: () -> Unit = {},
+    onPickYearMonth: () -> Unit = {},
+    timeBasis: TimeBasis = TimeBasis.Updated,
+    onTimeBasis: (TimeBasis) -> Unit = {},
 ) {
     Row(
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        if (time != TimeFilter.All || yearMonth != null) {
+            AssistChip(
+                onClick = { onTimeBasis(if (timeBasis == TimeBasis.Updated) TimeBasis.Created else TimeBasis.Updated) },
+                label = { Text(timeBasis.label) },
+                leadingIcon = { Icon(Icons.Default.Schedule, null, Modifier.size(16.dp)) },
+            )
+        }
+        FilterChip(
+            selected = yearMonth != null,
+            onClick = { if (yearMonth != null) onClearYearMonth() else onPickYearMonth() },
+            label = { Text(yearMonth?.label ?: "指定年月") },
+            leadingIcon = {
+                Icon(
+                    if (yearMonth != null) Icons.Default.Close else Icons.Default.CalendarMonth,
+                    null,
+                    Modifier.size(16.dp),
+                )
+            },
+        )
         TimeFilter.entries.drop(1).forEach { value ->
-            FilterChip(time == value, { onTime(if (time == value) TimeFilter.All else value) }, { Text(value.label) },
-                leadingIcon = if (time == value) ({ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }) else null)
+            FilterChip(
+                time == value && yearMonth == null,
+                {
+                    onClearYearMonth()
+                    onTime(if (time == value) TimeFilter.All else value)
+                },
+                { Text(value.label) },
+                leadingIcon = if (time == value && yearMonth == null) ({ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }) else null,
+            )
         }
         ContentFilter.entries.drop(1).forEach { value ->
-            FilterChip(content == value, { onContent(if (content == value) ContentFilter.All else value) }, { Text(value.label) },
-                leadingIcon = if (content == value) ({ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }) else null)
+            FilterChip(
+                content == value,
+                { onContent(if (content == value) ContentFilter.All else value) },
+                { Text(value.label) },
+                leadingIcon = if (content == value) ({ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }) else null,
+            )
         }
     }
+}
+
+@Composable
+internal fun YearMonthPickerDialog(
+    buckets: List<Pair<YearMonthFilter, Int>>,
+    selected: YearMonthFilter?,
+    timeBasis: TimeBasis,
+    onTimeBasis: (TimeBasis) -> Unit,
+    onSelect: (YearMonthFilter?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val now = Calendar.getInstance()
+    var customYear by remember { mutableIntStateOf(selected?.year ?: now.get(Calendar.YEAR)) }
+    var customMonth by remember { mutableIntStateOf(selected?.month ?: (now.get(Calendar.MONTH) + 1)) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("按年月查找日志与笔记") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TimeBasis.entries.forEach { basis ->
+                        FilterChip(
+                            selected = timeBasis == basis,
+                            onClick = { onTimeBasis(basis) },
+                            label = { Text(basis.label) },
+                        )
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    IconButton({ customYear = (customYear - 1).coerceAtLeast(1970) }) { Icon(Icons.Default.ChevronLeft, "上一年") }
+                    Text("${customYear} 年", fontWeight = FontWeight.SemiBold)
+                    IconButton({ customYear = (customYear + 1).coerceAtMost(2100) }) { Icon(Icons.Default.ChevronRight, "下一年") }
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    (1..12).chunked(4).forEach { row ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            row.forEach { m ->
+                                val ym = YearMonthFilter(customYear, m)
+                                val count = buckets.firstOrNull { it.first == ym }?.second ?: 0
+                                val chosen = selected == ym || (selected == null && customMonth == m)
+                                FilterChip(
+                                    selected = chosen,
+                                    onClick = {
+                                        customMonth = m
+                                        onSelect(ym)
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    label = {
+                                        Text(
+                                            if (count > 0) "${m}月·$count" else "${m}月",
+                                            fontSize = 11.sp,
+                                            maxLines = 1,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+                if (buckets.isNotEmpty()) {
+                    HorizontalDivider()
+                    Text("有记录的月份", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        buckets.take(12).forEach { (ym, count) ->
+                            AssistChip(
+                                onClick = { onSelect(ym) },
+                                label = { Text("${ym.label} ($count)", fontSize = 12.sp) },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button({ onSelect(YearMonthFilter(customYear, customMonth)) }) { Text("查看 ${customYear}年${customMonth}月") }
+        },
+        dismissButton = {
+            Row {
+                if (selected != null) {
+                    TextButton({ onSelect(null) }) { Text("清除年月") }
+                }
+                TextButton(onDismiss) { Text("取消") }
+            }
+        },
+    )
 }
 
 /** Sticky section header for pinned / date groups. */

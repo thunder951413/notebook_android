@@ -69,6 +69,10 @@ internal fun ReferenceEditorBody(
     onCaret: (Int) -> Unit = {
         onValue(value.copy(selection = androidx.compose.ui.text.TextRange(it)))
     },
+    canUndo: Boolean = false,
+    canRedo: Boolean = false,
+    onUndo: () -> Unit = {},
+    onRedo: () -> Unit = {},
     extras: @Composable ColumnScope.() -> Unit,
 ) {
     var panel by surface.panel
@@ -252,7 +256,21 @@ internal fun ReferenceEditorBody(
             Modifier.fillMaxWidth().padding(vertical = 12.dp),
             contentAlignment = Alignment.Center,
         ) {
-            FloatingPill(Modifier.width(208.dp).horizontalScroll(rememberScrollState())) {
+            FloatingPill(Modifier.widthIn(min = 208.dp, max = 336.dp).horizontalScroll(rememberScrollState())) {
+                IconButton(
+                    onUndo,
+                    Modifier.testTag("quick-undo"),
+                    enabled = canUndo,
+                ) {
+                    Icon(Icons.Default.Undo, "快捷撤销")
+                }
+                IconButton(
+                    onRedo,
+                    Modifier.testTag("quick-redo"),
+                    enabled = canRedo,
+                ) {
+                    Icon(Icons.Default.Redo, "快捷重做")
+                }
                 IconButton(
                     { openPanel("format") },
                     Modifier.testTag("format-tools"),

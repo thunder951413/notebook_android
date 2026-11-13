@@ -20,10 +20,17 @@ import io.github.notebook.android.sync.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
+import android.content.Intent
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.core.content.FileProvider
+import java.io.File
+
 private enum class SyncSettingsPage(val title: String) {
     Overview("同步设置"),
     Connection("连接配置"),
     Repair("同步状态与修复"),
+    Backup("本地备份与数据安全"),
     Migration("旧仓库迁移"),
 }
 
@@ -35,7 +42,9 @@ internal fun SettingsFlow(
     startWithSync: Boolean,
     onBack: () -> Unit,
     manage: @Composable (String, () -> Unit) -> Unit,
+    encryptedUnlocked: Boolean = false,
 ) {
+    val context = LocalContext.current
     var page by rememberSaveable {
         mutableStateOf(if (startWithSync) SyncSettingsPage.Overview else null)
     }
@@ -45,6 +54,7 @@ internal fun SettingsFlow(
     val detailScroll = key(page) { rememberScrollState() }
     val scope = rememberCoroutineScope()
     val lastSuccess by repo.lastSyncSuccess.collectAsState()
+
     var configured by remember { mutableStateOf(repo.hasRemoteConfiguration()) }
     var backend by remember { mutableStateOf(repo.syncBackend()) }
     var webdav by remember { mutableStateOf(repo.webdavSettings()) }
@@ -183,10 +193,11 @@ internal fun SettingsFlow(
             onScan = ::scan,
         )
     }
+
     val current = page
     when (current) {
         null -> ReferenceSettings(
-            repo, onBack, { open(SyncSettingsPage.Overview) }, overviewCard, manage, homeScroll,
+            repo, onBack, { open(SyncSettingsPage.Overview) }, overviewCard, manage, homeScroll, encryptedUnlocked,
         )
         SyncSettingsPage.Overview -> SettingsScreen(current.title, ::backFromOverview, overviewScroll) {
             Surface(Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) { overviewCard() }
@@ -198,6 +209,10 @@ internal fun SettingsFlow(
                 SettingsDivider()
                 SettingsLink("同步状态与修复", Icons.Default.Build, "待上传、冲突副本与异常记录") {
                     open(SyncSettingsPage.Repair)
+                }
+                SettingsDivider()
+                SettingsLink("本地备份与数据安全", Icons.Default.VerifiedUser, "导出离线 ZIP 备份包、零覆盖安全恢复") {
+                    open(SyncSettingsPage.Backup)
                 }
                 SettingsDivider()
                 SettingsLink("旧仓库迁移", Icons.Default.History, "SSH/SFTP 与旧版 HTTP API") {
@@ -275,17 +290,33 @@ internal fun SettingsFlow(
                         Text("配置坚果云 WebDAV 后，可以查看异常记录并执行修复。")
                         OutlinedButton({ open(SyncSettingsPage.Connection) }) { Text("打开连接配置") }
                     }
-                    OutlinedButton(onClick = {
-                        scope.launch {
-                            runCatching { repo.exportSyncDiagnostics() }
-                                .onSuccess { pageFeedback = SyncFeedback("同步诊断已保存（仅实体标识与校验值）") }
-                                .onFailure {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            scope.launch {
+                                runCatching {
+                                    val statusFile = repo.exportSyncDiagnostics()
+                                    val shareCopy = File(File(context.cacheDir, "exports").apply { mkdirs() }, "notebook-sync-status.json")
+                                    statusFile.copyTo(shareCopy, overwrite = true)
+                                    shareCopy
+                                }.onSuccess { shareCopy ->
+                                    pageFeedback = SyncFeedback("同步诊断已保存（仅实体标识与校验值）")
+                                    runCatching {
+                                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", shareCopy)
+                                        val share = Intent(Intent.ACTION_SEND).setType("application/json")
+                                            .putExtra(Intent.EXTRA_STREAM, uri)
+                                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        context.startActivity(Intent.createChooser(share, "分享同步状态诊断"))
+                                    }
+                                }.onFailure {
                                     if (it is CancellationException) throw it
                                     pageFeedback = SyncFeedback("诊断导出失败：${it.localizedMessage}", error = true)
                                 }
-                        }
-                    }, enabled = !busy) { Text("导出同步诊断") }
+                            }
+                        }, enabled = !busy) { Text("导出同步诊断") }
+                    }
+                    DiagnosticLogViewerSection(initialFilter = "SYNC")
                 }
+                SyncSettingsPage.Backup -> LocalBackupSafetyContent(repo, encryptedUnlocked)
                 SyncSettingsPage.Migration -> LegacyMigration(
                     ssh, { ssh = it }, backend, busy, ::scan,
                     onImportKey = { keyPicker.launch(arrayOf("*/*")) },
@@ -387,18 +418,41 @@ private fun SyncOverviewCounts(repo: SyncRepository, busy: Boolean, lastSuccess:
 @Composable
 private fun SyncFeedbackCard(feedback: SyncFeedback, working: Boolean = false) {
     val colors = MaterialTheme.colorScheme
+    val fraction = remember(feedback.text, working) {
+        if (working) parseSyncProgressFraction(feedback.text) else null
+    }
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().testTag("sync-feedback-card"),
         color = if (feedback.error) colors.errorContainer else colors.secondaryContainer,
         shape = MaterialTheme.shapes.medium,
     ) {
-        Row(
+        Column(
             Modifier.fillMaxWidth().padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (working) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-            Text(feedback.text, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (working) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Text(feedback.text, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                if (fraction != null) {
+                    Text("${(fraction * 100).toInt()}%", style = MaterialTheme.typography.labelMedium, color = colors.primary)
+                }
+            }
+            if (working) {
+                if (fraction != null) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth().testTag("sync-progress-bar"),
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().testTag("sync-progress-bar"),
+                    )
+                }
+            }
         }
     }
 }
@@ -560,6 +614,7 @@ private fun SyncHealthCard(
     var confirmation by remember { mutableStateOf<SyncRepair?>(null) }
     var readError by remember { mutableStateOf(false) }
     var issues by remember { mutableStateOf<WebdavSyncIssues?>(null) }
+
     LaunchedEffect(busy, lastSuccess) {
         if (!busy) {
             try {
@@ -572,10 +627,12 @@ private fun SyncHealthCard(
             }
         }
     }
+
     SettingsSection("同步状态") {
         Text(lastSyncLabel(lastSuccess), Modifier.padding(start = 12.dp, top = 12.dp), style = MaterialTheme.typography.bodySmall)
         Box(Modifier.padding(bottom = 12.dp)) { SyncOverviewCounts(repo, busy, lastSuccess) }
     }
+
     SettingsSection("修复") {
         SettingsLink(SyncRepair.Reread.label, Icons.Default.CloudDownload, "其他设备的修改还未出现在本机", enabled = !busy) {
             confirmation = SyncRepair.Reread
@@ -592,6 +649,7 @@ private fun SyncHealthCard(
     )
 
     if (readError) Text("无法读取同步问题", color = MaterialTheme.colorScheme.error)
+
     issues?.takeUnless { it.isEmpty }?.let { found ->
         SettingsSection("需要处理的同步问题") {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -620,6 +678,7 @@ private fun SyncHealthCard(
             }
         }
     }
+
     confirmation?.let { action ->
         AlertDialog(
             onDismissRequest = { confirmation = null },

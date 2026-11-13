@@ -145,6 +145,12 @@ internal fun ReferenceHome(
     encryptedUnlocked: Boolean = false,
     onCreateChild: (String) -> Unit = {},
     onHierarchyOpen: (String) -> Unit = onOpen,
+    searchAllScope: Boolean = false,
+    onSearchAllScope: (Boolean) -> Unit = {},
+    globalMatchCount: Int = 0,
+    onLockPrivate: () -> Unit = {},
+    onUnlockPrivate: () -> Unit = {},
+    onOpenSyncSettings: () -> Unit = onSettings,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var hierarchy by rememberSaveable { mutableStateOf(false) }
@@ -198,6 +204,9 @@ internal fun ReferenceHome(
     var compact by remember { mutableStateOf(preferences.getBoolean("homeCompact", false)) }
     var libraryList by remember { mutableStateOf(preferences.getBoolean("libraryList", false)) }
     var time by rememberSaveable { mutableStateOf(TimeFilter.All) }
+    var yearMonth by rememberSaveable { mutableStateOf<YearMonthFilter?>(null) }
+    var timeBasis by rememberSaveable { mutableStateOf(TimeBasis.Updated) }
+    var showYearMonthPicker by remember { mutableStateOf(false) }
     var recentSearches by remember { mutableStateOf(repo.recentSearches()) }
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
@@ -232,6 +241,10 @@ internal fun ReferenceHome(
         "${destination.name}:${folderId.orEmpty()}:${tagId.orEmpty()}:${if(search)"search" else "list"}"
     val listState = listStates.getOrPut(routeKey) { LazyListState() }
     val globalHome = destination == Destination.All && folderId == null && tagId == null
+    val topLevelTodo =
+        folderId == null &&
+            tagId == null &&
+            destination in setOf(Destination.Today, Destination.Important, Destination.Todos, Destination.Completed)
     val librariesVisible = tab == 1 && globalHome
     val isTodo =
         destination.newItemType == "todo" ||
@@ -254,15 +267,16 @@ internal fun ReferenceHome(
     }
     val linkSet = remember(linkIds) { linkIds.toHashSet() }
     val visible =
-        remember(notes, order, descending, content, filing, notesByKind, linkSet, time, searchOrder) {
+        remember(notes, order, descending, content, filing, notesByKind, linkSet, time, yearMonth, timeBasis, searchOrder) {
             val filtered = notes.filter { note ->
+                val ts = note.timestampFor(timeBasis)
                 (filing == FilingFilter.All ||
                     if (filing == FilingFilter.Unfiled) note.folderId == null
                     else note.folderId != null) &&
                     (content == ContentFilter.All ||
                         if (content == ContentFilter.Link) note.id in linkSet
                         else notesByKind[content]?.contains(note.id) == true) &&
-                    time.accepts(note.updatedAt)
+                    (yearMonth?.accepts(ts) ?: time.accepts(ts))
             }
             if (searchOrder != null) {
                 val rank = HashMap<String, Int>(searchOrder.size).apply { searchOrder.forEachIndexed { index, id -> put(id, index) } }
@@ -274,7 +288,7 @@ internal fun ReferenceHome(
     val pinnedVisible = if (search) emptyList() else visible.filter { it.id in pinnedSet }.sortedBy { pinnedIds.indexOf(it.id) }
     val unpinnedVisible = if (search || pinnedVisible.isEmpty()) visible else visible.filter { it.id !in pinnedSet }
     val dateSections =
-        remember(unpinnedVisible, order, search) {
+        remember(unpinnedVisible, order, search, yearMonth, timeBasis) {
             if (search || order == NoteOrder.Title) emptyList()
             else if (order == NoteOrder.Due) {
                 val now = System.currentTimeMillis()
@@ -289,7 +303,8 @@ internal fun ReferenceHome(
             else {
                 val sections = mutableListOf<Pair<String, MutableList<NoteSummary>>>()
                 for (note in unpinnedVisible) {
-                    val label = dateGroupLabel(if (order == NoteOrder.Created) note.createdAt else note.updatedAt)
+                    val useCreated = order == NoteOrder.Created || (yearMonth != null && timeBasis == TimeBasis.Created)
+                    val label = dateGroupLabel(if (useCreated) note.createdAt else note.updatedAt)
                     if (sections.lastOrNull()?.first == label) sections.last().second += note
                     else sections += label to mutableListOf(note)
                 }
@@ -359,9 +374,10 @@ internal fun ReferenceHome(
             }
             menu -> menu = false
             createMenu -> createMenu = false
-            search && (content != ContentFilter.All || time != TimeFilter.All) && query.isBlank() -> {
+            search && (content != ContentFilter.All || time != TimeFilter.All || yearMonth != null) && query.isBlank() -> {
                 content = ContentFilter.All
                 time = TimeFilter.All
+                yearMonth = null
             }
             selecting -> {
                 selecting = false
@@ -370,6 +386,8 @@ internal fun ReferenceHome(
             search -> {
                 keyboard?.hide()
                 search = false
+                yearMonth = null
+                onSearchAllScope(false)
                 onQuery("")
             }
             else -> onSelect(Destination.All, null, null)
@@ -560,6 +578,8 @@ internal fun ReferenceHome(
                                     search = false
                                     content = ContentFilter.All
                                     time = TimeFilter.All
+                                    yearMonth = null
+                                    onSearchAllScope(false)
                                     onQuery("")
                                 }) {
                                     Text("取消")
@@ -577,13 +597,21 @@ internal fun ReferenceHome(
                                         { onSelect(Destination.All, null, null) },
                                         filled = false,
                                     )
-                                else Spacer(Modifier.weight(1f))
-                                if (
-                                    folder != null ||
-                                        destination != Destination.All ||
-                                        tagId != null
+                                RoundTool(
+                                    Icons.Default.Menu,
+                                    "打开侧栏",
+                                    onNavigation,
+                                    filled = false,
+                                    modifier = Modifier.testTag("open-drawer"),
                                 )
-                                    Spacer(Modifier.weight(1f))
+                                Spacer(Modifier.weight(1f))
+                                if (encryptedUnlocked)
+                                    RoundTool(
+                                        Icons.Default.LockOpen,
+                                        "立即锁定私密内容",
+                                        onLockPrivate,
+                                        modifier = Modifier.testTag("lock-private"),
+                                    )
                                 RoundTool(
                                     Icons.Default.AccountTree,
                                     "笔记结构",
@@ -619,6 +647,14 @@ internal fun ReferenceHome(
                                                 selecting = true
                                             },
                                             enabled = visible.isNotEmpty(),
+                                        )
+                                        DropdownMenuItem(
+                                            { Text("导入笔记") },
+                                            {
+                                                menu = false
+                                                onImport()
+                                            },
+                                            leadingIcon = { Icon(Icons.Default.FileOpen, null) },
                                         )
                                         if (folder?.type == "noteFolder") {
                                             DropdownMenuItem(
@@ -709,31 +745,107 @@ internal fun ReferenceHome(
                         },
                         onShowAll = { onSelect(Destination.Todos, null, null) },
                     )
-                if (search) SearchFilterChips(content, time, { content = it }, { time = it })
-                if (search && (folder != null || tagId != null))
-                    Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("仅搜索「$title」", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        TextButton({ onSelect(Destination.All, null, null) }) { Text("搜索全部笔记", fontSize = 12.sp) }
+                if (search)
+                    SearchFilterChips(
+                        content = content,
+                        time = time,
+                        onContent = { content = it },
+                        onTime = { time = it },
+                        yearMonth = yearMonth,
+                        onClearYearMonth = { yearMonth = null },
+                        onPickYearMonth = { showYearMonthPicker = true },
+                        timeBasis = timeBasis,
+                        onTimeBasis = { timeBasis = it },
+                    )
+                if (search && !globalHome)
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("范围", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        FilterChip(
+                            selected = !searchAllScope,
+                            onClick = { onSearchAllScope(false) },
+                            label = { Text("仅「$title」", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            modifier = Modifier.testTag("search-scope-local"),
+                        )
+                        FilterChip(
+                            selected = searchAllScope,
+                            onClick = { onSearchAllScope(true) },
+                            label = {
+                                Text(
+                                    if (query.isNotBlank()) "全部内容 ($globalMatchCount)" else "全部内容",
+                                    fontSize = 12.sp,
+                                )
+                            },
+                            modifier = Modifier.testTag("search-scope-all"),
+                        )
                     }
-                status?.let {
+                if (search && !encryptedUnlocked && folders.any { it.type == "encryptedFolder" })
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Default.Lock, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            "私密文件夹已锁定，未纳入搜索",
+                            Modifier.weight(1f).padding(start = 6.dp),
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        TextButton(onUnlockPrivate, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                            Text("解锁后搜索", fontSize = 12.sp)
+                        }
+                    }
+                status?.let { message ->
+                    val failed = message.contains("失败")
+                    val fraction = if (syncing) parseSyncProgressFraction(message) else null
                     Surface(
-                        Modifier.padding(horizontal = 16.dp).fillMaxWidth(),
+                        Modifier.padding(horizontal = 16.dp, vertical = 4.dp).fillMaxWidth(),
                         shape = RoundedCornerShape(16.dp),
                         color =
-                            if (it.contains("失败")) MaterialTheme.colorScheme.errorContainer
+                            if (failed) MaterialTheme.colorScheme.errorContainer
                             else MaterialTheme.colorScheme.secondaryContainer,
                     ) {
-                        Row(
-                            Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            if (syncing)
-                                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Text(it, Modifier.weight(1f).padding(start = 6.dp), fontSize = 12.sp)
-                            if (!syncing)
-                                IconButton({ onStatus("") }, Modifier.size(30.dp)) {
-                                    Icon(Icons.Default.Close, "关闭提示", Modifier.size(16.dp))
+                        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (syncing)
+                                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Text(message, Modifier.weight(1f).padding(start = if (syncing) 8.dp else 4.dp), fontSize = 12.sp)
+                                if (syncing && fraction != null)
+                                    Text(
+                                        "${(fraction * 100).toInt()}%",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.padding(start = 6.dp),
+                                    )
+                                if (!syncing && failed) {
+                                    TextButton(onSync, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                                        Text("重试", fontSize = 12.sp)
+                                    }
+                                    TextButton(onOpenSyncSettings, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                                        Text("同步设置", fontSize = 12.sp)
+                                    }
                                 }
+                                if (!syncing)
+                                    IconButton({ onStatus("") }, Modifier.size(28.dp)) {
+                                        Icon(Icons.Default.Close, "关闭提示", Modifier.size(16.dp))
+                                    }
+                            }
+                            if (syncing) {
+                                Spacer(Modifier.height(6.dp))
+                                if (fraction != null)
+                                    LinearProgressIndicator(
+                                        progress = { fraction },
+                                        modifier = Modifier.fillMaxWidth().testTag("home-sync-progress"),
+                                    )
+                                else
+                                    LinearProgressIndicator(
+                                        modifier = Modifier.fillMaxWidth().testTag("home-sync-progress"),
+                                    )
+                            }
                         }
                     }
                 }
@@ -746,7 +858,7 @@ internal fun ReferenceHome(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            if (search) (if (query.isBlank() && content == ContentFilter.All && time == TimeFilter.All) "搜索" else "找到 ${visible.size} 篇")
+                            if (search) (if (query.isBlank() && content == ContentFilter.All && time == TimeFilter.All && yearMonth == null) "搜索" else "找到 ${visible.size} 篇")
                             else if (librariesVisible) "笔记库" else title,
                             Modifier.weight(1f),
                             fontSize = if (search) 18.sp else 32.sp,
@@ -765,12 +877,76 @@ internal fun ReferenceHome(
                                     if (libraryList) "图标显示" else "列表显示",
                                 )
                             }
-                        if (!search && !selecting && (tab == 0 || folder != null))
+                        if (!search && !selecting && (tab == 0 || folder != null || topLevelTodo))
                             TextButton({ filters = true }) {
                                 Icon(Icons.Default.Tune, "筛选", Modifier.size(19.dp))
                                 Text("${visible.size}", Modifier.padding(start = 6.dp))
                             }
                     }
+                if (topLevelTodo && !search && !selecting) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(
+                            Destination.Todos to "未完成",
+                            Destination.Today to "今天",
+                            Destination.Important to "重要",
+                            Destination.Completed to "已完成",
+                        ).forEach { (dest, label) ->
+                            FilterChip(
+                                selected = destination == dest,
+                                onClick = { onSelect(dest, null, null) },
+                                label = { Text(label) },
+                                modifier = Modifier.testTag("todo-subtab-${dest.name}"),
+                            )
+                        }
+                    }
+                }
+                if (!search && !selecting && !librariesVisible && (yearMonth != null || time != TimeFilter.All || content != ContentFilter.All || filing != FilingFilter.All)) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        yearMonth?.let { ym ->
+                            InputChip(
+                                selected = true,
+                                onClick = { yearMonth = null },
+                                label = { Text("${ym.label}（${timeBasis.label.removePrefix("按")}）") },
+                                trailingIcon = { Icon(Icons.Default.Close, "清除年月筛选", Modifier.size(16.dp)) },
+                            )
+                        }
+                        if (yearMonth == null && time != TimeFilter.All) {
+                            InputChip(
+                                selected = true,
+                                onClick = { time = TimeFilter.All },
+                                label = { Text(time.label) },
+                                trailingIcon = { Icon(Icons.Default.Close, "清除时间筛选", Modifier.size(16.dp)) },
+                            )
+                        }
+                        if (content != ContentFilter.All) {
+                            InputChip(
+                                selected = true,
+                                onClick = { content = ContentFilter.All },
+                                label = { Text(content.label) },
+                                trailingIcon = { Icon(Icons.Default.Close, "清除类型筛选", Modifier.size(16.dp)) },
+                            )
+                        }
+                        if (filing != FilingFilter.All) {
+                            InputChip(
+                                selected = true,
+                                onClick = { filing = FilingFilter.All },
+                                label = { Text(filing.label) },
+                                trailingIcon = { Icon(Icons.Default.Close, "清除归档筛选", Modifier.size(16.dp)) },
+                            )
+                        }
+                    }
+                }
                 if (destination == Destination.Trash)
                     Text(
                         "已删除的内容会保留在此，直到你恢复或彻底删除。",
@@ -922,7 +1098,7 @@ internal fun ReferenceHome(
                                     Spacer(Modifier.height(8.dp))
                                 }
                             }
-                            if (search && query.isBlank() && content == ContentFilter.All && time == TimeFilter.All) {
+                            if (search && query.isBlank() && content == ContentFilter.All && time == TimeFilter.All && yearMonth == null) {
                                 item(key = "search-start") {
                                     SearchStartPanel(
                                         recentSearches,
@@ -944,6 +1120,27 @@ internal fun ReferenceHome(
                             }
                             if (visible.isEmpty())
                                 item {
+                                    if (search && !searchAllScope && !globalHome && query.isNotBlank() && globalMatchCount > 0) {
+                                        Surface(
+                                            shape = RoundedCornerShape(18.dp),
+                                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f),
+                                            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                                        ) {
+                                            Row(
+                                                Modifier.padding(14.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Text(
+                                                    "在「$title」中没有匹配，但在全部内容中找到 $globalMatchCount 条结果",
+                                                    Modifier.weight(1f),
+                                                    fontSize = 13.sp,
+                                                )
+                                                TextButton({ onSearchAllScope(true) }) {
+                                                    Text("查看全部")
+                                                }
+                                            }
+                                        }
+                                    }
                                     EmptyNotes(
                                         if (search) "没有找到相关笔记" else "从一篇笔记开始",
                                         if (search) "换个关键词，或去掉筛选条件试试" else "记录想法，随时回来继续",
@@ -1060,101 +1257,112 @@ internal fun ReferenceHome(
                 Row(
                     Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    horizontalArrangement = Arrangement.spacedBy(if (tabletEditor != null) 10.dp else 14.dp),
                 ) {
-                    if (globalHome) {
-                        if (tabletEditor == null)
-                            FloatingRound {
-                                IconButton({
+                    if (globalHome || topLevelTodo) {
+                        FloatingRound {
+                            IconButton(
+                                {
                                     if (createMenu) {
                                         createMenu = false
                                         onSettings()
                                     } else {
-                                        tab = 0
-                                        onSelect(Destination.Todos, null, null)
+                                        onAiAssistant()
                                     }
-                                }) {
-                                    if (createMenu || todos.badgeCount == 0)
-                                        Icon(
-                                            if (createMenu) Icons.Default.Settings
-                                            else Icons.Default.Checklist,
-                                            if (createMenu) "设置" else "全部待办",
-                                        )
-                                    else
-                                        BadgedBox(
-                                            badge = {
-                                                Badge(
-                                                    containerColor =
-                                                        if (todos.hasOverdue) MaterialTheme.colorScheme.error
-                                                        else MaterialTheme.colorScheme.tertiary,
-                                                    contentColor =
-                                                        if (todos.hasOverdue) MaterialTheme.colorScheme.onError
-                                                        else MaterialTheme.colorScheme.onTertiary,
-                                                ) { Text(if (todos.badgeCount > 99) "99+" else "${todos.badgeCount}") }
-                                            },
-                                            modifier = Modifier.testTag("todo-badge"),
-                                        ) {
-                                            Icon(
-                                                Icons.Default.Checklist,
-                                                "全部待办，${todos.badgeCount} 项今天到期或已逾期",
-                                            )
-                                        }
-                                }
+                                },
+                                Modifier.testTag("home-ai"),
+                            ) {
+                                Icon(
+                                    if (createMenu) Icons.Default.Settings else Icons.Default.AutoAwesome,
+                                    if (createMenu) "设置" else "AI 助手",
+                                    tint = if (createMenu) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
+                                )
                             }
+                        }
                         FloatingPill(
                             Modifier.weight(1f)
                                 .then(if (homeBlur > 0.dp) Modifier.blur(homeBlur) else Modifier)
                         ) {
-                            // AI sits before 笔记 as a frequently used action (not a tab).
-                            Box(
-                                Modifier.weight(1f)
-                                    .height(44.dp)
-                                    .testTag("home-ai")
-                                    .clip(CircleShape)
-                                    .clickable(enabled = !createMenu) { onAiAssistant() },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                                ) {
-                                    Icon(Icons.Default.AutoAwesome, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
-                                    Text("AI", fontSize = 11.sp, lineHeight = 14.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                            listOf("笔记", "笔记库", "待办").forEachIndexed { index, label ->
+                                val selectedTab = when (index) {
+                                    0 -> globalHome && tab == 0
+                                    1 -> globalHome && tab == 1
+                                    else -> topLevelTodo
                                 }
-                            }
-                            listOf("笔记", "笔记库").forEachIndexed { index, label ->
                                 Box(
                                     Modifier.weight(1f)
                                         .height(44.dp)
                                         .testTag("home-tab-$index")
                                         .clip(CircleShape)
                                         .clickable(enabled = !createMenu) {
-                                            tab = index
-                                            onQuery("")
+                                            when (index) {
+                                                0 -> {
+                                                    tab = 0
+                                                    onQuery("")
+                                                    if (!globalHome) onSelect(Destination.All, null, null)
+                                                }
+                                                1 -> {
+                                                    tab = 1
+                                                    onQuery("")
+                                                    if (!globalHome) onSelect(Destination.All, null, null)
+                                                }
+                                                else -> {
+                                                    onQuery("")
+                                                    if (!topLevelTodo) onSelect(Destination.Todos, null, null)
+                                                }
+                                            }
                                         },
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     val foreground =
-                                        if (tab == index) MaterialTheme.colorScheme.onSurface
+                                        if (selectedTab) MaterialTheme.colorScheme.onSurface
                                         else MaterialTheme.colorScheme.onSurfaceVariant
                                     Column(
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                         verticalArrangement = Arrangement.spacedBy(2.dp),
                                     ) {
-                                        Icon(
-                                            if (index == 0) Icons.Default.Description
-                                            else Icons.Default.AutoStories,
-                                            null,
-                                            Modifier.size(24.dp),
-                                            tint = foreground,
-                                        )
+                                        if (index == 2 && todos.badgeCount > 0) {
+                                            BadgedBox(
+                                                badge = {
+                                                    Badge(
+                                                        containerColor =
+                                                            if (todos.hasOverdue) MaterialTheme.colorScheme.error
+                                                            else MaterialTheme.colorScheme.tertiary,
+                                                        contentColor =
+                                                            if (todos.hasOverdue) MaterialTheme.colorScheme.onError
+                                                            else MaterialTheme.colorScheme.onTertiary,
+                                                    ) {
+                                                        Text(if (todos.badgeCount > 99) "99+" else "${todos.badgeCount}")
+                                                    }
+                                                },
+                                                modifier = Modifier.testTag("todo-badge"),
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Checklist,
+                                                    "待办，${todos.badgeCount} 项今天到期或已逾期",
+                                                    Modifier.size(22.dp),
+                                                    tint = foreground,
+                                                )
+                                            }
+                                        } else {
+                                            Icon(
+                                                when (index) {
+                                                    0 -> Icons.Default.Description
+                                                    1 -> Icons.Default.AutoStories
+                                                    else -> Icons.Default.Checklist
+                                                },
+                                                null,
+                                                Modifier.size(22.dp),
+                                                tint = foreground,
+                                            )
+                                        }
                                         Text(
                                             label,
                                             fontSize = 11.sp,
                                             lineHeight = 14.sp,
                                             color = foreground,
                                             fontWeight =
-                                                if (tab == index) FontWeight.SemiBold
+                                                if (selectedTab) FontWeight.SemiBold
                                                 else FontWeight.Normal,
                                         )
                                     }
@@ -1178,13 +1386,14 @@ internal fun ReferenceHome(
                                     .combinedClickable(
                                         onClick = {
                                             if (librariesVisible) createLibrary = true
-                                            else createMenu = !createMenu
+                                            else if (createMenu) createMenu = false
+                                            else if (preferences.getBoolean("directCreate", true)) onCreate()
+                                            else createMenu = true
                                         },
                                         onLongClick = {
-                                            if (preferences.getBoolean("quickCreate", true)) {
-                                                if (librariesVisible) createLibrary = true
-                                                else onCreate()
-                                            }
+                                            if (librariesVisible) createLibrary = true
+                                            else if (preferences.getBoolean("directCreate", true)) createMenu = true
+                                            else if (preferences.getBoolean("quickCreate", true)) onCreate()
                                         },
                                     ),
                                 contentAlignment = Alignment.Center,
@@ -1259,28 +1468,48 @@ internal fun ReferenceHome(
         if (filters)
             Box(Modifier.width(homeWidth).fillMaxHeight()) {
                 ReferenceFilters(
-                    order,
-                    descending,
-                    content,
-                    filing,
-                    filterChild,
-                    { filterChild = it },
-                    {
+                    order = order,
+                    descending = descending,
+                    content = content,
+                    filing = filing,
+                    child = filterChild,
+                    onChild = { filterChild = it },
+                    onDismiss = {
                         filters = false
                         filterChild = null
                     },
-                    { order = it },
-                    { descending = !descending },
-                    { content = it },
-                    { filing = it },
-                    compact,
-                    {
+                    onOrder = { order = it },
+                    onDescending = { descending = !descending },
+                    onContent = { content = it },
+                    onFiling = { filing = it },
+                    compact = compact,
+                    onCompact = {
                         compact = !compact
                         preferences.edit().putBoolean("homeCompact", compact).apply()
                     },
                     showDue = todoContext,
+                    time = time,
+                    yearMonth = yearMonth,
+                    timeBasis = timeBasis,
+                    onTime = { time = it },
+                    onClearYearMonth = { yearMonth = null },
+                    onPickYearMonth = { showYearMonthPicker = true },
+                    onTimeBasis = { timeBasis = it },
                 )
             }
+        if (showYearMonthPicker) {
+            YearMonthPickerDialog(
+                buckets = remember(hierarchyNotes, timeBasis) { availableYearMonths(hierarchyNotes, timeBasis) },
+                selected = yearMonth,
+                timeBasis = timeBasis,
+                onTimeBasis = { timeBasis = it },
+                onSelect = { chosen ->
+                    yearMonth = chosen
+                    if (chosen != null) time = TimeFilter.All
+                },
+                onDismiss = { showYearMonthPicker = false },
+            )
+        }
         // Long lists: one tap back to the top.
         val farDown by remember(listState) { derivedStateOf { listState.firstVisibleItemIndex > 12 } }
         if (farDown && !librariesVisible && !selecting && !createMenu)

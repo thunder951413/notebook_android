@@ -74,4 +74,27 @@ class NoteBrowseTest {
         assertEquals(RowSwipe.None, rowSwipe(note.copy(deletedAt = 1L), selecting = false))
         assertEquals(RowSwipe.None, rowSwipe(note, selecting = true))
     }
+
+    @Test fun `year month filter and time basis distinguish creation vs update timestamps`() {
+        val marchCreated = Calendar.getInstance().apply { set(2025, Calendar.MARCH, 18, 9, 30, 0) }.timeInMillis
+        val octUpdated = Calendar.getInstance().apply { set(2026, Calendar.OCTOBER, 5, 14, 0, 0) }.timeInMillis
+        val log = summary("log-2025", "3月复盘", updatedAt = octUpdated).copy(createdAt = marchCreated)
+        val march2025 = YearMonthFilter(2025, 3)
+        val oct2026 = YearMonthFilter(2026, 10)
+
+        assertTrue(march2025.accepts(log.timestampFor(TimeBasis.Created)))
+        assertTrue(!march2025.accepts(log.timestampFor(TimeBasis.Updated)))
+        assertTrue(oct2026.accepts(log.timestampFor(TimeBasis.Updated)))
+
+        assertEquals(listOf(march2025 to 1), availableYearMonths(listOf(log), TimeBasis.Created))
+        assertEquals(listOf(oct2026 to 1), availableYearMonths(listOf(log), TimeBasis.Updated))
+    }
+
+    @Test fun `sync progress parser extracts percentages and fractions safely`() {
+        assertEquals(0.45f, parseSyncProgressFraction("正在上传附件 45%")!!, 0.001f)
+        assertEquals(0.25f, parseSyncProgressFraction("正在同步笔记 (3 / 12)")!!, 0.001f)
+        assertEquals(null, parseSyncProgressFraction("正在连接服务器…"))
+        assertEquals(null, parseSyncProgressFraction("2026/10/12 同步完成"))
+    }
 }
+

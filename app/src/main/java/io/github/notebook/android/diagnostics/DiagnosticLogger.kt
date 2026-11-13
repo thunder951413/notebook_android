@@ -38,6 +38,35 @@ enum class DiagnosticEvent(val wireName:String){
 
 enum class DiagnosticLevel { INFO, WARN, ERROR }
 
+data class DiagnosticEntry(
+    val timestamp:String,
+    val level:String,
+    val event:String,
+    val durationMs:Long?=null,
+    val errorClass:String?=null,
+    val resource:String?=null,
+    val counts:Map<String,Long> = emptyMap(),
+    val stack:List<String> = emptyList(),
+)
+
+fun diagnosticEventLabel(wireName:String):String = when(wireName){
+    "app.start" -> "应用启动"
+    "app.crash" -> "应用异常退出"
+    "app.init_failure" -> "初始化失败"
+    "draft.flush_failure" -> "草稿落盘失败"
+    "draft.recovery_start" -> "开始恢复草稿"
+    "draft.recovery_success" -> "草稿恢复完成"
+    "draft.recovery_failure" -> "草稿恢复失败"
+    "sync.start" -> "开始同步"
+    "sync.success" -> "同步完成"
+    "sync.failure" -> "同步失败 / 延后"
+    "sync.conflict_resolved" -> "同步冲突已保护处理"
+    "sync.repository_reset" -> "同步游标重置"
+    "sync.republish" -> "全量重新排队上传"
+    "diagnostic.repeated" -> "重复事件折叠"
+    else -> wireName
+}
+
 /**
  * Privacy-safe, bounded diagnostics. Callers can only select fixed event names;
  * exception messages and arbitrary text are deliberately absent from the API.
@@ -126,6 +155,15 @@ object DiagnosticLogger {
         return future.get(10,TimeUnit.SECONDS)
     }
 
+    /** Reads the newest redacted diagnostic entries safely on the logger thread. */
+    fun readRecentEntries(limit:Int=200):List<DiagnosticEntry>{
+        val current=state?:return emptyList()
+        return runCatching{
+            val future=current.executor.submit<List<DiagnosticEntry>>{current.store.readRecent(limit)}
+            future.get(5,TimeUnit.SECONDS)
+        }.getOrDefault(emptyList())
+    }
+
     internal fun flushForTest(timeoutMs:Long=5_000):Boolean{
         val current=state?:return false
         return runCatching{
@@ -180,6 +218,45 @@ internal class DiagnosticStore(
                 zip.putNextEntry(ZipEntry(file.name));file.inputStream().use{it.copyTo(zip)};zip.closeEntry()
             }
         }
+    }
+
+    @Synchronized fun readRecent(limit:Int=200):List<DiagnosticEntry>{
+        if(limit<=0||!directory.isDirectory)return emptyList()
+        if(repeatedCount>0){
+            runCatching{
+                write(record(DiagnosticLevel.INFO,DiagnosticEvent.REPEATED,null,null,null,null,mapOf("suppressed" to repeatedCount)))
+                repeatedCount=0
+            }
+        }
+        val collected=ArrayList<DiagnosticEntry>(minOf(limit,256))
+        for(file in diagnosticFiles()){
+            if(!file.isFile)continue
+            val lines=runCatching{file.readLines(Charsets.UTF_8)}.getOrDefault(emptyList())
+            for(index in lines.indices.reversed()){
+                val raw=lines[index].trim()
+                if(raw.isEmpty())continue
+                val parsed=runCatching{com.google.gson.JsonParser.parseString(raw).asJsonObject}.getOrNull()?:continue
+                val countsObj=parsed["counts"]?.takeIf{it.isJsonObject}?.asJsonObject
+                val countsMap=if(countsObj==null)emptyMap() else buildMap{
+                    countsObj.entrySet().forEach{(k,v)->if(v.isJsonPrimitive&&v.asJsonPrimitive.isNumber)put(k,v.asLong)}
+                }
+                val stackList=parsed["stack"]?.takeIf{it.isJsonArray}?.asJsonArray?.mapNotNull{
+                    it.takeIf{el->el.isJsonPrimitive}?.asString
+                }.orEmpty()
+                collected+=DiagnosticEntry(
+                    timestamp=parsed["timestamp"]?.takeIf{it.isJsonPrimitive}?.asString.orEmpty(),
+                    level=parsed["level"]?.takeIf{it.isJsonPrimitive}?.asString?.uppercase().orEmpty().ifBlank{"INFO"},
+                    event=parsed["event"]?.takeIf{it.isJsonPrimitive}?.asString.orEmpty(),
+                    durationMs=parsed["durationMs"]?.takeIf{it.isJsonPrimitive&&it.asJsonPrimitive.isNumber}?.asLong,
+                    errorClass=parsed["errorClass"]?.takeIf{it.isJsonPrimitive}?.asString,
+                    resource=parsed["resource"]?.takeIf{it.isJsonPrimitive}?.asString,
+                    counts=countsMap,
+                    stack=stackList,
+                )
+                if(collected.size>=limit)return collected
+            }
+        }
+        return collected
     }
 
     internal fun diagnosticFiles():List<File> = listOf(active)+(1..DiagnosticLogger.ARCHIVE_COUNT).map{File(directory,"diagnostics.$it.jsonl")}

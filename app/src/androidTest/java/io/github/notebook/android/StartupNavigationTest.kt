@@ -17,7 +17,6 @@ import org.junit.Test
 
 class StartupNavigationTest {
     @get:Rule val compose = createEmptyComposeRule()
-
     private val app get() =
         InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as NotebookApp
     private val note = NoteEntity("startup-note", title = "启动测试笔记")
@@ -28,22 +27,16 @@ class StartupNavigationTest {
             app.repository.flushAll()
             app.database.clearAllTables()
         }
+        app.getSharedPreferences("editor_preferences", 0).edit().remove("startInTodos").commit()
     }
 
-    @Test fun coldLaunchShowsOpenTodosAndResumeKeepsCurrentPage() {
+    @Test fun coldLaunchDefaultsToNotesHomeEvenWhenOpenTodosExist() {
         runBlocking {
             app.database.dao().put(note)
             app.database.dao().put(todo)
         }
-
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            waitForText("全部待办")
-            compose.onNodeWithText(todo.title).assertIsDisplayed()
-
-            compose.onNodeWithContentDescription("返回首页").performClick()
             waitForText(note.title)
-            scenario.moveToState(Lifecycle.State.CREATED)
-            scenario.moveToState(Lifecycle.State.RESUMED)
             compose.onNodeWithText(note.title).assertIsDisplayed()
 
             scenario.recreate()
@@ -52,14 +45,33 @@ class StartupNavigationTest {
         }
     }
 
+    @Test fun coldLaunchOpensTodosWhenStartInTodosPreferenceEnabled() {
+        app.getSharedPreferences("editor_preferences", 0).edit().putBoolean("startInTodos", true).commit()
+        runBlocking {
+            app.database.dao().put(note)
+            app.database.dao().put(todo)
+        }
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitForText("全部待办")
+            compose.onNodeWithText(todo.title).assertIsDisplayed()
+
+            compose.onNodeWithContentDescription("返回首页").performClick()
+            waitForText(note.title)
+
+            scenario.moveToState(Lifecycle.State.CREATED)
+            scenario.moveToState(Lifecycle.State.RESUMED)
+            compose.onNodeWithText(note.title).assertIsDisplayed()
+        }
+    }
+
     @Test fun coldLaunchWithOnlyCompletedOrDeletedTodosShowsNotes() {
+        app.getSharedPreferences("editor_preferences", 0).edit().putBoolean("startInTodos", true).commit()
         runBlocking {
             val dao = app.database.dao()
             dao.put(note)
             dao.put(todo.copy(completedAt = 1L))
             dao.put(todo.copy(id = "startup-deleted-todo", deletedAt = 1L))
         }
-
         ActivityScenario.launch(MainActivity::class.java).use {
             waitForText(note.title)
             compose.onNodeWithText(note.title).assertIsDisplayed()
@@ -70,3 +82,4 @@ class StartupNavigationTest {
         compose.waitUntil(5_000) { compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty() }
     }
 }
+

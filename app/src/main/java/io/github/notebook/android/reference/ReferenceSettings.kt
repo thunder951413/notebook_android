@@ -32,7 +32,7 @@ import io.github.notebook.android.sync.SyncRepository
 import io.github.notebook.android.ui.Appearance
 import io.github.notebook.android.ui.BackgroundPreset
 
-private enum class SettingsPage { Home, Appearance, Reading, Tags, TodoFolders, Reminders, AI, Voice, About }
+private enum class SettingsPage { Home, DataSafety, Appearance, Reading, Tags, TodoFolders, Reminders, AI, Voice, About }
 
 @Composable
 internal fun ReferenceSettings(
@@ -42,10 +42,14 @@ internal fun ReferenceSettings(
     syncCard: @Composable () -> Unit,
     manage: @Composable (kind: String, onBack: () -> Unit) -> Unit,
     scrollState: ScrollState,
+    encryptedUnlocked: Boolean = false,
 ) {
     var page by rememberSaveable { mutableStateOf(SettingsPage.Home) }
     val backToSettings = { page = SettingsPage.Home }
     when (page) {
+        SettingsPage.DataSafety -> SettingsScreen("本地备份与数据安全", backToSettings) {
+            LocalBackupSafetyContent(repo, encryptedUnlocked)
+        }
         SettingsPage.Appearance -> SettingsScreen("外观", backToSettings) { BackgroundPicker() }
         SettingsPage.Reading -> ReadingSettingsScreen(backToSettings)
         SettingsPage.Tags -> manage("tag", backToSettings)
@@ -70,17 +74,28 @@ private fun SettingsHome(
     val context = LocalContext.current
     val preferences = remember(context) { context.getSharedPreferences("editor_preferences", 0) }
     var autoKeyboard by remember { mutableStateOf(preferences.getBoolean("autoKeyboard", true)) }
-    var quickCreate by remember { mutableStateOf(preferences.getBoolean("quickCreate", true)) }
+    var directCreate by remember { mutableStateOf(preferences.getBoolean("directCreate", true)) }
+    var startInTodos by remember { mutableStateOf(preferences.getBoolean("startInTodos", false)) }
     val ai = repo.aiSettings()
     val voice = repo.ttsSettings()
     val reminders = rememberReminderPermissions()
+    val lastBackup = repo.lastLocalBackupAt()
+    val backupSummary = remember(lastBackup) {
+        if (lastBackup == null) "导出离线 ZIP 备份包、零覆盖安全恢复"
+        else "上次备份：${java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA).format(java.util.Date(lastBackup))}"
+    }
 
     SettingsScreen("设置", onBack, scrollState, "settings-home-scroll") {
-        SettingsSection("同步与数据") {
+        SettingsSection("同步与数据安全") {
             syncCard()
             SettingsDivider()
             SettingsLink("同步设置", Icons.Default.Tune, "连接、状态与修复", onClick = onSyncSettings)
+            SettingsDivider()
+            SettingsLink("本地备份与数据安全", Icons.Default.VerifiedUser, backupSummary) {
+                open(SettingsPage.DataSafety)
+            }
         }
+
         SettingsSection("使用偏好") {
             SettingsLink("外观", Icons.Default.Palette, "亮色与暗色背景") { open(SettingsPage.Appearance) }
             SettingsDivider()
@@ -91,11 +106,27 @@ private fun SettingsHome(
                 preferences.edit().putBoolean("autoKeyboard", it).apply()
             }
             SettingsDivider()
-            SettingsToggle("长按 + 快速新建", Icons.AutoMirrored.Filled.NoteAdd, quickCreate, "长按首页创建按钮，新建文字笔记") {
-                quickCreate = it
-                preferences.edit().putBoolean("quickCreate", it).apply()
+            SettingsToggle(
+                "点击 + 直接新建",
+                Icons.AutoMirrored.Filled.NoteAdd,
+                directCreate,
+                "开启后点击 + 立即新建，长按 + 打开导入与更多新建方式",
+            ) {
+                directCreate = it
+                preferences.edit().putBoolean("directCreate", it).apply()
+            }
+            SettingsDivider()
+            SettingsToggle(
+                "启动时优先打开待办",
+                Icons.Default.Checklist,
+                startInTodos,
+                "有未完成待办时冷启动直接进入待办列表；关闭则默认进入笔记首页",
+            ) {
+                startInTodos = it
+                preferences.edit().putBoolean("startInTodos", it).apply()
             }
         }
+
         SettingsSection("内容与提醒") {
             SettingsLink("标签管理", Icons.AutoMirrored.Filled.Label) { open(SettingsPage.Tags) }
             SettingsDivider()
@@ -103,6 +134,7 @@ private fun SettingsHome(
             SettingsDivider()
             SettingsLink("提醒权限", Icons.Default.Notifications, reminders.summary) { open(SettingsPage.Reminders) }
         }
+
         SettingsSection("AI 与朗读") {
             SettingsLink("AI 服务", Icons.Default.AutoAwesome, if (ai.configured) ai.provider.label else "未配置") {
                 open(SettingsPage.AI)
@@ -112,8 +144,9 @@ private fun SettingsHome(
                 open(SettingsPage.Voice)
             }
         }
+
         SettingsSection("关于与诊断") {
-            SettingsLink("关于 Notebook", Icons.Default.Info, "版本 ${BuildConfig.VERSION_NAME} · 导出运行日志") {
+            SettingsLink("关于 Notebook", Icons.Default.Info, "版本 ${BuildConfig.VERSION_NAME} · 查看与导出运行日志") {
                 open(SettingsPage.About)
             }
         }

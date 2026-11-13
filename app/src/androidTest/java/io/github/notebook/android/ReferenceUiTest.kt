@@ -228,7 +228,7 @@ class ReferenceUiTest {
 
     @Test
     fun formattingUndoRedoAndPanelSwitchingSaveActualMarkdown() {
-        rule.onNodeWithTag("new-item").performTouchInput { longClick() }
+        rule.onNodeWithTag("new-item").performClick()
         rule.onNodeWithTag("title-field").performTextInput("格式样本")
         rule.onNodeWithTag("body-field").performTextInput("中文段落")
         waitForStableEditorTools()
@@ -308,7 +308,7 @@ class ReferenceUiTest {
 
     @Test
     fun untouchedBlankNoteDoesNotCreateDatabaseRow() {
-        rule.onNodeWithTag("new-item").performTouchInput { longClick() }
+        rule.onNodeWithTag("new-item").performClick()
         rule.mainClock.advanceTimeBy(400)
         rule.waitForIdle()
         rule.onNodeWithTag("preview-mode").performClick()
@@ -370,7 +370,7 @@ class ReferenceUiTest {
 
     @Test
     fun insertingNativeCodeFocusesPayloadAndSupportsUndo() {
-        rule.onNodeWithTag("new-item").performTouchInput { longClick() }
+        rule.onNodeWithTag("new-item").performClick()
         rule.onNodeWithTag("title-field").performTextInput("新代码样本")
         rule.onNodeWithTag("body-field").performClick()
         rule.mainClock.advanceTimeBy(400)
@@ -395,7 +395,7 @@ class ReferenceUiTest {
 
     @Test
     fun androidInputConnectionCompositionCommitsWithoutDuplicatingChineseText() {
-        rule.onNodeWithTag("new-item").performTouchInput { longClick() }
+        rule.onNodeWithTag("new-item").performClick()
         rule.onNodeWithTag("title-field").performTextInput("组合输入样本")
         rule.onNodeWithTag("body-field").performClick()
         rule.waitForIdle()

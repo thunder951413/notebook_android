@@ -30,8 +30,8 @@ class MainActivityTest {
         app.repository.saveWebdavSettings(WebdavSettings("https://example.invalid/dav/","","","notebook_test"))
     }
 
-    private fun createNote(){rule.onNodeWithTag("new-item").performClick();rule.onNodeWithTag("create-text-note").performClick()}
-    private fun openNavigation(){if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isEmpty())rule.onNodeWithContentDescription("更多").performClick();rule.onNodeWithContentDescription("导航").performClick()}
+    private fun createNote(){rule.onNodeWithTag("new-item").performClick()}
+    private fun openNavigation(){if(rule.onAllNodesWithTag("open-drawer").fetchSemanticsNodes().isNotEmpty())rule.onNodeWithTag("open-drawer").performClick() else {if(rule.onAllNodesWithContentDescription("导航").fetchSemanticsNodes().isEmpty())rule.onNodeWithContentDescription("更多").performClick();rule.onNodeWithContentDescription("导航").performClick()}}
     @Test fun createEditAndSaveNote(){
         createNote()
         rule.onNodeWithTag("title-field").performTextInput("设备测试笔记")
